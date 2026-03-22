@@ -9,6 +9,8 @@ export interface FileInfo {
   created_at: string;
   direct_url: string | null;
   access_hash: string | null;
+  parent_id?: string | null;
+  isDir?: boolean;
 }
 
 export interface FileListResponse {

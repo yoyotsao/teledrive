@@ -1,6 +1,5 @@
 import os
 import hashlib
-import aiofiles
 from typing import Optional, List, Dict
 from datetime import datetime
 from pathlib import Path
@@ -147,7 +146,11 @@ class FileService:
                 mime_type=session.mime_type,
                 file_type=file_type,
                 telegram_message_id=session.message_id,
-                created_at=session.created_at
+                created_at=session.created_at,
+                direct_url=None,
+                access_hash=None,
+                parent_id=None,
+                isDir=False
             )
             
             self._files_metadata[file_info.file_id] = file_info
@@ -169,7 +172,8 @@ class FileService:
         mime_type: Optional[str],
         message_id: int,
         file_id: str,
-        access_hash: Optional[str] = None
+        access_hash: Optional[str] = None,
+        parent_id: Optional[str] = None,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -187,7 +191,10 @@ class FileService:
             file_type=file_type,
             telegram_message_id=message_id,
             created_at=datetime.utcnow(),
-            direct_url=None  # Will be generated on download request
+            direct_url=None,  # Will be generated on download request
+            access_hash=None,
+            parent_id=parent_id,
+            isDir=False
         )
         
         # Store access_hash in session for download
@@ -235,7 +242,11 @@ class FileService:
             mime_type=session.mime_type,
             file_type=file_type,
             telegram_message_id=message_id,
-            created_at=session.created_at
+            created_at=session.created_at,
+            direct_url=None,
+            access_hash=None,
+            parent_id=None,
+            isDir=False
         )
         
         self._files_metadata[telegram_file_id] = file_info
@@ -254,10 +265,16 @@ class FileService:
     async def list_files(
         self,
         page: int = 1,
-        page_size: int = 50
+        page_size: int = 50,
+        parent_id: Optional[str] = None
     ) -> tuple[List[FileInfo], int]:
-        """List all stored files."""
+        """List all stored files (excluding folders)."""
         files = list(self._files_metadata.values())
+        # Only return actual files, not folders
+        files = [f for f in files if getattr(f, 'isDir', False) == False]
+        # If a parent_id is provided, filter to that folder
+        if parent_id is not None:
+            files = [f for f in files if getattr(f, 'parent_id', None) == parent_id]
         total = len(files)
         
         # Sort by creation date, newest first
@@ -269,12 +286,54 @@ class FileService:
         paginated_files = files[start:end]
         
         return paginated_files, total
-    
+
+    async def list_folders(
+        self,
+        parent_id: Optional[str] = None
+    ) -> List[FileInfo]:
+        """List all stored folders (isDir == True). Optional parent_id filter."""
+        entries = list(self._files_metadata.values())
+        # Filter to folders
+        folders = [f for f in entries if getattr(f, "isDir", False)]
+        if parent_id is not None:
+            folders = [f for f in folders if getattr(f, "parent_id", None) == parent_id]
+        # Sort by creation date, newest first for consistency with list_files
+        folders.sort(key=lambda f: f.created_at, reverse=True)
+        return folders
+    def create_folder(self, name: str, parent_id: Optional[str] = None) -> FileInfo:
+        """Create an in-memory folder entry. No Telegram ops in MVP."""
+        file_id = self._generate_file_id(name, 0)
+        folder_info = FileInfo(
+            file_id=file_id,
+            filename=name,
+            filesize=0,
+            mime_type=None,
+            file_type=FileType.OTHER,
+            telegram_message_id=None,
+            created_at=datetime.utcnow(),
+            direct_url=None,
+            access_hash=None,
+            parent_id=parent_id,
+            isDir=True,
+        )
+        self._files_metadata[file_id] = folder_info
+        logger.info(f"Folder created: {name}, id: {file_id}")
+        return folder_info
+
     async def delete_file(self, file_id: str) -> bool:
         """Delete a file from metadata."""
         if file_id in self._files_metadata:
             del self._files_metadata[file_id]
             logger.info(f"File deleted: {file_id}")
+            return True
+        return False
+
+    async def delete_folder(self, folder_id: str) -> bool:
+        """Delete a folder from metadata only if it is a directory."""
+        info = self._files_metadata.get(folder_id)
+        if info and getattr(info, "isDir", False):
+            del self._files_metadata[folder_id]
+            logger.info(f"Folder deleted: {folder_id}")
             return True
         return False
     

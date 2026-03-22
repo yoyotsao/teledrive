@@ -19,6 +19,12 @@ class RegisterFileRequest(BaseModel):
     message_id: int
     file_id: str
     access_hash: Optional[str] = None
+    parent_id: Optional[str] = None
+
+
+class CreateFolderRequest(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
 
 
 @router.post("/files/register", response_model=FileInfo)
@@ -35,7 +41,8 @@ async def register_file(request: RegisterFileRequest):
             mime_type=request.mime_type,
             message_id=request.message_id,
             file_id=request.file_id,
-            access_hash=request.access_hash
+            access_hash=request.access_hash,
+            parent_id=request.parent_id
         )
         return file_info
     except Exception as e:
@@ -87,6 +94,7 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
             message_id=message_id_int,
             file_id=file_id_str,
             access_hash=access_hash,
+            parent_id=None,
         )
 
         # Cleanup temporary file
@@ -112,11 +120,15 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
 @router.get("/files", response_model=FileListResponse)
 async def list_files(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=100)
+    page_size: int = Query(50, ge=1, le=100),
+    parent_id: Optional[str] = Query(None)
 ):
+    # Convert string "null" to Python None
+    if parent_id == "null":
+        parent_id = None
     try:
         file_service = get_file_service()
-        files, total = await file_service.list_files(page, page_size)
+        files, total = await file_service.list_files(page, page_size, parent_id=parent_id)
         return FileListResponse(
             files=files,
             total=total,
@@ -166,6 +178,8 @@ async def delete_file(file_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
 @router.get("/files/{file_id}/download")
 async def get_download_info(file_id: str):
     """
@@ -187,6 +201,55 @@ async def get_download_info(file_id: str):
             "message_id": file_info.telegram_message_id,
             "access_hash": file_info.access_hash
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/folders", response_model=FileInfo)
+async def create_folder(request: CreateFolderRequest):
+    try:
+        file_service = get_file_service()
+        folder = file_service.create_folder(request.name, request.parent_id)
+        return folder
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/folders", response_model=FileListResponse)
+async def list_folders(
+    parent_id: Optional[str] = Query(None)
+):
+    if parent_id == "null":
+        parent_id = None
+    try:
+        file_service = get_file_service()
+        folders = await file_service.list_folders(parent_id=parent_id)
+        return FileListResponse(
+            files=folders,
+            total=len(folders),
+            page=1,
+            page_size=len(folders)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/folders/{folder_id}")
+async def delete_folder(folder_id: str):
+    try:
+        file_service = get_file_service()
+        file_info = await file_service.get_file_info(folder_id)
+        
+        if not file_info:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        
+        if not getattr(file_info, 'isDir', False):
+            raise HTTPException(status_code=400, detail="Not a folder")
+        
+        await file_service.delete_folder(folder_id)
+        return {"message": "Folder deleted", "folder_id": folder_id}
     except HTTPException:
         raise
     except Exception as e:

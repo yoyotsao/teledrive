@@ -1,29 +1,7 @@
-import { useState, useEffect } from 'react';
-import { FileBrowser } from './components/FileBrowser';
-import FileUploader from './components/FileUploader';
+import { ChonkyDrive } from './components/ChonkyDrive';
 import SessionConfig from './components/SessionConfig';
-import axios from 'axios';
 
 function App() {
-  const [isReady, setIsReady] = useState(false);
-
-  // Check if backend is reachable
-  useEffect(() => {
-    const checkBackend = async () => {
-      try {
-        await axios.get('/api/v1/files', {
-          params: { page: 1, page_size: 1 },
-          timeout: 5000,
-        });
-        setIsReady(true);
-      } catch {
-        // Backend might not have Telegram configured yet, but is running
-        setIsReady(true);
-      }
-    };
-    checkBackend();
-  }, []);
-
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
       <header style={{ padding: '16px', borderBottom: '1px solid #e5e7eb', background: '#fff' }}>
@@ -34,15 +12,12 @@ function App() {
       </header>
       
       {/* Backend / Telegram Connection Status */}
-      <SessionConfig onConfigured={() => setIsReady(true)} />
-      
-      {/* File Uploader */}
-      <FileUploader isConfigured={isReady} />
+      <SessionConfig />
       
       {/* File Browser */}
       <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, overflow: 'hidden' }}>
-          <FileBrowser />
+          <ChonkyDrive />
         </div>
       </main>
     </div>

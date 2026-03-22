@@ -49,6 +49,9 @@ class FileInfo(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Upload timestamp")
     direct_url: Optional[str] = Field(None, description="Direct CDN URL (if available)")
     access_hash: Optional[str] = Field(None, description="File access hash for MTProto download")
+    # Virtual folder support (new in MVP): optional parent folder reference and dir flag
+    parent_id: Optional[str] = Field(None, description="Parent folder ID, if any")
+    isDir: bool = Field(False, description="Is this item a directory?")
 
 
 class UploadInitResponse(BaseModel):

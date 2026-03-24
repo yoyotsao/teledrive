@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request
 from typing import Optional
 from pydantic import BaseModel
 
@@ -361,17 +361,60 @@ async def get_file_thumbnail(file_id: str):
 
 
 @router.get("/files/{file_id}/stream")
-async def stream_file(file_id: str):
+async def stream_file(file_id: str, request: Request):
     """
-    Stream file content from Telegram.
+    Stream file content from Telegram with Range header support.
     Returns file bytes with proper content-type for display/playback.
+    Supports HTTP Range requests for partial content (206) and full content (200).
     """
     from loguru import logger
     from fastapi.responses import StreamingResponse
-    import io
+    from starlette.status import HTTP_416_RANGE_NOT_SATISFIABLE
+    import re
     import traceback
     
     logger.info(f"Stream endpoint called with file_id: {file_id}")
+    
+    def parse_range(range_header: str, file_size: int) -> tuple[int, int] | None:
+        """Parse Range header and return (start, end) tuple or None if invalid."""
+        if not range_header:
+            return None
+        
+        # Only support bytes range (no multi-range)
+        if ',' in range_header:
+            return None
+        
+        # Match bytes=start-end or bytes=start- format
+        match = re.match(r'^bytes=(\d+)-(\d*)$', range_header)
+        if not match:
+            return None
+        
+        start_str, end_str = match.groups()
+        
+        # Validate start is a non-negative integer
+        try:
+            start = int(start_str)
+            if start < 0:
+                return None
+        except ValueError:
+            return None
+        
+        # Parse end (empty string means to EOF)
+        if end_str:
+            try:
+                end = int(end_str)
+                if end < 0:
+                    return None
+                # end must be >= start
+                if end < start:
+                    return None
+            except ValueError:
+                return None
+            return (start, end)
+        else:
+            # bytes=start- means from start to EOF
+            return (start, file_size - 1)
+    
     try:
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id)
@@ -383,35 +426,122 @@ async def stream_file(file_id: str):
         if not message_id:
             raise HTTPException(status_code=400, detail="No Telegram message ID")
         
-        mtproto_service = await get_telethon_service()
-        
-        # Download file content
-        logger.info(f"Streaming file: {file_id}, message_id: {message_id}")
-        try:
-            file_bytes = await mtproto_service.download_file(message_id)
-            logger.info(f"Downloaded {len(file_bytes)} bytes")
-        except Exception as download_err:
-            logger.error(f"Download error: {download_err}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Download failed: {str(download_err)}")
-        
+        file_size = file_info.filesize
         mime_type = file_info.mime_type or "application/octet-stream"
         
-        # Return as streaming response
-        return StreamingResponse(
-            io.BytesIO(file_bytes),
-            media_type=mime_type,
-            headers={
-                "Content-Length": str(len(file_bytes))
-            }
-        )
+        # Parse Range header
+        range_header = request.headers.get("range", "")
+        range_result = parse_range(range_header, file_size)
+        
+        # If Range header is present but invalid format, return 416
+        if range_header and range_result is None:
+            logger.info(f"Invalid Range header: {range_header}")
+            from fastapi.responses import Response
+            return Response(
+                status_code=HTTP_416_RANGE_NOT_SATISFIABLE,
+                headers={
+                    "Content-Range": f"bytes */{file_size}",
+                    "Accept-Ranges": "bytes"
+                }
+            )
+        
+        mtproto_service = await get_telethon_service()
+        
+        if range_result is not None:
+            # Range request
+            start, end = range_result
+            
+            # Check if start is beyond file size
+            if start >= file_size:
+                logger.info(f"Range not satisfiable: start={start} >= file_size={file_size}")
+                from fastapi.responses import Response
+                return Response(
+                    status_code=HTTP_416_RANGE_NOT_SATISFIABLE,
+                    headers={
+                        "Content-Range": f"bytes */{file_size}",
+                        "Accept-Ranges": "bytes"
+                    }
+                )
+            
+            # Clamp end to file size
+            actual_end = min(end, file_size - 1)
+            content_length = actual_end - start + 1
+            
+            logger.info(f"Streaming range: {file_id}, bytes {start}-{actual_end}/{file_size}")
+            
+            async def generate_range():
+                chunk_size = 1024 * 1024  # 1MB chunks
+                offset = start
+                remaining = content_length
+                
+                while remaining > 0:
+                    current_chunk = min(chunk_size, remaining)
+                    try:
+                        chunk = await mtproto_service.download_file(
+                            message_id,
+                            offset=offset,
+                            limit=current_chunk
+                        )
+                        if not chunk:
+                            break
+                        yield chunk
+                        offset += len(chunk)
+                        remaining -= len(chunk)
+                    except Exception as chunk_err:
+                        logger.error(f"Chunk download error: {chunk_err}")
+                        break
+            
+            return StreamingResponse(
+                generate_range(),
+                status_code=206,
+                media_type=mime_type,
+                headers={
+                    "Content-Length": str(content_length),
+                    "Content-Range": f"bytes {start}-{actual_end}/{file_size}",
+                    "Accept-Ranges": "bytes"
+                }
+            )
+        else:
+            # Full file request (no Range header)
+            logger.info(f"Streaming full file: {file_id}, size={file_size}")
+            
+            async def generate_full():
+                chunk_size = 1024 * 1024  # 1MB chunks
+                offset = 0
+                remaining = file_size
+                
+                while remaining > 0:
+                    current_chunk = min(chunk_size, remaining)
+                    try:
+                        chunk = await mtproto_service.download_file(
+                            message_id,
+                            offset=offset,
+                            limit=current_chunk
+                        )
+                        if not chunk:
+                            break
+                        yield chunk
+                        offset += len(chunk)
+                        remaining -= len(chunk)
+                    except Exception as chunk_err:
+                        logger.error(f"Chunk download error: {chunk_err}")
+                        break
+            
+            return StreamingResponse(
+                generate_full(),
+                status_code=200,
+                media_type=mime_type,
+                headers={
+                    "Content-Length": str(file_size),
+                    "Accept-Ranges": "bytes"
+                }
+            )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Stream error: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/folders", response_model=FileInfo)

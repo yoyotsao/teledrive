@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import hashlib
 
 from telethon import TelegramClient, types
+from telethon.tl.functions.upload import GetFileRequest
 from telethon.sessions import StringSession
 from loguru import logger
 
@@ -200,9 +201,16 @@ class TelethonService:
             logger.error(f"Thumbnail upload failed: {e}")
             raise
 
-    async def download_file(self, message_id: int) -> bytes:
+    async def download_file(self, message_id: int, offset: int = 0, limit: Optional[int] = None) -> bytes:
         """Download file content from Telegram message.
-        Returns: file bytes
+        
+        Args:
+            message_id: Telegram message ID
+            offset: Byte offset to start from (default 0)
+            limit: Max bytes to download. None means from offset to EOF.
+        
+        Returns:
+            File bytes (full file if no offset/limit, or partial chunk)
         """
         try:
             if not self._connected:
@@ -213,11 +221,62 @@ class TelethonService:
             if not message:
                 raise ValueError(f"Message {message_id} not found")
             
-            # Download the file content to a BytesIO buffer
+            # Determine the file size
+            size = 0
+            if getattr(message, 'document', None):
+                size = getattr(message.document, 'size', 0) or 0
+            elif getattr(message, 'photo', None):
+                size = getattr(message.photo, 'size', 0) or 0
+            
+            # Handle offset beyond file size
+            if offset >= size:
+                return b''
+            
+            # Use GetFileRequest for partial downloads (offset != 0 or limit is set)
+            if offset > 0 or limit is not None:
+                chunk_size = limit if limit is not None else 1024 * 1024
+                
+                # Determine location type based on message content
+                if getattr(message, 'document', None):
+                    from telethon.tl.types import InputDocumentFileLocation
+                    doc = message.document
+                    file_ref = bytes(doc.file_reference) if hasattr(doc, 'file_reference') and doc.file_reference else b''
+                    location = InputDocumentFileLocation(
+                        id=doc.id,
+                        access_hash=doc.access_hash,
+                        file_reference=file_ref,
+                        thumb_size=''
+                    )
+                elif getattr(message, 'photo', None):
+                    from telethon.tl.types import InputPhotoFileLocation
+                    photo = message.photo
+                    file_ref = bytes(photo.file_reference) if hasattr(photo, 'file_reference') and photo.file_reference else b''
+                    location = InputPhotoFileLocation(
+                        id=photo.id,
+                        access_hash=photo.access_hash,
+                        file_reference=file_ref,
+                        thumb_size=''
+                    )
+                else:
+                    raise ValueError("Message has no document or photo")
+                
+                result = await self.client.invoke(GetFileRequest(
+                    location=location,
+                    offset=offset,
+                    limit=chunk_size
+                ))
+                
+                if hasattr(result, 'bytes'):
+                    return bytes(result.bytes)
+                elif isinstance(result, bytes):
+                    return result
+                else:
+                    return b''
+            
+            # Default: full file download via download_media
             buffer = io.BytesIO()
             await self.client.download_media(message, file=buffer)
-            file_bytes = buffer.getvalue()
-            return file_bytes
+            return buffer.getvalue()
             
         except Exception as e:
             logger.error(f"Failed to download file: {e}")

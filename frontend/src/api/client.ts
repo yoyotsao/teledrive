@@ -81,6 +81,13 @@ export const api = {
     return response.data;
   },
 
+  generateVideoThumbnail: async (messageId: number): Promise<{ message_id: number; file_id: string; thumbnail_data: string }> => {
+    const response = await client.post<{ message_id: number; file_id: string; thumbnail_data: string }>('/videos/thumbnail', {
+      message_id: messageId,
+    });
+    return response.data;
+  },
+
   moveFile: async (fileId: string, newParentId: string | null): Promise<FileInfo> => {
     const response = await client.patch<FileInfo>(`/files/${fileId}`, {
       parent_id: newParentId,

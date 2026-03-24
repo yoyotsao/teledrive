@@ -207,25 +207,41 @@ export function ChonkyDrive() {
   }, []);
 
   const uploadWithThumbnail = async (file: File): Promise<void> => {
-    const isImageOrVideo = file.type.startsWith('image/') || file.type.startsWith('video/');
+    const isImage = file.type.startsWith('image/');
+    const isVideo = file.type.startsWith('video/');
+    const isImageOrVideo = isImage || isVideo;
     
     const result = await api.uploadFile(file, currentFolderId ?? undefined);
     console.log('[Upload] File uploaded:', result.file_id, result.filename);
     
     if (isImageOrVideo) {
-      const thumbBlob = await generateThumbnail(file, 200);
-      if (thumbBlob) {
-        console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
+      if (isVideo) {
+        // For videos: call backend API to generate thumbnail via FFmpeg
+        console.log('[Thumb] Generating video thumbnail via backend API for message_id:', result.message_id);
         try {
-          const thumbResult = await api.uploadThumbnail(thumbBlob);
-          console.log('[Thumb] Uploaded to Telegram, message_id:', thumbResult.message_id, 'data_len:', thumbResult.thumbnail_data?.length);
+          const thumbResult = await api.generateVideoThumbnail(result.message_id);
+          console.log('[Thumb] Got video thumbnail, message_id:', thumbResult.message_id, 'data_len:', thumbResult.thumbnail_data?.length);
           await api.updateFile(result.file_id, thumbResult.message_id, thumbResult.thumbnail_data);
-          console.log('[Thumb] Updated file with thumbnail_message_id and thumbnail_data');
+          console.log('[Thumb] Updated file with video thumbnail metadata');
         } catch (err: any) {
-          console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+          console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
         }
       } else {
-        console.log('[Thumb] generateThumbnail returned null for:', file.name);
+        // For images: generate thumbnail client-side
+        const thumbBlob = await generateThumbnail(file, 200);
+        if (thumbBlob) {
+          console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
+          try {
+            const thumbResult = await api.uploadThumbnail(thumbBlob);
+            console.log('[Thumb] Uploaded to Telegram, message_id:', thumbResult.message_id, 'data_len:', thumbResult.thumbnail_data?.length);
+            await api.updateFile(result.file_id, thumbResult.message_id, thumbResult.thumbnail_data);
+            console.log('[Thumb] Updated file with thumbnail_message_id and thumbnail_data');
+          } catch (err: any) {
+            console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+          }
+        } else {
+          console.log('[Thumb] generateThumbnail returned null for:', file.name);
+        }
       }
     }
   };

@@ -41,6 +41,7 @@ A personal cloud storage system using Telegram as the backend storage provider. 
 
 - Node.js 18+
 - Python 3.10+
+- FFmpeg (for video thumbnails — install via `winget install Gyan.FFmpeg` on Windows, `apt install ffmpeg` on Linux, or `brew install ffmpeg` on macOS)
 - Telegram API ID & Hash ([my.telegram.org](https://my.telegram.org))
 - Telegram Session String (user account)
 

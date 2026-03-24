@@ -8,6 +8,56 @@ from app.services import get_telethon_service
 from loguru import logger
 import os
 import tempfile
+import asyncio
+import subprocess
+import shutil
+import base64
+
+
+def find_ffmpeg() -> Optional[str]:
+    """Find ffmpeg executable, checking PATH and known locations."""
+    # Check PATH first
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        return ffmpeg_path
+    # Fallback to known Windows installation path
+    known_path = "C:/Program Files/AI ExpertMeet/resources/bindings/FFmpeg/ffmpeg.exe"
+    if os.path.exists(known_path):
+        return known_path
+    return None
+
+
+async def extract_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> None:
+    """Extract thumbnail from video using ffmpeg. Runs in executor to avoid blocking."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg.")
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i", video_path,
+        "-ss", "00:00:01.000",
+        "-vframes", "1",
+        "-vf", "scale='min(400,iw)':min'(400,ih)':force_original_aspect_ratio=decrease",
+        "-q:v", "2",
+        thumb_path
+    ]
+
+    logger.info(f"Running ffmpeg: {' '.join(cmd)}")
+
+    def run_ffmpeg():
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+        return result
+
+    await asyncio.to_thread(run_ffmpeg)
 
 router = APIRouter(prefix="/api/v1", tags=["files"])
 
@@ -32,6 +82,10 @@ class UpdateFileRequest(BaseModel):
     thumbnail_message_id: Optional[int] = None
     thumbnail_data: Optional[str] = None
     parent_id: Optional[str] = None
+
+
+class VideoThumbnailRequest(BaseModel):
+    message_id: int
 
 
 @router.post("/files/register", response_model=FileInfo)
@@ -112,6 +166,109 @@ async def upload_thumbnail(file: UploadFile = File(...)):
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/videos/thumbnail")
+async def generate_video_thumbnail(request: VideoThumbnailRequest):
+    """
+    Generate thumbnail for a video by extracting a frame using ffmpeg.
+    Downloads video from Telegram, extracts frame, uploads thumbnail back.
+    Returns base64-encoded JPEG thumbnail.
+    """
+    video_temp: Optional[str] = None
+    thumb_temp: Optional[str] = None
+    try:
+        telethon_svc = await get_telethon_service()
+
+        # Step 1: Get message info to verify it's a video
+        try:
+            message = await telethon_svc.client.get_messages("me", ids=request.message_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        mime_type = ""
+        if getattr(message, 'document', None):
+            mime_type = getattr(message.document, 'mime_type', '') or ''
+        elif getattr(message, 'media', None):
+            media = getattr(message.media, 'document', None) or getattr(message.media, 'photo', None)
+            if media:
+                mime_type = getattr(media, 'mime_type', '') or ''
+
+        if not mime_type.startswith('video/'):
+            raise HTTPException(status_code=400, detail="Not a video file")
+
+        # Step 2: Download video to temp file
+        logger.info(f"Downloading video message {request.message_id} for thumbnail generation")
+        video_bytes = await telethon_svc.download_file(request.message_id)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as video_tmp:
+            video_temp = video_tmp.name
+            video_tmp.write(video_bytes)
+        logger.info(f"Video saved to temp: {video_temp}, size={len(video_bytes)}")
+
+        # Step 3: Extract thumbnail with ffmpeg
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
+            thumb_temp = thumb_tmp.name
+
+        await extract_thumbnail_ffmpeg(video_temp, thumb_temp)
+
+        if not os.path.exists(thumb_temp):
+            raise HTTPException(status_code=500, detail="Thumbnail extraction failed")
+
+        thumb_size = os.path.getsize(thumb_temp)
+        if thumb_size > 100 * 1024:  # 100KB sanity check
+            logger.warning(f"Thumbnail too large: {thumb_size} bytes, may indicate issue")
+
+        # Step 4: Read and encode thumbnail
+        with open(thumb_temp, 'rb') as f:
+            thumb_bytes = f.read()
+        thumbnail_base64 = base64.b64encode(thumb_bytes).decode('utf-8')
+        logger.info(f"Thumbnail base64 encoded: {len(thumbnail_base64)} chars")
+
+        # Step 5: Upload thumbnail to Telegram
+        def progress_callback(current: int, total: int):
+            try:
+                pct = int((current / total) * 100) if total else 0
+            except Exception:
+                pct = 0
+            logger.info(f"Thumbnail upload progress: {pct}% ({current}/{total} bytes)")
+
+        upload_result = await telethon_svc.upload_thumbnail(
+            thumb_temp,
+            original_filename="video_thumbnail.jpg",
+            progress_callback=progress_callback
+        )
+        logger.info(f"Thumbnail uploaded: {upload_result}")
+
+        return {
+            "message_id": request.message_id,
+            "file_id": upload_result.get("file_id"),
+            "thumbnail_data": thumbnail_base64,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup temp files
+        if video_temp and os.path.exists(video_temp):
+            try:
+                os.remove(video_temp)
+                logger.info(f"Cleaned up video temp: {video_temp}")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup video temp: {e}")
+        if thumb_temp and os.path.exists(thumb_temp):
+            try:
+                os.remove(thumb_temp)
+                logger.info(f"Cleaned up thumb temp: {thumb_temp}")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup thumb temp: {e}")
 
 
 @router.post("/files/upload")

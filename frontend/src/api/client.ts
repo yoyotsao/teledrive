@@ -50,10 +50,6 @@ export const api = {
     return response.data;
   },
 
-  deleteFile: async (fileId: string): Promise<void> => {
-    await client.delete(`/files/${fileId}`);
-  },
-
   getDownloadInfo: async (fileId: string): Promise<FileInfo> => {
     const response = await client.get<FileInfo>(`/files/${fileId}/download`);
     return response.data;
@@ -76,12 +72,24 @@ export const api = {
     return response.data;
   },
 
-  updateFile: async (fileId: string, thumbnailMessageId?: number, thumbnailData?: string): Promise<FileInfo> => {
+  updateFile: async (fileId: string, thumbnailMessageId?: number, thumbnailData?: string, parentId?: string): Promise<FileInfo> => {
     const response = await client.patch<FileInfo>(`/files/${fileId}`, {
       thumbnail_message_id: thumbnailMessageId,
       thumbnail_data: thumbnailData,
+      parent_id: parentId,
     });
     return response.data;
+  },
+
+  moveFile: async (fileId: string, newParentId: string | null): Promise<FileInfo> => {
+    const response = await client.patch<FileInfo>(`/files/${fileId}`, {
+      parent_id: newParentId,
+    });
+    return response.data;
+  },
+
+  deleteFile: async (fileId: string): Promise<void> => {
+    await client.delete(`/files/${fileId}`);
   },
 };
 

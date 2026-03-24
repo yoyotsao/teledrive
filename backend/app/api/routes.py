@@ -31,6 +31,7 @@ class CreateFolderRequest(BaseModel):
 class UpdateFileRequest(BaseModel):
     thumbnail_message_id: Optional[int] = None
     thumbnail_data: Optional[str] = None
+    parent_id: Optional[str] = None
 
 
 @router.post("/files/register", response_model=FileInfo)
@@ -242,13 +243,24 @@ async def delete_file(file_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/files")
+async def delete_all_files():
+    """Delete all files and folders."""
+    try:
+        file_service = get_file_service()
+        count = await file_service.delete_all()
+        return {"message": "All files deleted", "count": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.patch("/files/{file_id}")
 async def update_file(file_id: str, request: UpdateFileRequest):
     """
-    Update file metadata (e.g., thumbnail_message_id, thumbnail_data).
+    Update file metadata (e.g., thumbnail_message_id, thumbnail_data, parent_id for move).
     """
     try:
-        logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, thumbnail_data_len={len(request.thumbnail_data) if request.thumbnail_data else 0}")
+        logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, thumbnail_data_len={len(request.thumbnail_data) if request.thumbnail_data else 0}, parent_id={request.parent_id}")
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id)
         
@@ -259,10 +271,11 @@ async def update_file(file_id: str, request: UpdateFileRequest):
         updated_info = await file_service.update_file(
             file_id, 
             thumbnail_message_id=request.thumbnail_message_id,
-            thumbnail_data=request.thumbnail_data
+            thumbnail_data=request.thumbnail_data,
+            parent_id=request.parent_id
         )
         
-        logger.info(f"File updated successfully: {file_id}, thumbnail_data set={request.thumbnail_data is not None}")
+        logger.info(f"File updated successfully: {file_id}, thumbnail_data set={request.thumbnail_data is not None}, parent_id set={request.parent_id is not None}")
         return updated_info
     except HTTPException:
         raise
@@ -344,6 +357,60 @@ async def get_file_thumbnail(file_id: str):
         raise
     except Exception as e:
         logger.error(f"Thumbnail error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/files/{file_id}/stream")
+async def stream_file(file_id: str):
+    """
+    Stream file content from Telegram.
+    Returns file bytes with proper content-type for display/playback.
+    """
+    from loguru import logger
+    from fastapi.responses import StreamingResponse
+    import io
+    import traceback
+    
+    logger.info(f"Stream endpoint called with file_id: {file_id}")
+    try:
+        file_service = get_file_service()
+        file_info = await file_service.get_file_info(file_id)
+        
+        if not file_info:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        message_id = file_info.telegram_message_id
+        if not message_id:
+            raise HTTPException(status_code=400, detail="No Telegram message ID")
+        
+        mtproto_service = await get_telethon_service()
+        
+        # Download file content
+        logger.info(f"Streaming file: {file_id}, message_id: {message_id}")
+        try:
+            file_bytes = await mtproto_service.download_file(message_id)
+            logger.info(f"Downloaded {len(file_bytes)} bytes")
+        except Exception as download_err:
+            logger.error(f"Download error: {download_err}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Download failed: {str(download_err)}")
+        
+        mime_type = file_info.mime_type or "application/octet-stream"
+        
+        # Return as streaming response
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type=mime_type,
+            headers={
+                "Content-Length": str(len(file_bytes))
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Stream error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

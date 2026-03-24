@@ -273,9 +273,8 @@ class FileService:
         files = list(self._files_metadata.values())
         # Only return actual files, not folders
         files = [f for f in files if getattr(f, 'isDir', False) == False]
-        # If a parent_id is provided, filter to that folder
-        if parent_id is not None:
-            files = [f for f in files if getattr(f, 'parent_id', None) == parent_id]
+        # Filter by parent_id (None means root)
+        files = [f for f in files if getattr(f, 'parent_id', None) == parent_id]
         total = len(files)
         
         # Sort by creation date, newest first
@@ -292,12 +291,12 @@ class FileService:
         self,
         parent_id: Optional[str] = None
     ) -> List[FileInfo]:
-        """List all stored folders (isDir == True). Optional parent_id filter."""
+        """List all stored folders (isDir == True). Filter by parent_id."""
         entries = list(self._files_metadata.values())
         # Filter to folders
         folders = [f for f in entries if getattr(f, "isDir", False)]
-        if parent_id is not None:
-            folders = [f for f in folders if getattr(f, "parent_id", None) == parent_id]
+        # Filter by parent_id (None means root)
+        folders = [f for f in folders if getattr(f, "parent_id", None) == parent_id]
         # Sort by creation date, newest first for consistency with list_files
         folders.sort(key=lambda f: f.created_at, reverse=True)
         return folders
@@ -338,9 +337,16 @@ class FileService:
             return True
         return False
 
-    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, thumbnail_data: Optional[str] = None) -> Optional[FileInfo]:
+    async def delete_all(self) -> int:
+        """Delete all files and folders from metadata."""
+        count = len(self._files_metadata)
+        self._files_metadata.clear()
+        logger.info(f"All files deleted: {count} items")
+        return count
+
+    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, thumbnail_data: Optional[str] = None, parent_id: Optional[str] = None) -> Optional[FileInfo]:
         """Update file metadata."""
-        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, thumbnail_data_len={len(thumbnail_data) if thumbnail_data else 0}")
+        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, thumbnail_data_len={len(thumbnail_data) if thumbnail_data else 0}, parent_id={parent_id}")
         file_info = self._files_metadata.get(file_id)
         if not file_info:
             logger.error(f"File not found in metadata: {file_id}")
@@ -353,6 +359,10 @@ class FileService:
         if thumbnail_data is not None:
             file_info.thumbnail_data = thumbnail_data
             logger.info(f"File updated: {file_id}, thumbnail_data length: {len(thumbnail_data)}")
+        
+        if parent_id is not None:
+            file_info.parent_id = parent_id
+            logger.info(f"File moved: {file_id}, parent_id: {parent_id}")
         
         self._files_metadata[file_id] = file_info
         logger.info(f"File stored in metadata: {file_id}, thumbnail_data present: {file_info.thumbnail_data is not None}")

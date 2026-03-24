@@ -1,5 +1,6 @@
 from typing import Optional
 import os
+import io
 from datetime import datetime, timedelta
 import hashlib
 
@@ -197,6 +198,29 @@ class TelethonService:
             }
         except Exception as e:
             logger.error(f"Thumbnail upload failed: {e}")
+            raise
+
+    async def download_file(self, message_id: int) -> bytes:
+        """Download file content from Telegram message.
+        Returns: file bytes
+        """
+        try:
+            if not self._connected:
+                await self.connect()
+
+            message = await self.client.get_messages("me", ids=message_id)
+            
+            if not message:
+                raise ValueError(f"Message {message_id} not found")
+            
+            # Download the file content to a BytesIO buffer
+            buffer = io.BytesIO()
+            await self.client.download_media(message, file=buffer)
+            file_bytes = buffer.getvalue()
+            return file_bytes
+            
+        except Exception as e:
+            logger.error(f"Failed to download file: {e}")
             raise
 
 

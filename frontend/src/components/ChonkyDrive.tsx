@@ -20,8 +20,18 @@ export function ChonkyDrive() {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
 
+  // Preview state
+  const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  // Selection state
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const lastSelectedRef = useRef<string | null>(null);
+  const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
+  const [isDraggingInternal, setIsDraggingInternal] = useState(false);
+
   const dragCounterRef = useRef(0);
-  const [isDragging, setIsDragging] = useState(false);
+  const isDraggingRef = useRef(false); // Track external file drag for upload
   const [uploadingFiles, setUploadingFiles] = useState<
     Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>
   >([]);
@@ -108,6 +118,31 @@ export function ChonkyDrive() {
     loadContents();
   }, [loadContents]);
 
+  // Handle keyboard delete
+  useEffect(() => {
+    const handleKeyDown = async (event: KeyboardEvent) => {
+      if (event.key === 'Delete' && selectedFiles.size > 0) {
+        event.preventDefault();
+        const confirmed = confirm(`Delete ${selectedFiles.size} selected file(s)?`);
+        if (!confirmed) return;
+
+        try {
+          for (const fileId of selectedFiles) {
+            await api.deleteFile(fileId);
+          }
+          setSelectedFiles(new Set());
+          loadContents();
+        } catch (err) {
+          console.error('Failed to delete files:', err);
+          setError(err instanceof Error ? err.message : 'Failed to delete files');
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedFiles, loadContents]);
+
   const handleNavigateToBreadcrumb = (index: number) => {
     if (index === 0) {
       // Navigate to root
@@ -145,7 +180,7 @@ export function ChonkyDrive() {
     event.preventDefault();
     event.stopPropagation();
     dragCounterRef.current += 1;
-    setIsDragging(true);
+    isDraggingRef.current = true;
   }, []);
 
   const handleDragLeave = useCallback((event: React.DragEvent) => {
@@ -163,7 +198,7 @@ export function ChonkyDrive() {
     dragCounterRef.current -= 1;
     if (dragCounterRef.current <= 0) {
       dragCounterRef.current = 0;
-      setIsDragging(false);
+      isDraggingRef.current = false;
     }
   }, []);
 
@@ -198,7 +233,15 @@ export function ChonkyDrive() {
   const handleDrop = useCallback(async (event: React.DragEvent) => {
     event.preventDefault();
     dragCounterRef.current = 0;
-    setIsDragging(false);
+    isDraggingRef.current = false;
+
+    // Skip if this is an internal file drag (not external file drop)
+    // Internal drags use custom MIME type
+    const dragData = event.dataTransfer.getData('application/x-teledrive-file-id');
+    if (dragData) {
+      // This is an internal file drag - let the folder drop handler deal with it
+      return;
+    }
 
     const droppedFiles = Array.from(event.dataTransfer.files);
     if (droppedFiles.length === 0) return;
@@ -232,7 +275,7 @@ export function ChonkyDrive() {
     }
 
     loadContents();
-  }, [currentFolderId, loadContents, uploadWithThumbnail]);
+  }, [currentFolderId, loadContents, uploadWithThumbnail, isDraggingInternal]);
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(event.target.files || []);
@@ -271,6 +314,153 @@ export function ChonkyDrive() {
     fileInputRef.current?.click();
   };
 
+  // Selection handlers
+  const handleFileClick = useCallback((file: FileData, event: React.MouseEvent) => {
+    const fileId = file.id;
+    
+    if (event.ctrlKey || event.metaKey) {
+      // Ctrl+Click: toggle multi-select
+      setSelectedFiles((prev) => {
+        const newSet = new Set(prev);
+        if (newSet.has(fileId)) {
+          newSet.delete(fileId);
+        } else {
+          newSet.add(fileId);
+        }
+        return newSet;
+      });
+      lastSelectedRef.current = fileId;
+    } else if (event.shiftKey && lastSelectedRef.current !== null) {
+      // Shift+Click: range select from last selected to current
+      const lastIndex = files.findIndex((f) => f.id === lastSelectedRef.current);
+      const currentIndex = files.findIndex((f) => f.id === fileId);
+      
+      if (lastIndex !== -1 && currentIndex !== -1) {
+        const start = Math.min(lastIndex, currentIndex);
+        const end = Math.max(lastIndex, currentIndex);
+        
+        const rangeIds = files.slice(start, end + 1).map((f) => f.id);
+        setSelectedFiles(new Set([...selectedFiles, ...rangeIds]));
+      }
+    } else {
+      // Plain click: select single file
+      if (selectedFiles.has(fileId) && selectedFiles.size === 1) {
+        // If already selected and clicking same file, deselect it
+        setSelectedFiles(new Set());
+      } else {
+        setSelectedFiles(new Set([fileId]));
+      }
+      lastSelectedRef.current = fileId;
+    }
+  }, [files, selectedFiles]);
+
+  // Drag handlers for file items
+  const handleFileDragStart = useCallback((file: FileData, event: React.DragEvent) => {
+    console.log('[DragStart] Starting drag for file:', file.id, file.name, 'isDir:', file.isDir);
+    
+    // Only allow dragging files (not folders)
+    if (file.isDir) {
+      event.preventDefault();
+      return;
+    }
+    
+    // Set drag data with custom type to distinguish from external file drops
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.dropEffect = 'move';
+    event.dataTransfer.setData('application/x-teledrive-file-id', file.id);
+    setIsDraggingInternal(true);
+    
+    // If file is not selected, select just this file
+    if (!selectedFiles.has(file.id)) {
+      setSelectedFiles(new Set([file.id]));
+    }
+  }, [selectedFiles]);
+
+  const handleFileDragEnd = useCallback(() => {
+    setIsDraggingInternal(false);
+  }, []);
+
+  const handleFolderDragEnter = useCallback((folderId: string, event: React.DragEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragOverFolderId(folderId);
+  }, []);
+
+  const handleFolderDragLeave = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragOverFolderId(null);
+  }, []);
+
+  const handleFolderDragOver = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  }, []);
+
+  const handleFolderDrop = useCallback(async (folderId: string, event: React.DragEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragOverFolderId(null);
+    console.log('[Drop] handleFolderDrop called, folderId:', folderId);
+
+    // Get selected file IDs (from selection or from drag data)
+    const selectedIds = Array.from(selectedFiles);
+    console.log('[Drop] selectedIds from state:', selectedIds);
+    
+    if (selectedIds.length === 0) {
+      // Check for internal file drag
+      const dragData = event.dataTransfer.getData('application/x-teledrive-file-id');
+      console.log('[Drop] dragData from dataTransfer:', dragData);
+      if (dragData) {
+        selectedIds.push(dragData);
+      }
+    }
+
+    if (selectedIds.length === 0) {
+      console.log('[Drop] No files to move, returning');
+      return;
+    }
+
+    // Move all selected files to the target folder
+    try {
+      console.log('[Drop] Moving files:', selectedIds, 'to folder:', folderId);
+      for (const fileId of selectedIds) {
+        await api.moveFile(fileId, folderId);
+      }
+      // Clear selection and reload contents
+      setSelectedFiles(new Set());
+      lastSelectedRef.current = null;
+      loadContents();
+    } catch (err) {
+      console.error('Failed to move files:', err);
+      setError(err instanceof Error ? err.message : 'Failed to move files');
+    }
+  }, [selectedFiles, loadContents]);
+
+  // Double-click handler for folder navigation and file preview
+  const handleFileDoubleClick = useCallback(async (file: FileData) => {
+    if (file.isDir) {
+      // Double-click folder to navigate into it
+      setCurrentFolderId(file.id);
+      setBreadcrumb((prev) => [...prev, file]);
+    } else {
+      // Double-click file to preview
+      const original = originalFiles.find((f) => f.file_id === file.id);
+      if (original) {
+        setPreviewFile(original);
+        // Create URL for streaming playback
+        const url = `/api/v1/files/${file.id}/stream`;
+        setPreviewUrl(url);
+      }
+    }
+  }, [originalFiles]);
+
+  // Close preview modal
+  const closePreview = useCallback(() => {
+    setPreviewFile(null);
+    setPreviewUrl(null);
+  }, []);
+
   return (
     <div
       style={{ height: '100%', overflow: 'auto', padding: '16px', position: 'relative' }}
@@ -279,26 +469,6 @@ export function ChonkyDrive() {
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
-      {isDragging && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(59, 130, 246, 0.15)',
-            border: '3px dashed #3b82f6',
-            borderRadius: '8px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-            pointerEvents: 'none', // Overlay doesn't capture drag events - parent handles them
-          }}
-        >
-          <span style={{ fontSize: '20px', fontWeight: 600, color: '#3b82f6' }}>
-            Drop files to upload
-          </span>
-        </div>
-      )}
 
       {uploadingFiles.length > 0 && (
         <div
@@ -506,93 +676,216 @@ export function ChonkyDrive() {
       {files.length > 0 && (
         <div style={{
           display: viewMode === 'grid' ? 'grid' : 'flex',
-          gridTemplateColumns: viewMode === 'grid' ? 'repeat(auto-fill, minmax(150px, 1fr))' : undefined,
+          gridTemplateColumns: viewMode === 'grid' ? 'repeat(auto-fill, minmax(225px, 1fr))' : undefined,
           flexDirection: viewMode === 'grid' ? undefined : 'column',
-          gap: '8px',
+          gap: '12px',
         }}>
           {files.map((file) => {
             const original = originalFiles.find((f) => f.file_id === file.id);
             const isImage = original?.mime_type?.startsWith('image/');
             const isVideo = original?.mime_type?.startsWith('video/');
             const thumbnailUrl = original ? thumbnails[original.file_id] : null;
+            const isSelected = selectedFiles.has(file.id);
+            const isDragOver = dragOverFolderId === file.id;
             
             return (
               <div
                 key={file.id}
+                draggable={!file.isDir}
+                onDragStart={(e) => handleFileDragStart(file, e)}
+                onDragEnd={handleFileDragEnd}
                 style={{
                   display: 'flex',
                   alignItems: viewMode === 'grid' ? 'center' : 'center',
                   flexDirection: viewMode === 'grid' ? 'column' : 'row',
                   padding: viewMode === 'grid' ? '12px' : '12px',
-                  background: 'white',
-                  border: '1px solid #e5e7eb',
+                  background: isSelected ? '#eff6ff' : 'white',
+                  border: isSelected ? '2px solid #3b82f6' : (isDragOver ? '2px dashed #3b82f6' : '1px solid #e5e7eb'),
                   borderRadius: '8px',
-                  cursor: file.isDir ? 'pointer' : 'default',
+                  cursor: file.isDir ? 'pointer' : (isSelected ? 'grab' : 'default'),
                   textAlign: viewMode === 'grid' ? 'center' : 'left',
+                  opacity: !file.isDir && isSelected ? 0.8 : 1,
+                  transition: 'all 0.15s ease',
+                  transform: isDragOver ? 'scale(1.02)' : undefined,
+                  boxShadow: isSelected ? '0 2px 8px rgba(59, 130, 246, 0.15)' : (isDragOver ? '0 4px 12px rgba(59, 130, 246, 0.2)' : undefined),
                 }}
-                onClick={() => {
-                  if (file.isDir) {
-                    setCurrentFolderId(file.id);
-                    setBreadcrumb((prev) => [...prev, file]);
-                  }
+                onClick={(e) => {
+                  // Single click: select file/folder (no navigation for folders)
+                  handleFileClick(file, e);
                 }}
+                onDoubleClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleFileDoubleClick(file);
+                }}
+                {...(file.isDir ? {
+                  onDragEnter: (e: React.DragEvent) => handleFolderDragEnter(file.id, e),
+                  onDragLeave: handleFolderDragLeave,
+                  onDragOver: handleFolderDragOver,
+                  onDrop: (e: React.DragEvent) => handleFolderDrop(file.id, e),
+                } : {})}
               >
                 <div style={{
-                  width: viewMode === 'grid' ? '80px' : '40px',
-                  height: viewMode === 'grid' ? '80px' : '40px',
                   display: 'flex',
                   alignItems: 'center',
-                  justifyContent: 'center',
-                  background: (isImage || isVideo) ? '#f3f4f6' : 'transparent',
-                  borderRadius: '4px',
-                  marginRight: viewMode === 'grid' ? 0 : '12px',
-                  marginBottom: viewMode === 'grid' ? '8px' : 0,
-                  overflow: 'hidden',
-                  position: 'relative',
+                  flex: viewMode === 'grid' ? undefined : 1,
+                  flexDirection: viewMode === 'grid' ? 'column' : 'row',
+                  width: viewMode === 'grid' ? '100%' : undefined,
                 }}>
-                  {file.isDir ? (
-                    <span style={{ fontSize: viewMode === 'grid' ? '40px' : '20px' }}>📁</span>
-                  ) : (isImage || isVideo) && thumbnailUrl ? (
-                    <>
-                      <img 
-                        src={thumbnailUrl} 
-                        alt={file.name}
-                        style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'cover' }}
-                      />
-                      {isVideo && (
-                        <span style={{
-                          position: 'absolute',
-                          fontSize: '16px',
-                        }}>▶️</span>
-                      )}
-                    </>
-                  ) : (isImage || isVideo) ? (
-                    <span style={{ fontSize: viewMode === 'grid' ? '40px' : '20px' }}>
-                      {isVideo ? '🎬' : '🖼️'}
-                    </span>
-                  ) : (
-                    <span style={{ fontSize: viewMode === 'grid' ? '40px' : '20px' }}>📄</span>
-                  )}
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ 
-                    fontSize: '14px', 
-                    color: '#374151',
+                  <div style={{
+                    width: viewMode === 'grid' ? '120px' : '40px',
+                    height: viewMode === 'grid' ? '120px' : '40px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    background: (isImage || isVideo) ? '#f3f4f6' : 'transparent',
+                    borderRadius: '4px',
+                    marginRight: viewMode === 'grid' ? 0 : '12px',
+                    marginBottom: viewMode === 'grid' ? '12px' : 0,
                     overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: viewMode === 'grid' ? 'nowrap' : 'normal',
+                    position: 'relative',
                   }}>
-                    {file.name}
+                    {file.isDir ? (
+                      <span style={{ fontSize: viewMode === 'grid' ? '60px' : '20px' }}>📁</span>
+                    ) : (isImage || isVideo) && thumbnailUrl ? (
+                      <>
+                        <img 
+                          src={thumbnailUrl} 
+                          alt={file.name}
+                          style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'cover' }}
+                        />
+                        {isVideo && (
+                          <span style={{
+                            position: 'absolute',
+                            fontSize: '24px',
+                          }}>▶️</span>
+                        )}
+                      </>
+                    ) : (isImage || isVideo) ? (
+                      <span style={{ fontSize: viewMode === 'grid' ? '60px' : '20px' }}>
+                        {isVideo ? '🎬' : '🖼️'}
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: viewMode === 'grid' ? '60px' : '20px' }}>📄</span>
+                    )}
                   </div>
-                  {!file.isDir && file.size && (
-                    <div style={{ fontSize: '12px', color: '#6b7280' }}>
-                      {formatFileSize(file.size)}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ 
+                      fontSize: '14px', 
+                      color: '#374151',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      {file.name}
                     </div>
-                  )}
+                    {!file.isDir && file.size && viewMode !== 'grid' && (
+                      <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                        {formatFileSize(file.size)}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Preview Modal */}
+      {previewFile && previewUrl && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(0, 0, 0, 0.8)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={closePreview}
+        >
+          <div
+            style={{
+              maxWidth: '90vw',
+              maxHeight: '90vh',
+              background: 'white',
+              borderRadius: '8px',
+              overflow: 'hidden',
+              position: 'relative',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Close button */}
+            <button
+              onClick={closePreview}
+              style={{
+                position: 'absolute',
+                top: '8px',
+                right: '8px',
+                background: 'rgba(0, 0, 0, 0.5)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '50%',
+                width: '32px',
+                height: '32px',
+                cursor: 'pointer',
+                fontSize: '18px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 1001,
+              }}
+            >
+              ✕
+            </button>
+            
+            {/* File name */}
+            <div style={{ 
+              padding: '12px 16px', 
+              borderBottom: '1px solid #e5e7eb',
+              fontSize: '14px',
+              fontWeight: 500,
+              color: '#374151',
+            }}>
+              {previewFile.filename}
+            </div>
+            
+            {/* Content: Image or Video */}
+            <div style={{ padding: '8px' }}>
+              {previewFile.mime_type?.startsWith('image/') ? (
+                <img
+                  src={previewUrl}
+                  alt={previewFile.filename}
+                  style={{
+                    maxWidth: '100%',
+                    maxHeight: 'calc(90vh - 100px)',
+                    objectFit: 'contain',
+                  }}
+                />
+              ) : previewFile.mime_type?.startsWith('video/') ? (
+                <video
+                  controls
+                  autoPlay
+                  style={{
+                    maxWidth: '100%',
+                    maxHeight: 'calc(90vh - 100px)',
+                  }}
+                >
+                  <source src={previewUrl} type={previewFile.mime_type || 'video/mp4'} />
+                  Your browser does not support video playback.
+                </video>
+              ) : (
+                <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
+                  Preview not available for this file type
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

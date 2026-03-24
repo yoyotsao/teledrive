@@ -752,6 +752,10 @@ export function ChonkyDrive() {
                         <img 
                           src={thumbnailUrl} 
                           alt={file.name}
+                          loading="lazy"
+                          decoding="async"
+                          width={viewMode === 'grid' ? 120 : 40}
+                          height={viewMode === 'grid' ? 120 : 40}
                           style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'cover' }}
                         />
                         {isVideo && (
@@ -861,7 +865,11 @@ export function ChonkyDrive() {
                 <img
                   src={previewUrl}
                   alt={previewFile.filename}
+                  loading="lazy"
+                  decoding="async"
                   style={{
+                    minWidth: '200px',
+                    minHeight: '200px',
                     maxWidth: '100%',
                     maxHeight: 'calc(90vh - 100px)',
                     objectFit: 'contain',
@@ -871,6 +879,7 @@ export function ChonkyDrive() {
                 <video
                   controls
                   autoPlay
+                  preload="auto"
                   style={{
                     maxWidth: '100%',
                     maxHeight: 'calc(90vh - 100px)',

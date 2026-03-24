@@ -87,38 +87,69 @@ class TelethonService:
                 await self.connect()
 
             filename_to_use = original_filename or os.path.basename(file_path)
-
-            message = await self.client.send_file(
-                entity='me',
-                file=file_path,
-                force_document=True,
-                attributes=[
-                    types.DocumentAttributeFilename(file_name=filename_to_use)
-                ],
-                progress_callback=progress_callback
-            )
+            
+            ext = os.path.splitext(file_path)[1].lower()
+            mime_map = {
+                '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+                '.gif': 'image/gif', '.webp': 'image/webp',
+                '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
+            }
+            mime = mime_map.get(ext, '')
+            is_image = mime.startswith('image/')
+            is_video = mime.startswith('video/')
+            
+            if is_image:
+                message = await self.client.send_file(
+                    entity='me',
+                    file=file_path,
+                    force_document=False,
+                    progress_callback=progress_callback
+                )
+            elif is_video:
+                message = await self.client.send_file(
+                    entity='me',
+                    file=file_path,
+                    force_document=False,
+                    progress_callback=progress_callback
+                )
+            else:
+                message = await self.client.send_file(
+                    entity='me',
+                    file=file_path,
+                    force_document=True,
+                    attributes=[
+                        types.DocumentAttributeFilename(file_name=filename_to_use)
+                    ],
+                    progress_callback=progress_callback
+                )
 
             document = getattr(message, 'document', None)
             if document is None and getattr(message, 'media', None) is not None:
                 document = getattr(message.media, 'document', None)
 
-            if document is None:
-                raise ValueError("Upload completed but no document found in Telegram message")
+            photo = getattr(message, 'photo', None)
 
-            file_id = str(document.id)
-            access_hash = str(document.access_hash) if hasattr(document, 'access_hash') else None
-            size = getattr(document, 'size', None)
-            mime_type = getattr(document, 'mime_type', None)
+            if document is None and photo is None:
+                raise ValueError("Upload completed but no document or photo found in Telegram message")
 
-            # Get filename from document attributes, fallback to provided name
-            filename = None
-            if hasattr(document, 'attributes'):
-                for attr in document.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        filename = attr.file_name
-                        break
-
-            message_id = getattr(message, 'id', None)
+            if photo:
+                file_id = str(photo.id)
+                access_hash = None
+                size = getattr(photo.sizes[-1], 'size', None) if hasattr(photo, 'sizes') and photo.sizes else None
+                mime_type = mime or 'image/jpeg'
+                message_id = getattr(message, 'id', None)
+            else:
+                file_id = str(document.id)
+                access_hash = str(document.access_hash) if hasattr(document, 'access_hash') else None
+                size = getattr(document, 'size', None)
+                mime_type = getattr(document, 'mime_type', None)
+                message_id = getattr(message, 'id', None)
+                filename = None
+                if hasattr(document, 'attributes'):
+                    for attr in document.attributes:
+                        if hasattr(attr, 'file_name') and attr.file_name:
+                            filename = attr.file_name
+                            break
 
             return {
                 "message_id": int(message_id) if message_id is not None else None,
@@ -130,6 +161,42 @@ class TelethonService:
             }
         except Exception as e:
             logger.error(f"MTProto upload failed: {e}")
+            raise
+
+    async def upload_thumbnail(self, file_path: str, original_filename: str = "thumbnail.jpg", progress_callback=None) -> dict:
+        """Upload a thumbnail image to Telegram Saved Messages.
+        Returns: dict with message_id, file_id
+        """
+        try:
+            if not self._connected:
+                await self.connect()
+
+            message = await self.client.send_file(
+                entity='me',
+                file=file_path,
+                force_document=False,
+                progress_callback=progress_callback
+            )
+
+            photo = getattr(message, 'photo', None)
+            if photo:
+                file_id = str(photo.id)
+                message_id = getattr(message, 'id', None)
+            else:
+                document = getattr(message, 'document', None)
+                if document is None and getattr(message, 'media', None) is not None:
+                    document = getattr(message.media, 'document', None)
+                file_id = str(document.id) if document else None
+                message_id = getattr(message, 'id', None)
+
+            logger.info(f"Thumbnail uploaded: message_id={message_id}, file_id={file_id}")
+
+            return {
+                "message_id": int(message_id) if message_id is not None else None,
+                "file_id": file_id,
+            }
+        except Exception as e:
+            logger.error(f"Thumbnail upload failed: {e}")
             raise
 
 

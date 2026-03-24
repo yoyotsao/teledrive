@@ -20,11 +20,17 @@ class RegisterFileRequest(BaseModel):
     file_id: str
     access_hash: Optional[str] = None
     parent_id: Optional[str] = None
+    thumbnail_message_id: Optional[int] = None
 
 
 class CreateFolderRequest(BaseModel):
     name: str
     parent_id: Optional[str] = None
+
+
+class UpdateFileRequest(BaseModel):
+    thumbnail_message_id: Optional[int] = None
+    thumbnail_data: Optional[str] = None
 
 
 @router.post("/files/register", response_model=FileInfo)
@@ -42,10 +48,68 @@ async def register_file(request: RegisterFileRequest):
             message_id=request.message_id,
             file_id=request.file_id,
             access_hash=request.access_hash,
-            parent_id=request.parent_id
+            parent_id=request.parent_id,
+            thumbnail_message_id=request.thumbnail_message_id
         )
         return file_info
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/files/thumbnail/upload")
+async def upload_thumbnail(file: UploadFile = File(...)):
+    """
+    Upload a thumbnail image. 
+    Returns the message_id for the uploaded thumbnail AND stores thumbnail data.
+    """
+    logger.info("=== THUMBNAIL UPLOAD ENDPOINT HIT ===")
+    temp_path: Optional[str] = None
+    try:
+        import base64
+        
+        logger.info(f"Thumbnail upload started: filename={file.filename}, content_type={file.content_type}")
+        
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            temp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+
+        file_size = os.path.getsize(temp_path) if temp_path and os.path.exists(temp_path) else 0
+        logger.info(f"Thumbnail saved to temp: {temp_path}, size={file_size}")
+
+        telethon_svc = await get_telethon_service()
+
+        def progress_callback(current: int, total: int):
+            try:
+                pct = int((current / total) * 100) if total else 0
+            except Exception:
+                pct = 0
+            logger.info(f"Thumbnail upload progress: {pct}% ({current}/{total} bytes)")
+
+        upload_result = await telethon_svc.upload_thumbnail(temp_path, original_filename=file.filename or "thumbnail.jpg", progress_callback=progress_callback)
+        logger.info(f"Thumbnail uploaded to Telegram: {upload_result}")
+
+        with open(temp_path, 'rb') as f:
+            thumbnail_bytes = f.read()
+        thumbnail_base64 = base64.b64encode(thumbnail_bytes).decode('utf-8')
+        logger.info(f"Thumbnail base64 encoded: length={len(thumbnail_base64)}")
+        
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        return {
+            "message_id": upload_result.get("message_id"),
+            "file_id": upload_result.get("file_id"),
+            "thumbnail_data": thumbnail_base64,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -178,6 +242,34 @@ async def delete_file(file_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.patch("/files/{file_id}")
+async def update_file(file_id: str, request: UpdateFileRequest):
+    """
+    Update file metadata (e.g., thumbnail_message_id, thumbnail_data).
+    """
+    try:
+        logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, thumbnail_data_len={len(request.thumbnail_data) if request.thumbnail_data else 0}")
+        file_service = get_file_service()
+        file_info = await file_service.get_file_info(file_id)
+        
+        if not file_info:
+            logger.error(f"File not found: {file_id}")
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        updated_info = await file_service.update_file(
+            file_id, 
+            thumbnail_message_id=request.thumbnail_message_id,
+            thumbnail_data=request.thumbnail_data
+        )
+        
+        logger.info(f"File updated successfully: {file_id}, thumbnail_data set={request.thumbnail_data is not None}")
+        return updated_info
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 @router.get("/files/{file_id}/download")
@@ -204,6 +296,54 @@ async def get_download_info(file_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/files/{file_id}/thumbnail")
+async def get_file_thumbnail(file_id: str):
+    """
+    Get thumbnail for image/video files from Telegram.
+    Returns base64 encoded thumbnail image.
+    
+    Priority: thumbnail_message_id > telegram_message_id (for backward compatibility)
+    """
+    from loguru import logger
+    try:
+        file_service = get_file_service()
+        file_info = await file_service.get_file_info(file_id)
+        
+        if not file_info:
+            logger.error(f"Thumbnail: File not found: {file_id}")
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        message_id = file_info.thumbnail_message_id or file_info.telegram_message_id
+        if not message_id:
+            logger.error(f"Thumbnail: No message ID for: {file_id}")
+            raise HTTPException(status_code=400, detail="No Telegram message ID")
+        
+        mtproto_service = await get_bot_service()
+        
+        mime_type = file_info.mime_type or ""
+        if not (mime_type.startswith('image/') or mime_type.startswith('video/')):
+            logger.error(f"Thumbnail: Not image/video: {mime_type}")
+            raise HTTPException(status_code=400, detail="Not an image or video file")
+        
+        logger.info(f"Getting thumbnail for message {message_id} (thumb_id={file_info.thumbnail_message_id}, file_id={file_info.telegram_message_id})")
+        thumbnail_data = await mtproto_service.get_thumbnail(message_id)
+        
+        if not thumbnail_data:
+            logger.error(f"Thumbnail: No data returned for message {message_id}")
+            raise HTTPException(status_code=404, detail="No thumbnail available")
+        
+        logger.info(f"Thumbnail retrieved: {len(thumbnail_data)} chars")
+        return {
+            "thumbnail": thumbnail_data,
+            "mime_type": "image/jpeg"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Thumbnail error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

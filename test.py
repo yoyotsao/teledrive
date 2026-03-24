@@ -3,8 +3,10 @@ from telethon.sessions import StringSession
 
 api_id = 17595730
 api_hash = '083b35d069db416b19789625a520be2c'
-session_str = '1BVtsOIwBuxL0tmv6hcI3QTzBEopFsdX9kj9G9OolJwUJNF0q5RFwgS_evBeWNhmVqmCWwEwyfPEfsZY0-QfEFwZ9uMmn53EuSdklGcnOaGCuD2hA_3fi-JX1Uw0W3QXrL4iGiD28V25bpZVfkcpqO61dVbVN2hX8L73wxXitQXpPOaElBNB180_gJ8krqrKo3gIQ5hOfDB6P1wRSxMUqCmypo7ECxuj09wFTfvOt1PGp4Tx84eLH8HmkNaMm4Y2rK92TYGEfstL9EJ69429WsJ_PdiyrITxtRW_AAof5vBDg-S111Uk79V-1rOiTuWm061m621tTltUI7jYpOuXIs9lLwZ43oh8='
+session_str = '1BVtsOIwBuzPpKl0qEsWRKNhnFfdgR_l162f6CA-1FYmP_M9KfzihfDzmovVAP-jQSGOgWb0nNXBTtNzkuLMt6BYdWmuDSO4uPt8vOnoe6WNLcGqDzPX4F8v1x3VPY2M_Bx6JaIthhCNCcrNIHQDguZydd7ePp_gP2-DowM1lLw-LscBD2fDU1fkMYk510E4HEIIyT6HD24ZKq8eZlleb8pAxq0e_ZxTzYy9HRQLMwf6EsWC3xjOR4mZi1pRz0P-t1XzrkRp3jMaC6rf5RiGaBVfeW6fS2E9PyhlvpdiyIwQlrn7qhzMNfBhWUxh3ADSNo8FKVLDOUYRWLnPT1s6A4Nwm3GQVGNU='
 
 with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
+    session_str = client.session.save()
+    print(session_str)
     me = client.get_me()
     print(f"OK: {me.first_name} (@{me.username})")

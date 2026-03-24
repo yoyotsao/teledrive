@@ -1,15 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import {
-  FileBrowser,
-  ChonkyActions,
-  DefaultFileActions,
-  FileData,
-  GenericFileActionHandler,
-  ChonkyActionUnion,
-} from '@aperturerobotics/chonky';
-import { ChonkyIconFA } from '@aperturerobotics/chonky-icon-fontawesome';
-import { api } from '../api/client';
+import { FileData } from '@aperturerobotics/chonky';
+import { api, generateThumbnail } from '../api/client';
 import { FileInfo } from '../types';
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
 
 export function ChonkyDrive() {
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
@@ -19,13 +18,41 @@ export function ChonkyDrive() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+  const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
 
-  // Drag-and-drop state
-  const dragCounter = useRef(0);
+  const dragCounterRef = useRef(0);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadingFiles, setUploadingFiles] = useState<
     Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>
   >([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const loadThumbnails = useCallback(async (files: FileInfo[]) => {
+    const imageOrVideoFiles = files.filter(
+      (f) => f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/')
+    );
+    
+    for (const file of imageOrVideoFiles) {
+      if (!thumbnails[file.file_id]) {
+        if (file.thumbnail_data) {
+          const thumbUrl = `data:image/jpeg;base64,${file.thumbnail_data}`;
+          console.log(`[Thumb] Using stored thumbnail_data for ${file.filename}`);
+          setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
+        } else {
+          try {
+            console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id})...`);
+            const thumb = await api.getThumbnail(file.file_id);
+            console.log(`[Thumb] Result for ${file.filename}:`, thumb ? `success` : 'null');
+            if (thumb) {
+              setThumbnails((prev) => ({ ...prev, [file.file_id]: thumb }));
+            }
+          } catch (err: any) {
+            console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
+          }
+        }
+      }
+    }
+  }, [thumbnails]);
 
   const loadContents = useCallback(async () => {
     setLoading(true);
@@ -36,14 +63,24 @@ export function ChonkyDrive() {
         api.listFolders(currentFolderId),
       ]);
 
+      const allOriginal: FileInfo[] = [...foldersResponse.files, ...filesResponse.files];
+      
+      // 去重：根據檔名去重，保留最新上傳的
+      const seenNames = new Set<string>();
+      const uniqueFiles = allOriginal.reverse().filter((f) => {
+        if (seenNames.has(f.filename)) return false;
+        seenNames.add(f.filename);
+        return true;
+      }).reverse();
+
       const fileEntries: FileData[] = [
-        ...foldersResponse.files.map((f: FileInfo): FileData => ({
+        ...uniqueFiles.filter((f) => f.isDir).map((f): FileData => ({
           id: f.file_id,
           name: f.filename,
           isDir: true,
           parentId: f.parent_id ?? undefined,
         })),
-        ...filesResponse.files.map((f: FileInfo): FileData => ({
+        ...uniqueFiles.filter((f) => !f.isDir).map((f): FileData => ({
           id: f.file_id,
           name: f.filename,
           isDir: false,
@@ -53,9 +90,11 @@ export function ChonkyDrive() {
         })),
       ];
 
-      const allOriginal: FileInfo[] = [...foldersResponse.files, ...filesResponse.files];
       setFiles(fileEntries);
-      setOriginalFiles(allOriginal);
+      setOriginalFiles(uniqueFiles);
+      
+      // Load thumbnails for images/videos
+      loadThumbnails(uniqueFiles);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load files');
       setFiles([]);
@@ -63,24 +102,11 @@ export function ChonkyDrive() {
     } finally {
       setLoading(false);
     }
-  }, [currentFolderId]);
+  }, [currentFolderId, loadThumbnails]);
 
   useEffect(() => {
     loadContents();
   }, [loadContents]);
-
-  const handleFileAction: GenericFileActionHandler<ChonkyActionUnion> = useCallback(
-    ({ action, payload }) => {
-      if (action.id === ChonkyActions.OpenFiles.id) {
-        const targetFile = (payload as { targetFile?: FileData }).targetFile;
-        if (targetFile?.isDir) {
-          setCurrentFolderId(targetFile.id);
-          setBreadcrumb((prev) => [...prev, targetFile]);
-        }
-      }
-    },
-    []
-  );
 
   const handleNavigateToBreadcrumb = (index: number) => {
     if (index === 0) {
@@ -115,29 +141,64 @@ export function ChonkyDrive() {
     }
   };
 
-  const handleDragEnter = (event: React.DragEvent) => {
+  const handleDragEnter = useCallback((event: React.DragEvent) => {
     event.preventDefault();
-    dragCounter.current += 1;
+    event.stopPropagation();
+    dragCounterRef.current += 1;
     setIsDragging(true);
-  };
+  }, []);
 
-  const handleDragLeave = (event: React.DragEvent) => {
+  const handleDragLeave = useCallback((event: React.DragEvent) => {
     event.preventDefault();
-    dragCounter.current -= 1;
-    if (dragCounter.current <= 0) {
-      dragCounter.current = 0;
+    event.stopPropagation();
+    
+    if (event.relatedTarget) {
+      const currentTarget = event.currentTarget as HTMLElement;
+      const relatedTarget = event.relatedTarget as HTMLElement;
+      if (currentTarget.contains(relatedTarget)) {
+        return;
+      }
+    }
+    
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0;
       setIsDragging(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+  }, []);
+
+  const uploadWithThumbnail = async (file: File): Promise<void> => {
+    const isImageOrVideo = file.type.startsWith('image/') || file.type.startsWith('video/');
+    
+    const result = await api.uploadFile(file, currentFolderId ?? undefined);
+    console.log('[Upload] File uploaded:', result.file_id, result.filename);
+    
+    if (isImageOrVideo) {
+      const thumbBlob = await generateThumbnail(file, 200);
+      if (thumbBlob) {
+        console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
+        try {
+          const thumbResult = await api.uploadThumbnail(thumbBlob);
+          console.log('[Thumb] Uploaded to Telegram, message_id:', thumbResult.message_id, 'data_len:', thumbResult.thumbnail_data?.length);
+          await api.updateFile(result.file_id, thumbResult.message_id, thumbResult.thumbnail_data);
+          console.log('[Thumb] Updated file with thumbnail_message_id and thumbnail_data');
+        } catch (err: any) {
+          console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+        }
+      } else {
+        console.log('[Thumb] generateThumbnail returned null for:', file.name);
+      }
     }
   };
 
-  const handleDragOver = (event: React.DragEvent) => {
+  const handleDrop = useCallback(async (event: React.DragEvent) => {
     event.preventDefault();
-  };
-
-  const handleDrop = async (event: React.DragEvent) => {
-    event.preventDefault();
+    dragCounterRef.current = 0;
     setIsDragging(false);
-    dragCounter.current = 0;
 
     const droppedFiles = Array.from(event.dataTransfer.files);
     if (droppedFiles.length === 0) return;
@@ -157,7 +218,7 @@ export function ChonkyDrive() {
     for (let i = 0; i < droppedFiles.length; i++) {
       const file = droppedFiles[i];
       try {
-        await api.uploadFile(file, currentFolderId ?? undefined);
+        await uploadWithThumbnail(file);
         results[i] = { name: file.name, progress: 100, status: 'complete' };
       } catch (err: any) {
         results[i] = {
@@ -171,16 +232,44 @@ export function ChonkyDrive() {
     }
 
     loadContents();
+  }, [currentFolderId, loadContents, uploadWithThumbnail]);
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    if (selectedFiles.length === 0) return;
+
+    const initialFiles = selectedFiles.map((f) => ({
+      name: f.name,
+      progress: 0,
+      status: 'uploading' as const,
+    }));
+    setUploadingFiles(initialFiles);
+
+    const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
+
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const file = selectedFiles[i];
+      try {
+        await uploadWithThumbnail(file);
+        results[i] = { name: file.name, progress: 100, status: 'complete' };
+      } catch (err: any) {
+        results[i] = {
+          name: file.name,
+          progress: 0,
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Upload failed',
+        };
+      }
+      setUploadingFiles([...results]);
+    }
+
+    loadContents();
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const allActions = [...DefaultFileActions];
-
-  const currentFolderName =
-    currentFolderId === null
-      ? 'Root'
-      : breadcrumb.length > 0
-      ? breadcrumb[breadcrumb.length - 1].name
-      : 'Folder';
+  const handleUploadClick = () => {
+    fileInputRef.current?.click();
+  };
 
   return (
     <div
@@ -193,7 +282,7 @@ export function ChonkyDrive() {
       {isDragging && (
         <div
           style={{
-            position: 'absolute',
+            position: 'fixed',
             inset: 0,
             background: 'rgba(59, 130, 246, 0.15)',
             border: '3px dashed #3b82f6',
@@ -201,7 +290,8 @@ export function ChonkyDrive() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            zIndex: 100,
+            zIndex: 1000,
+            pointerEvents: 'none', // Overlay doesn't capture drag events - parent handles them
           }}
         >
           <span style={{ fontSize: '20px', fontWeight: 600, color: '#3b82f6' }}>
@@ -350,6 +440,31 @@ export function ChonkyDrive() {
         >
           + New Folder
         </button>
+
+        <button
+          onClick={handleUploadClick}
+          style={{
+            background: '#16a34a',
+            border: 'none',
+            cursor: 'pointer',
+            color: 'white',
+            fontSize: '14px',
+            padding: '8px 16px',
+            borderRadius: '6px',
+            marginLeft: '8px',
+            fontWeight: 500,
+          }}
+        >
+          ↑ Upload Files
+        </button>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          onChange={handleFileSelect}
+          style={{ display: 'none' }}
+        />
       </div>
 
       {error && (
@@ -389,27 +504,96 @@ export function ChonkyDrive() {
       )}
 
       {files.length > 0 && (
-        <FileBrowser
-          files={files}
-          folderChain={currentFolderId !== null ? [{ id: currentFolderId, name: currentFolderName, isDir: true }] : []}
-          onFileAction={handleFileAction}
-          fileActions={allActions}
-          iconComponent={ChonkyIconFA}
-          disableDragAndDrop
-          defaultFileViewActionId={
-            viewMode === 'grid'
-              ? ChonkyActions.EnableGridView.id
-              : ChonkyActions.EnableListView.id
-          }
-          thumbnailGenerator={(file: FileData) => {
+        <div style={{
+          display: viewMode === 'grid' ? 'grid' : 'flex',
+          gridTemplateColumns: viewMode === 'grid' ? 'repeat(auto-fill, minmax(150px, 1fr))' : undefined,
+          flexDirection: viewMode === 'grid' ? undefined : 'column',
+          gap: '8px',
+        }}>
+          {files.map((file) => {
             const original = originalFiles.find((f) => f.file_id === file.id);
-            if (!original) return null;
-            if (original.file_type === 'photo' || original.mime_type?.startsWith('image/')) {
-              return original.direct_url || null;
-            }
-            return null;
-          }}
-        />
+            const isImage = original?.mime_type?.startsWith('image/');
+            const isVideo = original?.mime_type?.startsWith('video/');
+            const thumbnailUrl = original ? thumbnails[original.file_id] : null;
+            
+            return (
+              <div
+                key={file.id}
+                style={{
+                  display: 'flex',
+                  alignItems: viewMode === 'grid' ? 'center' : 'center',
+                  flexDirection: viewMode === 'grid' ? 'column' : 'row',
+                  padding: viewMode === 'grid' ? '12px' : '12px',
+                  background: 'white',
+                  border: '1px solid #e5e7eb',
+                  borderRadius: '8px',
+                  cursor: file.isDir ? 'pointer' : 'default',
+                  textAlign: viewMode === 'grid' ? 'center' : 'left',
+                }}
+                onClick={() => {
+                  if (file.isDir) {
+                    setCurrentFolderId(file.id);
+                    setBreadcrumb((prev) => [...prev, file]);
+                  }
+                }}
+              >
+                <div style={{
+                  width: viewMode === 'grid' ? '80px' : '40px',
+                  height: viewMode === 'grid' ? '80px' : '40px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: (isImage || isVideo) ? '#f3f4f6' : 'transparent',
+                  borderRadius: '4px',
+                  marginRight: viewMode === 'grid' ? 0 : '12px',
+                  marginBottom: viewMode === 'grid' ? '8px' : 0,
+                  overflow: 'hidden',
+                  position: 'relative',
+                }}>
+                  {file.isDir ? (
+                    <span style={{ fontSize: viewMode === 'grid' ? '40px' : '20px' }}>📁</span>
+                  ) : (isImage || isVideo) && thumbnailUrl ? (
+                    <>
+                      <img 
+                        src={thumbnailUrl} 
+                        alt={file.name}
+                        style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'cover' }}
+                      />
+                      {isVideo && (
+                        <span style={{
+                          position: 'absolute',
+                          fontSize: '16px',
+                        }}>▶️</span>
+                      )}
+                    </>
+                  ) : (isImage || isVideo) ? (
+                    <span style={{ fontSize: viewMode === 'grid' ? '40px' : '20px' }}>
+                      {isVideo ? '🎬' : '🖼️'}
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: viewMode === 'grid' ? '40px' : '20px' }}>📄</span>
+                  )}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ 
+                    fontSize: '14px', 
+                    color: '#374151',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: viewMode === 'grid' ? 'nowrap' : 'normal',
+                  }}>
+                    {file.name}
+                  </div>
+                  {!file.isDir && file.size && (
+                    <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                      {formatFileSize(file.size)}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );

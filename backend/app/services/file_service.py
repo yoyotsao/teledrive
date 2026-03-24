@@ -174,6 +174,7 @@ class FileService:
         file_id: str,
         access_hash: Optional[str] = None,
         parent_id: Optional[str] = None,
+        thumbnail_message_id: Optional[int] = None,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -190,14 +191,14 @@ class FileService:
             mime_type=mime_type,
             file_type=file_type,
             telegram_message_id=message_id,
+            thumbnail_message_id=thumbnail_message_id,
             created_at=datetime.utcnow(),
-            direct_url=None,  # Will be generated on download request
+            direct_url=None,
             access_hash=None,
             parent_id=parent_id,
             isDir=False
         )
         
-        # Store access_hash in session for download
         session = UploadSession(
             file_id=file_id,
             filename=filename,
@@ -213,7 +214,7 @@ class FileService:
         self._upload_sessions[file_id] = session
         self._files_metadata[file_id] = file_info
         
-        logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}")
+        logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, thumbnail: {thumbnail_message_id}")
         
         return file_info
     
@@ -336,6 +337,26 @@ class FileService:
             logger.info(f"Folder deleted: {folder_id}")
             return True
         return False
+
+    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, thumbnail_data: Optional[str] = None) -> Optional[FileInfo]:
+        """Update file metadata."""
+        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, thumbnail_data_len={len(thumbnail_data) if thumbnail_data else 0}")
+        file_info = self._files_metadata.get(file_id)
+        if not file_info:
+            logger.error(f"File not found in metadata: {file_id}")
+            return None
+        
+        if thumbnail_message_id is not None:
+            file_info.thumbnail_message_id = thumbnail_message_id
+            logger.info(f"File updated: {file_id}, thumbnail_message_id: {thumbnail_message_id}")
+        
+        if thumbnail_data is not None:
+            file_info.thumbnail_data = thumbnail_data
+            logger.info(f"File updated: {file_id}, thumbnail_data length: {len(thumbnail_data)}")
+        
+        self._files_metadata[file_id] = file_info
+        logger.info(f"File stored in metadata: {file_id}, thumbnail_data present: {file_info.thumbnail_data is not None}")
+        return file_info
     
     def get_chunk_size(self) -> int:
         """Get the configured chunk size."""

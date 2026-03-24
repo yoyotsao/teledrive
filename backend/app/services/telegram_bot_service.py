@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import Document, Message
 from telethon.tl.functions.upload import GetFileRequest
 from loguru import logger
@@ -42,7 +43,7 @@ class TelegramMTProtoService:
             # Use session string if provided, otherwise create memory session
             if self.session_string:
                 self._client = TelegramClient(
-                    session=self.session_string,
+                    session=StringSession(self.session_string),
                     api_id=self.api_id,
                     api_hash=self.api_hash
                 )
@@ -240,6 +241,108 @@ class TelegramMTProtoService:
         except Exception as e:
             logger.error(f"Failed to download file: {e}")
             raise
+
+    async def get_thumbnail(self, message_id: int) -> Optional[str]:
+        """
+        Get thumbnail for a message containing an image or video.
+        Returns base64 encoded thumbnail.
+        """
+        try:
+            import base64
+            from telethon.tl.types import InputPhotoFileLocation, InputDocumentFileLocation
+            client = await self.connect()
+            
+            message = await client.get_messages('me', ids=message_id)
+            if not message:
+                logger.error(f"Thumbnail: Message {message_id} not found")
+                return None
+            
+            photo = getattr(message, 'photo', None)
+            if photo:
+                logger.info(f"Thumbnail: Found photo on message {message_id}")
+                sizes = getattr(photo, 'sizes', [])
+                photo_access_hash = getattr(photo, 'access_hash', 0) or 0
+                photo_file_ref = getattr(photo, 'file_reference', b'') or b''
+                logger.info(f"Thumbnail: Photo sizes count = {len(sizes)}, photo.id = {photo.id}, access_hash = {photo_access_hash}, file_ref = {photo_file_ref[:20] if photo_file_ref else 'empty'}")
+                
+                if sizes:
+                    largest = None
+                    for s in sizes:
+                        stype = getattr(s, 'type', '')
+                        size_val = getattr(s, 'size', 0)
+                        logger.info(f"Thumbnail:   size type={stype}, size={size_val}")
+                        if isinstance(stype, str) and stype.lower() in ['y', 'm']:
+                            largest = s
+                            if stype.lower() == 'y':
+                                break
+                    if not largest:
+                        largest = sizes[-1]
+                    
+                    thumb_size = getattr(largest, 'type', '')
+                    
+                    input_loc = InputPhotoFileLocation(
+                        id=photo.id,
+                        access_hash=photo_access_hash,
+                        file_reference=photo_file_ref,
+                        thumb_size=thumb_size
+                    )
+                    
+                    logger.info(f"Thumbnail: Invoking GetFileRequest with InputPhotoFileLocation")
+                    result = await client.invoke(GetFileRequest(
+                        location=input_loc,
+                        offset=0,
+                        limit=256 * 1024
+                    ))
+                    if hasattr(result, 'bytes') and result.bytes:
+                        logger.info(f"Thumbnail: Successfully got {len(result.bytes)} bytes")
+                        return base64.b64encode(bytes(result.bytes)).decode()
+                    else:
+                        logger.warning(f"Thumbnail: GetFileRequest returned no bytes")
+            
+            media = getattr(message, 'media', None)
+            if media:
+                if hasattr(media, 'photo') and media.photo:
+                    photo = media.photo
+                    sizes = getattr(photo, 'sizes', [])
+                    if sizes:
+                        largest = sizes[-1]
+                        thumb_size = getattr(largest, 'type', '')
+                        input_loc = InputPhotoFileLocation(
+                            id=photo.id,
+                            access_hash=getattr(photo, 'access_hash', 0) or 0,
+                            file_reference=getattr(photo, 'file_reference', b'') or b'',
+                            thumb_size=thumb_size
+                        )
+                        result = await client.invoke(GetFileRequest(
+                            location=input_loc,
+                            offset=0,
+                            limit=256 * 1024
+                        ))
+                        if hasattr(result, 'bytes') and result.bytes:
+                            return base64.b64encode(bytes(result.bytes)).decode()
+                
+                doc = getattr(media, 'document', None)
+                if doc:
+                    thumb = getattr(doc, 'thumb', None)
+                    if thumb:
+                        loc = getattr(thumb, 'location', None)
+                        if loc:
+                            result = await client.invoke(GetFileRequest(
+                                location=loc,
+                                offset=0,
+                                limit=256 * 1024
+                            ))
+                            if hasattr(result, 'bytes') and result.bytes:
+                                return base64.b64encode(bytes(result.bytes)).decode()
+            
+            logger.warning(f"Thumbnail: No thumbnail data found for message {message_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get thumbnail: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 
 # Singleton instance

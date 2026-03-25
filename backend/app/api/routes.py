@@ -80,7 +80,6 @@ class CreateFolderRequest(BaseModel):
 
 class UpdateFileRequest(BaseModel):
     thumbnail_message_id: Optional[int] = None
-    thumbnail_data: Optional[str] = None
     parent_id: Optional[str] = None
 
 
@@ -158,7 +157,6 @@ async def upload_thumbnail(file: UploadFile = File(...)):
         return {
             "message_id": upload_result.get("message_id"),
             "file_id": upload_result.get("file_id"),
-            "thumbnail_data": thumbnail_base64,
         }
     except Exception as e:
         import traceback
@@ -179,26 +177,58 @@ async def generate_video_thumbnail(request: VideoThumbnailRequest):
     thumb_temp: Optional[str] = None
     try:
         telethon_svc = await get_telethon_service()
+        
+        # Ensure Telethon is connected
+        await telethon_svc.connect()
 
         # Step 1: Get message info to verify it's a video
         try:
             message = await telethon_svc.client.get_messages("me", ids=request.message_id)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to get message: {e}")
             raise HTTPException(status_code=404, detail="Message not found")
 
+        # Handle list response from get_messages
+        if hasattr(message, '__len__') and len(message) > 0:
+            message = message[0]
+        
         if not message:
             raise HTTPException(status_code=404, detail="Message not found")
 
+        # Debug: log message attributes
+        logger.info(f"Message {request.message_id}: document={getattr(message, 'document', None)}, media={getattr(message, 'media', None)}")
+        
         mime_type = ""
+        is_video = False
+        
         if getattr(message, 'document', None):
             mime_type = getattr(message.document, 'mime_type', '') or ''
+            logger.info(f"Got mime_type from document: {mime_type}")
+            
+            # Check if it's a video by mime_type or by filename extension
+            if mime_type.startswith('video/'):
+                is_video = True
+            else:
+                # Check filename extension for videos
+                attributes = getattr(message.document, 'attributes', [])
+                for attr in attributes:
+                    if hasattr(attr, 'file_name'):
+                        filename = attr.file_name or ''
+                        if filename.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv')):
+                            is_video = True
+                            logger.info(f"Detected video by filename extension: {filename}")
+                            break
         elif getattr(message, 'media', None):
             media = getattr(message.media, 'document', None) or getattr(message.media, 'photo', None)
             if media:
                 mime_type = getattr(media, 'mime_type', '') or ''
+                logger.info(f"Got mime_type from media: {mime_type}")
+                if mime_type.startswith('video/'):
+                    is_video = True
 
-        if not mime_type.startswith('video/'):
-            raise HTTPException(status_code=400, detail="Not a video file")
+        logger.info(f"Final mime_type: '{mime_type}', is_video: {is_video}")
+        if not is_video:
+            raise HTTPException(status_code=400, detail=f"Not a video file, got: '{mime_type}'")
 
         # Step 2: Download video to temp file
         logger.info(f"Downloading video message {request.message_id} for thumbnail generation")
@@ -243,10 +273,10 @@ async def generate_video_thumbnail(request: VideoThumbnailRequest):
         )
         logger.info(f"Thumbnail uploaded: {upload_result}")
 
+        # Return the thumbnail's message_id, not the original video's message_id
         return {
-            "message_id": request.message_id,
+            "message_id": upload_result.get("message_id"),
             "file_id": upload_result.get("file_id"),
-            "thumbnail_data": thumbnail_base64,
         }
 
     except HTTPException:
@@ -414,10 +444,10 @@ async def delete_all_files():
 @router.patch("/files/{file_id}")
 async def update_file(file_id: str, request: UpdateFileRequest):
     """
-    Update file metadata (e.g., thumbnail_message_id, thumbnail_data, parent_id for move).
+    Update file metadata (e.g., thumbnail_message_id, parent_id for move).
     """
     try:
-        logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, thumbnail_data_len={len(request.thumbnail_data) if request.thumbnail_data else 0}, parent_id={request.parent_id}")
+        logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, parent_id={request.parent_id}")
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id)
         
@@ -428,11 +458,10 @@ async def update_file(file_id: str, request: UpdateFileRequest):
         updated_info = await file_service.update_file(
             file_id, 
             thumbnail_message_id=request.thumbnail_message_id,
-            thumbnail_data=request.thumbnail_data,
             parent_id=request.parent_id
         )
         
-        logger.info(f"File updated successfully: {file_id}, thumbnail_data set={request.thumbnail_data is not None}, parent_id set={request.parent_id is not None}")
+        logger.info(f"File updated successfully: {file_id}, parent_id set={request.parent_id is not None}")
         return updated_info
     except HTTPException:
         raise
@@ -580,6 +609,7 @@ async def stream_file(file_id: str, request: Request):
             raise HTTPException(status_code=404, detail="File not found")
         
         message_id = file_info.telegram_message_id
+        
         if not message_id:
             raise HTTPException(status_code=400, detail="No Telegram message ID")
         
@@ -627,33 +657,23 @@ async def stream_file(file_id: str, request: Request):
             logger.info(f"Streaming range: {file_id}, bytes {start}-{actual_end}/{file_size}")
             
             async def generate_range():
-                chunk_size = 1024 * 1024  # 1MB chunks
-                offset = start
-                remaining = content_length
-                
-                while remaining > 0:
-                    current_chunk = min(chunk_size, remaining)
-                    try:
-                        chunk = await mtproto_service.download_file(
-                            message_id,
-                            offset=offset,
-                            limit=current_chunk
-                        )
-                        if not chunk:
-                            break
+                # Range request - download only the requested range
+                try:
+                    chunk = await mtproto_service.download_file(
+                        message_id=message_id,
+                        offset=start,
+                        limit=content_length
+                    )
+                    if chunk:
                         yield chunk
-                        offset += len(chunk)
-                        remaining -= len(chunk)
-                    except Exception as chunk_err:
-                        logger.error(f"Chunk download error: {chunk_err}")
-                        break
+                except Exception as chunk_err:
+                    logger.error(f"Range download error: {chunk_err}")
             
             return StreamingResponse(
                 generate_range(),
                 status_code=206,
                 media_type=mime_type,
                 headers={
-                    "Content-Length": str(content_length),
                     "Content-Range": f"bytes {start}-{actual_end}/{file_size}",
                     "Accept-Ranges": "bytes"
                 }
@@ -663,33 +683,24 @@ async def stream_file(file_id: str, request: Request):
             logger.info(f"Streaming full file: {file_id}, size={file_size}")
             
             async def generate_full():
-                chunk_size = 1024 * 1024  # 1MB chunks
-                offset = 0
-                remaining = file_size
-                
-                while remaining > 0:
-                    current_chunk = min(chunk_size, remaining)
-                    try:
-                        chunk = await mtproto_service.download_file(
-                            message_id,
-                            offset=offset,
-                            limit=current_chunk
-                        )
-                        if not chunk:
-                            break
+                # For full file download, get everything in one request (or few large chunks)
+                # Telegram requires minimum 512KB limit, so we request the full file at once
+                try:
+                    chunk = await mtproto_service.download_file(
+                        message_id=message_id,
+                        offset=0,
+                        limit=file_size  # Request full file
+                    )
+                    if chunk:
                         yield chunk
-                        offset += len(chunk)
-                        remaining -= len(chunk)
-                    except Exception as chunk_err:
-                        logger.error(f"Chunk download error: {chunk_err}")
-                        break
+                except Exception as chunk_err:
+                    logger.error(f"Download error: {chunk_err}")
             
             return StreamingResponse(
                 generate_full(),
                 status_code=200,
                 media_type=mime_type,
                 headers={
-                    "Content-Length": str(file_size),
                     "Accept-Ranges": "bytes"
                 }
             )
@@ -705,7 +716,7 @@ async def stream_file(file_id: str, request: Request):
 async def create_folder(request: CreateFolderRequest):
     try:
         file_service = get_file_service()
-        folder = file_service.create_folder(request.name, request.parent_id)
+        folder = await file_service.create_folder(request.name, request.parent_id)
         return folder
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

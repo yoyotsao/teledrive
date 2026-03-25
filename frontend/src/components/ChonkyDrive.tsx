@@ -44,21 +44,16 @@ export function ChonkyDrive() {
     
     for (const file of imageOrVideoFiles) {
       if (!thumbnails[file.file_id]) {
-        if (file.thumbnail_data) {
-          const thumbUrl = `data:image/jpeg;base64,${file.thumbnail_data}`;
-          console.log(`[Thumb] Using stored thumbnail_data for ${file.filename}`);
-          setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
-        } else {
-          try {
-            console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id})...`);
-            const thumb = await api.getThumbnail(file.file_id);
-            console.log(`[Thumb] Result for ${file.filename}:`, thumb ? `success` : 'null');
-            if (thumb) {
-              setThumbnails((prev) => ({ ...prev, [file.file_id]: thumb }));
-            }
-          } catch (err: any) {
-            console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
+        // Always load thumbnail from Telegram via thumbnail_message_id
+        try {
+          console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id})...`);
+          const thumb = await api.getThumbnail(file.file_id);
+          console.log(`[Thumb] Result for ${file.filename}:`, thumb ? `success` : 'null');
+          if (thumb) {
+            setThumbnails((prev) => ({ ...prev, [file.file_id]: thumb }));
           }
+        } catch (err: any) {
+          console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
         }
       }
     }
@@ -220,8 +215,8 @@ export function ChonkyDrive() {
         console.log('[Thumb] Generating video thumbnail via backend API for message_id:', result.message_id);
         try {
           const thumbResult = await api.generateVideoThumbnail(result.message_id);
-          console.log('[Thumb] Got video thumbnail, message_id:', thumbResult.message_id, 'data_len:', thumbResult.thumbnail_data?.length);
-          await api.updateFile(result.file_id, thumbResult.message_id, thumbResult.thumbnail_data);
+          console.log('[Thumb] Got video thumbnail, message_id:', thumbResult.message_id);
+          await api.updateFile(result.file_id, thumbResult.message_id);
           console.log('[Thumb] Updated file with video thumbnail metadata');
         } catch (err: any) {
           console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
@@ -233,9 +228,9 @@ export function ChonkyDrive() {
           console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
           try {
             const thumbResult = await api.uploadThumbnail(thumbBlob);
-            console.log('[Thumb] Uploaded to Telegram, message_id:', thumbResult.message_id, 'data_len:', thumbResult.thumbnail_data?.length);
-            await api.updateFile(result.file_id, thumbResult.message_id, thumbResult.thumbnail_data);
-            console.log('[Thumb] Updated file with thumbnail_message_id and thumbnail_data');
+            console.log('[Thumb] Uploaded to Telegram, message_id:', thumbResult.message_id);
+            await api.updateFile(result.file_id, thumbResult.message_id);
+            console.log('[Thumb] Updated file with thumbnail_message_id');
           } catch (err: any) {
             console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
           }

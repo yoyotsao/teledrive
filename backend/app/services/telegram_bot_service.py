@@ -225,10 +225,13 @@ class TelegramMTProtoService:
                 thumb_size=''
             )
             
-            result = await client.invoke(GetFileRequest(
+            # Telegram requires minimum 512KB limit
+            actual_limit = max(limit, 512 * 1024)
+            
+            result = await client(GetFileRequest(
                 location=location,
                 offset=offset,
-                limit=limit
+                limit=actual_limit
             ))
             
             if hasattr(result, 'bytes'):
@@ -257,20 +260,23 @@ class TelegramMTProtoService:
                 logger.error(f"Thumbnail: Message {message_id} not found")
                 return None
             
+            # Debug: log message structure
+            logger.info(f"Thumbnail: message.photo = {getattr(message, 'photo', None)}")
+            logger.info(f"Thumbnail: message.media = {getattr(message, 'media', None)}")
+            
+            # First, check if message has a photo (original photo)
             photo = getattr(message, 'photo', None)
             if photo:
                 logger.info(f"Thumbnail: Found photo on message {message_id}")
                 sizes = getattr(photo, 'sizes', [])
                 photo_access_hash = getattr(photo, 'access_hash', 0) or 0
                 photo_file_ref = getattr(photo, 'file_reference', b'') or b''
-                logger.info(f"Thumbnail: Photo sizes count = {len(sizes)}, photo.id = {photo.id}, access_hash = {photo_access_hash}, file_ref = {photo_file_ref[:20] if photo_file_ref else 'empty'}")
+                logger.info(f"Thumbnail: Photo sizes count = {len(sizes)}, photo.id = {photo.id}, access_hash = {photo_access_hash}")
                 
                 if sizes:
                     largest = None
                     for s in sizes:
                         stype = getattr(s, 'type', '')
-                        size_val = getattr(s, 'size', 0)
-                        logger.info(f"Thumbnail:   size type={stype}, size={size_val}")
                         if isinstance(stype, str) and stype.lower() in ['y', 'm']:
                             largest = s
                             if stype.lower() == 'y':
@@ -287,20 +293,23 @@ class TelegramMTProtoService:
                         thumb_size=thumb_size
                     )
                     
-                    logger.info(f"Thumbnail: Invoking GetFileRequest with InputPhotoFileLocation")
-                    result = await client.invoke(GetFileRequest(
+                    result = await client(GetFileRequest(
                         location=input_loc,
                         offset=0,
                         limit=256 * 1024
                     ))
                     if hasattr(result, 'bytes') and result.bytes:
-                        logger.info(f"Thumbnail: Successfully got {len(result.bytes)} bytes")
+                        logger.info(f"Thumbnail: Successfully got {len(result.bytes)} bytes from photo")
                         return base64.b64encode(bytes(result.bytes)).decode()
-                    else:
-                        logger.warning(f"Thumbnail: GetFileRequest returned no bytes")
             
+            # Check media attribute
             media = getattr(message, 'media', None)
             if media:
+                logger.info(f"Thumbnail: media = {media}")
+                logger.info(f"Thumbnail: media.photo = {getattr(media, 'photo', None)}")
+                logger.info(f"Thumbnail: media.document = {getattr(media, 'document', None)}")
+                
+                # Check if media has a photo
                 if hasattr(media, 'photo') and media.photo:
                     photo = media.photo
                     sizes = getattr(photo, 'sizes', [])
@@ -313,7 +322,7 @@ class TelegramMTProtoService:
                             file_reference=getattr(photo, 'file_reference', b'') or b'',
                             thumb_size=thumb_size
                         )
-                        result = await client.invoke(GetFileRequest(
+                        result = await client(GetFileRequest(
                             location=input_loc,
                             offset=0,
                             limit=256 * 1024
@@ -323,7 +332,28 @@ class TelegramMTProtoService:
                 
                 doc = getattr(media, 'document', None)
                 if doc:
+                    logger.info(f"Thumbnail: Found document, mime_type = {getattr(doc, 'mime_type', None)}")
+                    # First, try to get the document's thumbnail (for videos)
                     thumb = getattr(doc, 'thumb', None)
+                    logger.info(f"Thumbnail: doc.thumb = {thumb}")
+                    if thumb:
+                        loc = getattr(thumb, 'location', None)
+                        if loc:
+                            result = await client(GetFileRequest(
+                                location=loc,
+                                offset=0,
+                                limit=256 * 1024
+                            ))
+                            if hasattr(result, 'bytes') and result.bytes:
+                                return base64.b64encode(bytes(result.bytes)).decode()
+                
+                # Check if it's a document (could be an image file or video with thumbnail)
+                doc = getattr(media, 'document', None)
+                if doc:
+                    logger.info(f"Thumbnail: Found document, mime_type = {getattr(doc, 'mime_type', None)}")
+                    # First, try to get the document's thumbnail (for videos)
+                    thumb = getattr(doc, 'thumb', None)
+                    logger.info(f"Thumbnail: doc.thumb = {thumb}")
                     if thumb:
                         loc = getattr(thumb, 'location', None)
                         if loc:
@@ -334,6 +364,25 @@ class TelegramMTProtoService:
                             ))
                             if hasattr(result, 'bytes') and result.bytes:
                                 return base64.b64encode(bytes(result.bytes)).decode()
+                    
+                    # If no thumbnail, try to download the document itself
+                    # This handles cases where the thumbnail was uploaded as a file (application/octet-stream)
+                    logger.info(f"Thumbnail: No thumb on document, trying to download full document")
+                    file_ref = getattr(doc, 'file_reference', b'') or b''
+                    input_loc = InputDocumentFileLocation(
+                        id=doc.id,
+                        access_hash=getattr(doc, 'access_hash', 0) or 0,
+                        file_reference=file_ref,
+                        thumb_size=''
+                    )
+                    result = await client(GetFileRequest(
+                        location=input_loc,
+                        offset=0,
+                        limit=256 * 1024
+                    ))
+                    if hasattr(result, 'bytes') and result.bytes:
+                        logger.info(f"Thumbnail: Got {len(result.bytes)} bytes from document")
+                        return base64.b64encode(bytes(result.bytes)).decode()
             
             logger.warning(f"Thumbnail: No thumbnail data found for message {message_id}")
             return None

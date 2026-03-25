@@ -63,26 +63,25 @@ export const api = {
     return null;
   },
 
-  uploadThumbnail: async (thumbnailBlob: Blob): Promise<{ message_id: number; file_id: string; thumbnail_data?: string }> => {
+  uploadThumbnail: async (thumbnailBlob: Blob): Promise<{ message_id: number; file_id: string }> => {
     const formData = new FormData();
     formData.append('file', thumbnailBlob, 'thumbnail.jpg');
-    const response = await client.post<{ message_id: number; file_id: string; thumbnail_data?: string }>('/files/thumbnail/upload', formData, {
+    const response = await client.post<{ message_id: number; file_id: string }>('/files/thumbnail/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
     return response.data;
   },
 
-  updateFile: async (fileId: string, thumbnailMessageId?: number, thumbnailData?: string, parentId?: string): Promise<FileInfo> => {
+  updateFile: async (fileId: string, thumbnailMessageId?: number, parentId?: string): Promise<FileInfo> => {
     const response = await client.patch<FileInfo>(`/files/${fileId}`, {
       thumbnail_message_id: thumbnailMessageId,
-      thumbnail_data: thumbnailData,
       parent_id: parentId,
     });
     return response.data;
   },
 
-  generateVideoThumbnail: async (messageId: number): Promise<{ message_id: number; file_id: string; thumbnail_data: string }> => {
-    const response = await client.post<{ message_id: number; file_id: string; thumbnail_data: string }>('/videos/thumbnail', {
+  generateVideoThumbnail: async (messageId: number): Promise<{ message_id: number; file_id: string }> => {
+    const response = await client.post<{ message_id: number; file_id: string }>('/videos/thumbnail', {
       message_id: messageId,
     });
     return response.data;

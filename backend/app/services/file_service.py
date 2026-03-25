@@ -10,6 +10,7 @@ from app.models.schemas import (
     UploadStatus, UploadInitRequest
 )
 from app.services.config import get_settings
+from app.services.database import get_database, Database
 
 
 class FileService:
@@ -20,12 +21,36 @@ class FileService:
         self.chunk_size = settings.chunk_size
         self.max_file_size = settings.max_file_size
         
-        # In-memory storage for upload sessions and file metadata
-        # In production, use a database (PostgreSQL, MongoDB, etc.)
+        # In-memory cache for upload sessions (short-lived, no need to persist)
         self._upload_sessions: Dict[str, UploadSession] = {}
-        self._files_metadata: Dict[str, FileInfo] = {}
+        
+        # Database instance for persistent file metadata
+        self._db: Optional[Database] = None
         
         logger.info("File service initialized")
+    
+    async def _get_db(self) -> Database:
+        """Get database instance."""
+        if self._db is None:
+            self._db = await get_database()
+        return self._db
+    
+    def _row_to_file_info(self, row: dict) -> FileInfo:
+        """Convert database row to FileInfo model."""
+        return FileInfo(
+            file_id=row['file_id'],
+            filename=row['filename'],
+            filesize=row['filesize'],
+            mime_type=row['mime_type'],
+            file_type=FileType(row['file_type']),
+            telegram_message_id=row['telegram_message_id'],
+            thumbnail_message_id=row['thumbnail_message_id'],
+            created_at=datetime.fromisoformat(row['created_at']) if isinstance(row['created_at'], str) else row['created_at'],
+            direct_url=row.get('direct_url'),
+            access_hash=row.get('access_hash'),
+            parent_id=row.get('parent_id'),
+            isDir=bool(row['isDir']) if row.get('isDir') is not None else False
+        )
     
     def _detect_file_type(self, mime_type: Optional[str], filename: str) -> FileType:
         """Detect file type from mime type or extension."""
@@ -137,6 +162,7 @@ class FileService:
             session.status = UploadStatus.COMPLETED
             
             # Create file metadata
+            db = await self._get_db()
             file_type = self._detect_file_type(session.mime_type, session.filename)
             
             file_info = FileInfo(
@@ -153,7 +179,21 @@ class FileService:
                 isDir=False
             )
             
-            self._files_metadata[file_info.file_id] = file_info
+            # Store in SQLite
+            await db.insert_file(
+                file_id=file_info.file_id,
+                filename=file_info.filename,
+                filesize=file_info.filesize,
+                mime_type=file_info.mime_type,
+                file_type=file_info.file_type.value,
+            telegram_message_id=file_info.telegram_message_id,
+            thumbnail_message_id=file_info.thumbnail_message_id,
+            created_at=file_info.created_at.isoformat(),
+            direct_url=file_info.direct_url,
+                access_hash=file_info.access_hash,
+                parent_id=file_info.parent_id,
+                is_dir=file_info.isDir
+            )
             
             logger.info(f"Upload completed: {file_id}")
         
@@ -182,7 +222,9 @@ class FileService:
         This is called by the frontend after uploading directly to Telegram.
         Only metadata is stored on the server.
         """
+        db = await self._get_db()
         file_type = self._detect_file_type(mime_type, filename)
+        created_at = datetime.utcnow()
         
         file_info = FileInfo(
             file_id=file_id,
@@ -192,9 +234,9 @@ class FileService:
             file_type=file_type,
             telegram_message_id=message_id,
             thumbnail_message_id=thumbnail_message_id,
-            created_at=datetime.utcnow(),
+            created_at=created_at,
             direct_url=None,
-            access_hash=None,
+            access_hash=access_hash,
             parent_id=parent_id,
             isDir=False
         )
@@ -209,10 +251,25 @@ class FileService:
             status=UploadStatus.COMPLETED,
             telegram_file_id=file_id,
             message_id=message_id,
-            created_at=datetime.utcnow()
+            created_at=created_at
         )
         self._upload_sessions[file_id] = session
-        self._files_metadata[file_id] = file_info
+        
+        # Store in SQLite instead of memory
+        await db.insert_file(
+            file_id=file_info.file_id,
+            filename=file_info.filename,
+            filesize=file_info.filesize,
+            mime_type=file_info.mime_type,
+            file_type=file_info.file_type.value,
+            telegram_message_id=file_info.telegram_message_id,
+                thumbnail_message_id=file_info.thumbnail_message_id,
+                created_at=file_info.created_at.isoformat(),
+            direct_url=file_info.direct_url,
+            access_hash=file_info.access_hash,
+            parent_id=file_info.parent_id,
+            is_dir=file_info.isDir
+        )
         
         logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, thumbnail: {thumbnail_message_id}")
         
@@ -225,6 +282,7 @@ class FileService:
         message_id: int
     ) -> FileInfo:
         """Finalize an upload and create file metadata."""
+        db = await self._get_db()
         session = self._upload_sessions.get(file_id)
         
         if not session:
@@ -250,7 +308,21 @@ class FileService:
             isDir=False
         )
         
-        self._files_metadata[telegram_file_id] = file_info
+        # Store in SQLite
+        await db.insert_file(
+            file_id=file_info.file_id,
+            filename=file_info.filename,
+            filesize=file_info.filesize,
+            mime_type=file_info.mime_type,
+            file_type=file_info.file_type.value,
+            telegram_message_id=file_info.telegram_message_id,
+                thumbnail_message_id=file_info.thumbnail_message_id,
+                created_at=file_info.created_at.isoformat(),
+            direct_url=file_info.direct_url,
+            access_hash=file_info.access_hash,
+            parent_id=file_info.parent_id,
+            is_dir=file_info.isDir
+        )
         
         # Clean up session
         del self._upload_sessions[file_id]
@@ -261,7 +333,11 @@ class FileService:
     
     async def get_file_info(self, file_id: str) -> Optional[FileInfo]:
         """Get file metadata."""
-        return self._files_metadata.get(file_id)
+        db = await self._get_db()
+        row = await db.get_file(file_id)
+        if row:
+            return self._row_to_file_info(row)
+        return None
     
     async def list_files(
         self,
@@ -270,39 +346,39 @@ class FileService:
         parent_id: Optional[str] = None
     ) -> tuple[List[FileInfo], int]:
         """List all stored files (excluding folders)."""
-        files = list(self._files_metadata.values())
-        # Only return actual files, not folders
-        files = [f for f in files if getattr(f, 'isDir', False) == False]
-        # Filter by parent_id (None means root)
-        files = [f for f in files if getattr(f, 'parent_id', None) == parent_id]
-        total = len(files)
-        
-        # Sort by creation date, newest first
-        files.sort(key=lambda f: f.created_at, reverse=True)
-        
-        # Paginate
-        start = (page - 1) * page_size
-        end = start + page_size
-        paginated_files = files[start:end]
-        
-        return paginated_files, total
+        db = await self._get_db()
+        rows, total = await db.get_files_paginated(
+            page=page,
+            page_size=page_size,
+            parent_id=parent_id,
+            is_dir=False
+        )
+        files = [self._row_to_file_info(row) for row in rows]
+        return files, total
 
     async def list_folders(
         self,
         parent_id: Optional[str] = None
     ) -> List[FileInfo]:
         """List all stored folders (isDir == True). Filter by parent_id."""
-        entries = list(self._files_metadata.values())
-        # Filter to folders
-        folders = [f for f in entries if getattr(f, "isDir", False)]
-        # Filter by parent_id (None means root)
-        folders = [f for f in folders if getattr(f, "parent_id", None) == parent_id]
-        # Sort by creation date, newest first for consistency with list_files
-        folders.sort(key=lambda f: f.created_at, reverse=True)
+        db = await self._get_db()
+        rows, _ = await db.get_files_paginated(
+            page=1,
+            page_size=10000,  # Get all folders
+            parent_id=parent_id,
+            is_dir=True
+        )
+        folders = [self._row_to_file_info(row) for row in rows]
         return folders
-    def create_folder(self, name: str, parent_id: Optional[str] = None) -> FileInfo:
-        """Create an in-memory folder entry. No Telegram ops in MVP."""
+
+    async def create_folder(self, name: str, parent_id: Optional[str] = None) -> FileInfo:
+        """Create a folder entry in the database. No Telegram ops in MVP."""
+        logger.info(f"create_folder called: name={name}, parent_id={parent_id}")
+        db = await self._get_db()
+        logger.info(f"Got database: {db.db_path}")
         file_id = self._generate_file_id(name, 0)
+        created_at = datetime.utcnow()
+        
         folder_info = FileInfo(
             file_id=file_id,
             filename=name,
@@ -310,63 +386,77 @@ class FileService:
             mime_type=None,
             file_type=FileType.OTHER,
             telegram_message_id=None,
-            created_at=datetime.utcnow(),
+            created_at=created_at,
             direct_url=None,
             access_hash=None,
             parent_id=parent_id,
             isDir=True,
         )
-        self._files_metadata[file_id] = folder_info
-        logger.info(f"Folder created: {name}, id: {file_id}")
+        
+        # Store in SQLite
+        logger.info(f"Inserting folder into database: {folder_info.file_id}")
+        await db.insert_file(
+            file_id=folder_info.file_id,
+            filename=folder_info.filename,
+            filesize=folder_info.filesize,
+            mime_type=folder_info.mime_type,
+            file_type=folder_info.file_type.value,
+            telegram_message_id=folder_info.telegram_message_id,
+            thumbnail_message_id=folder_info.thumbnail_message_id,
+            created_at=folder_info.created_at.isoformat(),
+            direct_url=folder_info.direct_url,
+            access_hash=folder_info.access_hash,
+            parent_id=folder_info.parent_id,
+            is_dir=folder_info.isDir
+        )
+        logger.info(f"Folder inserted: {name}, id: {file_id}")
+        
         return folder_info
 
     async def delete_file(self, file_id: str) -> bool:
         """Delete a file from metadata."""
-        if file_id in self._files_metadata:
-            del self._files_metadata[file_id]
+        db = await self._get_db()
+        result = await db.delete_file(file_id)
+        if result:
             logger.info(f"File deleted: {file_id}")
-            return True
-        return False
+        return result
 
     async def delete_folder(self, folder_id: str) -> bool:
         """Delete a folder from metadata only if it is a directory."""
-        info = self._files_metadata.get(folder_id)
-        if info and getattr(info, "isDir", False):
-            del self._files_metadata[folder_id]
-            logger.info(f"Folder deleted: {folder_id}")
-            return True
+        db = await self._get_db()
+        # First check if it's a folder
+        row = await db.get_file(folder_id)
+        if row and row.get('isDir'):
+            result = await db.delete_file(folder_id)
+            if result:
+                logger.info(f"Folder deleted: {folder_id}")
+            return result
         return False
 
     async def delete_all(self) -> int:
         """Delete all files and folders from metadata."""
-        count = len(self._files_metadata)
-        self._files_metadata.clear()
+        db = await self._get_db()
+        count = await db.delete_all_files()
         logger.info(f"All files deleted: {count} items")
         return count
 
-    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, thumbnail_data: Optional[str] = None, parent_id: Optional[str] = None) -> Optional[FileInfo]:
+    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, parent_id: Optional[str] = None) -> Optional[FileInfo]:
         """Update file metadata."""
-        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, thumbnail_data_len={len(thumbnail_data) if thumbnail_data else 0}, parent_id={parent_id}")
-        file_info = self._files_metadata.get(file_id)
-        if not file_info:
+        db = await self._get_db()
+        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, parent_id={parent_id}")
+        
+        updated_row = await db.update_file(
+            file_id,
+            thumbnail_message_id=thumbnail_message_id,
+            parent_id=parent_id
+        )
+        
+        if not updated_row:
             logger.error(f"File not found in metadata: {file_id}")
             return None
         
-        if thumbnail_message_id is not None:
-            file_info.thumbnail_message_id = thumbnail_message_id
-            logger.info(f"File updated: {file_id}, thumbnail_message_id: {thumbnail_message_id}")
-        
-        if thumbnail_data is not None:
-            file_info.thumbnail_data = thumbnail_data
-            logger.info(f"File updated: {file_id}, thumbnail_data length: {len(thumbnail_data)}")
-        
-        if parent_id is not None:
-            file_info.parent_id = parent_id
-            logger.info(f"File moved: {file_id}, parent_id: {parent_id}")
-        
-        self._files_metadata[file_id] = file_info
-        logger.info(f"File stored in metadata: {file_id}, thumbnail_data present: {file_info.thumbnail_data is not None}")
-        return file_info
+        logger.info(f"File updated in database: {file_id}")
+        return self._row_to_file_info(updated_row)
     
     def get_chunk_size(self) -> int:
         """Get the configured chunk size."""

@@ -16,6 +16,7 @@ from loguru import logger
 import sys
 
 from app.services.config import get_settings
+from app.services.database import get_database, close_database
 from app.api.routes import router
 
 
@@ -34,6 +35,11 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Telegram Cloud Storage API...")
     logger.info("Initializing services...")
     
+    # Initialize database
+    logger.info("Initializing SQLite database...")
+    db = await get_database()
+    logger.info(f"Database initialized: {db.db_path}")
+    
     # Startup
     settings = get_settings()
     logger.info(f"Server configuration: {settings.backend_host}:{settings.backend_port}")
@@ -44,6 +50,8 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down Telegram Cloud Storage API...")
+    await close_database()
+    logger.info("Database connection closed")
 
 
 # Create FastAPI application
@@ -141,6 +149,6 @@ if __name__ == "__main__":
         "main:app",
         host=settings.backend_host,
         port=settings.backend_port,
-        reload=True,
+        reload=False,
         log_level="info"
     )

@@ -29,6 +29,7 @@ env/
 backend/__pycache__/
 backend/*.pyc
 backend/.env
+backend/teledrive.db
 
 # Frontend
 node_modules/

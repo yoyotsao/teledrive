@@ -7,7 +7,6 @@ export interface FileInfo {
   file_type: string;
   telegram_message_id: number | null;
   thumbnail_message_id?: number | null;
-  thumbnail_data?: string | null;
   created_at: string;
   direct_url: string | null;
   access_hash: string | null;

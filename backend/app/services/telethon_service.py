@@ -234,7 +234,8 @@ class TelethonService:
             
             # Use GetFileRequest for partial downloads (offset != 0 or limit is set)
             if offset > 0 or limit is not None:
-                chunk_size = limit if limit is not None else 1024 * 1024
+                # Telegram requires minimum 512KB limit for GetFileRequest
+                chunk_size = max(limit, 512 * 1024) if limit is not None else 1024 * 1024
                 
                 # Determine location type based on message content
                 if getattr(message, 'document', None):
@@ -260,7 +261,7 @@ class TelethonService:
                 else:
                     raise ValueError("Message has no document or photo")
                 
-                result = await self.client.invoke(GetFileRequest(
+                result = await self.client(GetFileRequest(
                     location=location,
                     offset=offset,
                     limit=chunk_size

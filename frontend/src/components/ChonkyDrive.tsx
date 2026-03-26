@@ -859,6 +859,35 @@ export function ChonkyDrive() {
               ✕
             </button>
             
+            {/* Download button */}
+            <a
+              href={`/api/v1/files/${previewFile.file_id}/stream`}
+              download={previewFile.filename}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                position: 'absolute',
+                top: '8px',
+                right: '48px',
+                background: 'rgba(0, 0, 0, 0.5)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '50%',
+                width: '32px',
+                height: '32px',
+                cursor: 'pointer',
+                fontSize: '16px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 1001,
+                textDecoration: 'none',
+              }}
+              title="Download"
+            >
+              ↓
+            </a>
+            
             {/* File name */}
             <div style={{ 
               padding: '12px 16px', 

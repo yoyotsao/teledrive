@@ -113,260 +113,38 @@ async def register_file(request: RegisterFileRequest):
 @router.post("/files/thumbnail/upload")
 async def upload_thumbnail(file: UploadFile = File(...)):
     """
-    Upload a thumbnail image. 
-    Returns the message_id for the uploaded thumbnail AND stores thumbnail data.
+    DEPRECATED: This endpoint is no longer supported.
+    
+    The correct architecture is:
+    1. Frontend uses GramJS to upload thumbnail directly to Telegram
+    2. Frontend calls /files/register with thumbnail_message_id
+    
+    This approach avoids file transfer through the backend.
     """
-    logger.info("=== THUMBNAIL UPLOAD ENDPOINT HIT ===")
-    temp_path: Optional[str] = None
-    try:
-        import base64
-        
-        logger.info(f"Thumbnail upload started: filename={file.filename}, content_type={file.content_type}")
-        
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            temp_path = tmp.name
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                tmp.write(chunk)
-
-        file_size = os.path.getsize(temp_path) if temp_path and os.path.exists(temp_path) else 0
-        logger.info(f"Thumbnail saved to temp: {temp_path}, size={file_size}")
-
-        telethon_svc = await get_telethon_service()
-
-        def progress_callback(current: int, total: int):
-            try:
-                pct = int((current / total) * 100) if total else 0
-            except Exception:
-                pct = 0
-            logger.info(f"Thumbnail upload progress: {pct}% ({current}/{total} bytes)")
-
-        upload_result = await telethon_svc.upload_thumbnail(temp_path, original_filename=file.filename or "thumbnail.jpg", progress_callback=progress_callback)
-        logger.info(f"Thumbnail uploaded to Telegram: {upload_result}")
-
-        with open(temp_path, 'rb') as f:
-            thumbnail_bytes = f.read()
-        thumbnail_base64 = base64.b64encode(thumbnail_bytes).decode('utf-8')
-        logger.info(f"Thumbnail base64 encoded: length={len(thumbnail_base64)}")
-        
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-        return {
-            "message_id": upload_result.get("message_id"),
-            "file_id": upload_result.get("file_id"),
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(
+        status_code=410,
+        detail="This endpoint is deprecated. Use frontend to upload thumbnail to Telegram, then call /files/register with thumbnail_message_id."
+    )
 
 
 @router.post("/videos/thumbnail")
 async def generate_video_thumbnail(request: VideoThumbnailRequest):
-    """
-    Generate thumbnail for a video by extracting a frame using ffmpeg.
-    Downloads video from Telegram, extracts frame, uploads thumbnail back.
-    Returns base64-encoded JPEG thumbnail.
-    """
-    video_temp: Optional[str] = None
-    thumb_temp: Optional[str] = None
-    try:
-        telethon_svc = await get_telethon_service()
-        
-        # Ensure Telethon is connected
-        await telethon_svc.connect()
-
-        # Step 1: Get message info to verify it's a video
-        try:
-            message = await telethon_svc.client.get_messages("me", ids=request.message_id)
-        except Exception as e:
-            logger.error(f"Failed to get message: {e}")
-            raise HTTPException(status_code=404, detail="Message not found")
-
-        # Handle list response from get_messages
-        if hasattr(message, '__len__') and len(message) > 0:
-            message = message[0]
-        
-        if not message:
-            raise HTTPException(status_code=404, detail="Message not found")
-
-        # Debug: log message attributes
-        logger.info(f"Message {request.message_id}: document={getattr(message, 'document', None)}, media={getattr(message, 'media', None)}")
-        
-        mime_type = ""
-        is_video = False
-        
-        if getattr(message, 'document', None):
-            mime_type = getattr(message.document, 'mime_type', '') or ''
-            logger.info(f"Got mime_type from document: {mime_type}")
-            
-            # Check if it's a video by mime_type or by filename extension
-            if mime_type.startswith('video/'):
-                is_video = True
-            else:
-                # Check filename extension for videos
-                attributes = getattr(message.document, 'attributes', [])
-                for attr in attributes:
-                    if hasattr(attr, 'file_name'):
-                        filename = attr.file_name or ''
-                        if filename.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv')):
-                            is_video = True
-                            logger.info(f"Detected video by filename extension: {filename}")
-                            break
-        elif getattr(message, 'media', None):
-            media = getattr(message.media, 'document', None) or getattr(message.media, 'photo', None)
-            if media:
-                mime_type = getattr(media, 'mime_type', '') or ''
-                logger.info(f"Got mime_type from media: {mime_type}")
-                if mime_type.startswith('video/'):
-                    is_video = True
-
-        logger.info(f"Final mime_type: '{mime_type}', is_video: {is_video}")
-        if not is_video:
-            raise HTTPException(status_code=400, detail=f"Not a video file, got: '{mime_type}'")
-
-        # Step 2: Download video to temp file
-        logger.info(f"Downloading video message {request.message_id} for thumbnail generation")
-        video_bytes = await telethon_svc.download_file(request.message_id)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as video_tmp:
-            video_temp = video_tmp.name
-            video_tmp.write(video_bytes)
-        logger.info(f"Video saved to temp: {video_temp}, size={len(video_bytes)}")
-
-        # Step 3: Extract thumbnail with ffmpeg
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
-            thumb_temp = thumb_tmp.name
-
-        await extract_thumbnail_ffmpeg(video_temp, thumb_temp)
-
-        if not os.path.exists(thumb_temp):
-            raise HTTPException(status_code=500, detail="Thumbnail extraction failed")
-
-        thumb_size = os.path.getsize(thumb_temp)
-        if thumb_size > 100 * 1024:  # 100KB sanity check
-            logger.warning(f"Thumbnail too large: {thumb_size} bytes, may indicate issue")
-
-        # Step 4: Read and encode thumbnail
-        with open(thumb_temp, 'rb') as f:
-            thumb_bytes = f.read()
-        thumbnail_base64 = base64.b64encode(thumb_bytes).decode('utf-8')
-        logger.info(f"Thumbnail base64 encoded: {len(thumbnail_base64)} chars")
-
-        # Step 5: Upload thumbnail to Telegram
-        def progress_callback(current: int, total: int):
-            try:
-                pct = int((current / total) * 100) if total else 0
-            except Exception:
-                pct = 0
-            logger.info(f"Thumbnail upload progress: {pct}% ({current}/{total} bytes)")
-
-        upload_result = await telethon_svc.upload_thumbnail(
-            thumb_temp,
-            original_filename="video_thumbnail.jpg",
-            progress_callback=progress_callback
-        )
-        logger.info(f"Thumbnail uploaded: {upload_result}")
-
-        # Return the thumbnail's message_id, not the original video's message_id
-        return {
-            "message_id": upload_result.get("message_id"),
-            "file_id": upload_result.get("file_id"),
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Cleanup temp files
-        if video_temp and os.path.exists(video_temp):
-            try:
-                os.remove(video_temp)
-                logger.info(f"Cleaned up video temp: {video_temp}")
-            except Exception as e:
-                logger.warning(f"Failed to cleanup video temp: {e}")
-        if thumb_temp and os.path.exists(thumb_temp):
-            try:
-                os.remove(thumb_temp)
-                logger.info(f"Cleaned up thumb temp: {thumb_temp}")
-            except Exception as e:
-                logger.warning(f"Failed to cleanup thumb temp: {e}")
+    """DEPRECATED: Use frontend FFmpeg WASM to generate thumbnail, upload to Telegram, then call /files/register with thumbnail_message_id."""
+    raise HTTPException(
+        status_code=410,
+        detail="This endpoint is deprecated. Use frontend FFmpeg WASM to generate video thumbnail, upload to Telegram, then call /files/register with thumbnail_message_id."
+    )
 
 
 @router.post("/files/upload")
 async def upload_file_endpoint(file: UploadFile = File(...)):
-    """Upload a file from multipart form data (field name 'file') and store metadata."""
-    temp_path: Optional[str] = None
-    try:
-        # Save to a temporary file on disk (streaming to avoid memory pressure)
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            temp_path = tmp.name
-            while True:
-                chunk = await file.read(1024 * 1024)  # 1MB chunks
-                if not chunk:
-                    break
-                tmp.write(chunk)
-
-        # Upload to Telegram Saved Messages via Telethon service
-        telethon_svc = await get_telethon_service()
-
-        def progress_callback(current: int, total: int):
-            try:
-                pct = int((current / total) * 100) if total else 0
-            except Exception:
-                pct = 0
-            logger.info(f"Telegram upload progress: {pct}% ({current}/{total} bytes)")
-
-        upload_result = await telethon_svc.upload_file(temp_path, original_filename=file.filename, progress_callback=progress_callback)
-
-        # Persist metadata via FileService
-        file_service = get_file_service()
-        mime_type = file.content_type or upload_result.get("mime_type")
-        filename = upload_result.get("filename") or file.filename or "uploaded_file"
-        size = upload_result.get("size") or 0
-        message_id = upload_result.get("message_id")
-        file_id = upload_result.get("file_id")
-        access_hash = upload_result.get("access_hash")
-
-        # Normalize types for the service layer
-        message_id_int = int(message_id) if message_id is not None else 0
-        file_id_str = str(file_id) if file_id is not None else ""
-        await file_service.register_uploaded_file(
-            filename=filename,
-            filesize=size,
-            mime_type=mime_type,
-            message_id=message_id_int,
-            file_id=file_id_str,
-            access_hash=access_hash,
-            parent_id=None,
-        )
-
-        # Cleanup temporary file
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
-        return {
-            "message_id": message_id,
-            "file_id": file_id,
-            "access_hash": access_hash,
-            "size": size,
-            "mime_type": mime_type,
-            "filename": filename,
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=str(e))
+    """DEPRECATED: Use frontend GramJS to upload directly to Telegram, then call /files/register with metadata."""
+    # This endpoint is deprecated. Frontend should use GramJS for direct Telegram uploads.
+    # See AGENTS.md architecture: frontend -> Telegram (GramJS) -> backend (metadata only)
+    raise HTTPException(
+        status_code=410, 
+        detail="This endpoint is deprecated. Use frontend GramJS to upload directly to Telegram, then call /files/register with metadata."
+    )
 
 
 @router.get("/files", response_model=FileListResponse)

@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { FileData } from '@aperturerobotics/chonky';
 import { api, generateThumbnail } from '../api/client';
+import { getTelegramClient } from '../lib/gramjs';
+import { generateVideoThumbnail } from '../lib/videoThumbnail';
 import { FileInfo } from '../types';
 
 function formatFileSize(bytes: number): string {
@@ -42,16 +44,37 @@ export function ChonkyDrive() {
       (f) => f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/')
     );
     
+    // Get Telegram client
+    let telegramClient: ReturnType<typeof getTelegramClient>;
+    try {
+      telegramClient = getTelegramClient();
+      if (!telegramClient.isConnected()) {
+        console.log('[Thumb] Telegram client not connected, skipping thumbnails');
+        return;
+      }
+    } catch (err) {
+      console.log('[Thumb] Telegram client not available:', err);
+      return;
+    }
+    
     for (const file of imageOrVideoFiles) {
       if (!thumbnails[file.file_id]) {
-        // Always load thumbnail from Telegram via thumbnail_message_id
+        // Try to load thumbnail from Telegram via thumbnail_message_id
         try {
           console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id})...`);
-          const thumb = await api.getThumbnail(file.file_id);
-          console.log(`[Thumb] Result for ${file.filename}:`, thumb ? `success` : 'null');
-          if (thumb) {
-            setThumbnails((prev) => ({ ...prev, [file.file_id]: thumb }));
+          
+          // Use thumbnail_message_id if available, otherwise skip
+          const thumbMsgId = (file as any).thumbnail_message_id;
+          if (!thumbMsgId) {
+            console.log(`[Thumb] No thumbnail_message_id for ${file.filename}, skipping`);
+            continue;
           }
+          
+          // Download directly from Telegram via GramJS
+          const thumbBlob = await telegramClient.downloadThumbnail(thumbMsgId);
+          const thumbUrl = URL.createObjectURL(thumbBlob);
+          console.log(`[Thumb] Downloaded for ${file.filename}:`, thumbUrl);
+          setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
         } catch (err: any) {
           console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
         }
@@ -206,30 +229,47 @@ export function ChonkyDrive() {
     const isVideo = file.type.startsWith('video/');
     const isImageOrVideo = isImage || isVideo;
     
-    const result = await api.uploadFile(file, currentFolderId ?? undefined);
-    console.log('[Upload] File uploaded:', result.file_id, result.filename);
+    // Step 1: Upload file directly to Telegram via GramJS
+    const telegramClient = getTelegramClient();
+    console.log('[Upload] Starting GramJS upload for:', file.name);
+    const uploadResult = await telegramClient.uploadFile(file);
+    console.log('[Upload] File uploaded to Telegram, message_id:', uploadResult.message_id, 'file_id:', uploadResult.file_id);
+    
+    // Step 2: Register file metadata with backend
+    const fileInfo = await api.registerFile({
+      filename: file.name,
+      filesize: file.size,
+      mimeType: file.type || undefined,
+      messageId: uploadResult.message_id,
+      fileId: uploadResult.file_id,
+      accessHash: uploadResult.access_hash,
+      parentId: currentFolderId ?? undefined,
+    });
+    console.log('[Upload] File registered:', fileInfo.file_id, fileInfo.filename);
     
     if (isImageOrVideo) {
       if (isVideo) {
-        // For videos: call backend API to generate thumbnail via FFmpeg
-        console.log('[Thumb] Generating video thumbnail via backend API for message_id:', result.message_id);
+        // For videos: generate thumbnail client-side using FFmpeg WASM, then upload via GramJS
+        console.log('[Thumb] Generating video thumbnail via FFmpeg WASM for:', file.name);
         try {
-          const thumbResult = await api.generateVideoThumbnail(result.message_id);
-          console.log('[Thumb] Got video thumbnail, message_id:', thumbResult.message_id);
-          await api.updateFile(result.file_id, thumbResult.message_id);
+          const thumbBlob = await generateVideoThumbnail(file);
+          console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
+          const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+          console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
+          await api.updateFile(fileInfo.file_id, thumbResult.message_id);
           console.log('[Thumb] Updated file with video thumbnail metadata');
         } catch (err: any) {
           console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
         }
       } else {
-        // For images: generate thumbnail client-side
+        // For images: generate thumbnail client-side and upload via GramJS
         const thumbBlob = await generateThumbnail(file, 200);
         if (thumbBlob) {
           console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
           try {
-            const thumbResult = await api.uploadThumbnail(thumbBlob);
-            console.log('[Thumb] Uploaded to Telegram, message_id:', thumbResult.message_id);
-            await api.updateFile(result.file_id, thumbResult.message_id);
+            const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+            console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
+            await api.updateFile(fileInfo.file_id, thumbResult.message_id);
             console.log('[Thumb] Updated file with thumbnail_message_id');
           } catch (err: any) {
             console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
@@ -459,18 +499,41 @@ export function ChonkyDrive() {
       const original = originalFiles.find((f) => f.file_id === file.id);
       if (original) {
         setPreviewFile(original);
-        // Create URL for streaming playback
-        const url = `/api/v1/files/${file.id}/stream`;
-        setPreviewUrl(url);
+        
+        // Download directly from Telegram via GramJS
+        try {
+          const telegramClient = getTelegramClient();
+          if (!telegramClient.isConnected()) {
+            console.error('[Preview] Telegram client not connected');
+            return;
+          }
+          
+          const msgId = original.telegram_message_id;
+          if (!msgId) {
+            console.error('[Preview] No telegram_message_id for file');
+            return;
+          }
+          
+          const mimeType = original.mime_type || 'application/octet-stream';
+          const blob = await telegramClient.downloadFile(msgId, mimeType);
+          const url = URL.createObjectURL(blob);
+          setPreviewUrl(url);
+          console.log('[Preview] Downloaded file:', original.filename);
+        } catch (err) {
+          console.error('[Preview] Error downloading file:', err);
+        }
       }
     }
   }, [originalFiles]);
 
   // Close preview modal
   const closePreview = useCallback(() => {
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+    }
     setPreviewFile(null);
     setPreviewUrl(null);
-  }, []);
+  }, [previewUrl]);
 
   return (
     <div

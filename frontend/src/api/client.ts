@@ -94,6 +94,29 @@ export const api = {
     return response.data;
   },
 
+  registerFile: async (params: {
+    filename: string;
+    filesize: number;
+    mimeType?: string;
+    messageId: number;
+    fileId: string;
+    accessHash?: string;
+    parentId?: string;
+    thumbnailMessageId?: number;
+  }): Promise<FileInfo> => {
+    const response = await client.post<FileInfo>('/files/register', {
+      filename: params.filename,
+      filesize: params.filesize,
+      mime_type: params.mimeType,
+      message_id: params.messageId,
+      file_id: params.fileId,
+      access_hash: params.accessHash,
+      parent_id: params.parentId,
+      thumbnail_message_id: params.thumbnailMessageId,
+    });
+    return response.data;
+  },
+
   deleteFile: async (fileId: string): Promise<void> => {
     await client.delete(`/files/${fileId}`);
   },

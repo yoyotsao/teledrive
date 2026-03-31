@@ -244,24 +244,37 @@ export function ChonkyDrive() {
     const isVideo = file.type.startsWith('video/');
     const isImageOrVideo = isImage || isVideo;
     
-    // Step 1: Upload file directly to Telegram via GramJS
+    // Step 1: Upload file using split upload to Telegram via GramJS
     const telegramClient = getTelegramClient();
-    console.log('[Upload] Starting GramJS upload for:', file.name);
-    const uploadResult = await telegramClient.uploadFile(file);
-    console.log('[Upload] File uploaded to Telegram, message_id:', uploadResult.message_id, 'file_id:', uploadResult.file_id);
+    console.log('[Upload] Starting split upload for:', file.name);
+    const uploadResult = await telegramClient.uploadFileSplit(file);
+    console.log('[Upload] Split upload completed, parts:', uploadResult.parts.length);
     
-    // Step 2: Register file metadata with backend
-    const fileInfo = await api.registerFile({
-      filename: file.name,
-      filesize: file.size,
-      mimeType: file.type || undefined,
-      messageId: uploadResult.message_id,
-      fileId: uploadResult.file_id,
-      accessHash: uploadResult.access_hash,
-      parentId: currentFolderId ?? undefined,
-    });
-    console.log('[Upload] File registered:', fileInfo.file_id, fileInfo.filename);
+    // Generate split_group_id for this file
+    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     
+    // Step 2: Register each part with backend
+    for (let i = 0; i < uploadResult.parts.length; i++) {
+      const part = uploadResult.parts[i];
+      
+      await api.registerFile({
+        filename: file.name,  // Use original filename for all parts
+        filesize: part.size,
+        mimeType: file.type || undefined,
+        messageId: part.message_id,
+        fileId: part.file_id,
+        accessHash: part.access_hash,
+        parentId: currentFolderId ?? undefined,
+        isSplitFile: true,
+        splitGroupId: splitGroupId,
+        partIndex: i,
+        totalParts: uploadResult.parts.length,
+        originalName: file.name,  // Store original name for all parts
+      });
+    }
+    console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
+    
+    // Step 3: Upload thumbnail if needed
     if (isImageOrVideo) {
       if (isVideo) {
         // For videos: generate thumbnail client-side using FFmpeg WASM, then upload via GramJS
@@ -271,7 +284,8 @@ export function ChonkyDrive() {
           console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
           const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
           console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
-          await api.updateFile(fileInfo.file_id, thumbResult.message_id);
+          // Update first part with thumbnail
+          await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
           console.log('[Thumb] Updated file with video thumbnail metadata');
         } catch (err: any) {
           console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
@@ -284,7 +298,8 @@ export function ChonkyDrive() {
           try {
             const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
             console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
-            await api.updateFile(fileInfo.file_id, thumbResult.message_id);
+            // Update first part with thumbnail
+            await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
             console.log('[Thumb] Updated file with thumbnail_message_id');
           } catch (err: any) {
             console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
@@ -523,14 +538,25 @@ export function ChonkyDrive() {
             return;
           }
           
-          const msgId = original.telegram_message_id;
-          if (!msgId) {
-            console.error('[Preview] No telegram_message_id for file');
-            return;
+          const mimeType = original.mime_type || 'application/octet-stream';
+          let blob: Blob;
+          
+          // Check if this is a split file
+          if ((original as any).is_split_file && (original as any).split_group_id) {
+            // Download and merge all parts
+            console.log('[Preview] Downloading split file, group:', (original as any).split_group_id);
+            blob = await telegramClient.downloadFileMerge((original as any).split_group_id, mimeType);
+            console.log('[Preview] Merged split file, size:', blob.size);
+          } else {
+            // Download single file
+            const msgId = original.telegram_message_id;
+            if (!msgId) {
+              console.error('[Preview] No telegram_message_id for file');
+              return;
+            }
+            blob = await telegramClient.downloadFile(msgId, mimeType);
           }
           
-          const mimeType = original.mime_type || 'application/octet-stream';
-          const blob = await telegramClient.downloadFile(msgId, mimeType);
           const url = URL.createObjectURL(blob);
           setPreviewUrl(url);
           console.log('[Preview] Downloaded file:', original.filename);
@@ -938,11 +964,43 @@ export function ChonkyDrive() {
             </button>
             
             {/* Download button */}
-            <a
-              href={`/api/v1/files/${previewFile.file_id}/stream`}
-              download={previewFile.filename}
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              onClick={async () => {
+                // Trigger download with correct filename
+                try {
+                  const telegramClient = getTelegramClient();
+                  const mimeType = previewFile.mime_type || 'application/octet-stream';
+                  let blob: Blob;
+                  
+                  // Check if this is a split file
+                  if ((previewFile as any).is_split_file && (previewFile as any).split_group_id) {
+                    blob = await telegramClient.downloadFileMerge((previewFile as any).split_group_id, mimeType);
+                  } else {
+                    const msgId = previewFile.telegram_message_id;
+                    if (!msgId) {
+                      console.error('[Download] No telegram_message_id for file');
+                      return;
+                    }
+                    blob = await telegramClient.downloadFile(msgId, mimeType);
+                  }
+                  
+                  // Use original_name for split files, otherwise filename
+                  const downloadFilename = (previewFile as any).original_name || previewFile.filename;
+                  
+                  // Create download link and trigger
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = downloadFilename;
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                  console.log('[Download] Downloaded file:', downloadFilename);
+                } catch (err) {
+                  console.error('[Download] Error downloading file:', err);
+                }
+              }}
               style={{
                 position: 'absolute',
                 top: '8px',
@@ -959,12 +1017,11 @@ export function ChonkyDrive() {
                 alignItems: 'center',
                 justifyContent: 'center',
                 zIndex: 1001,
-                textDecoration: 'none',
               }}
               title="Download"
             >
               ↓
-            </a>
+            </button>
             
             {/* File name */}
             <div style={{ 

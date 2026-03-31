@@ -1,10 +1,12 @@
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request
 from typing import Optional
 from pydantic import BaseModel
+from datetime import datetime
 
-from app.models.schemas import FileListResponse, FileInfo
+from app.models.schemas import FileListResponse, FileInfo, FileType
 from app.services import get_file_service, get_bot_service
 from app.services import get_telethon_service
+from app.services.database import get_database
 from loguru import logger
 import os
 import tempfile
@@ -71,6 +73,11 @@ class RegisterFileRequest(BaseModel):
     access_hash: Optional[str] = None
     parent_id: Optional[str] = None
     thumbnail_message_id: Optional[int] = None
+    is_split_file: bool = False
+    original_name: Optional[str] = None
+    part_index: Optional[int] = None
+    total_parts: Optional[int] = None
+    split_group_id: Optional[str] = None
 
 
 class CreateFolderRequest(BaseModel):
@@ -103,7 +110,12 @@ async def register_file(request: RegisterFileRequest):
             file_id=request.file_id,
             access_hash=request.access_hash,
             parent_id=request.parent_id,
-            thumbnail_message_id=request.thumbnail_message_id
+            thumbnail_message_id=request.thumbnail_message_id,
+            is_split_file=request.is_split_file,
+            original_name=request.original_name,
+            part_index=request.part_index,
+            total_parts=request.total_parts,
+            split_group_id=request.split_group_id
         )
         return file_info
     except Exception as e:
@@ -151,14 +163,20 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
 async def list_files(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
-    parent_id: Optional[str] = Query(None)
+    parent_id: Optional[str] = Query(None),
+    split_group_id: Optional[str] = Query(None, description="Filter files by split group ID")
 ):
     # Convert string "null" to Python None
     if parent_id == "null":
         parent_id = None
     try:
         file_service = get_file_service()
-        files, total = await file_service.list_files(page, page_size, parent_id=parent_id)
+        files, total = await file_service.list_files(
+            page, 
+            page_size, 
+            parent_id=parent_id,
+            split_group_id=split_group_id
+        )
         return FileListResponse(
             files=files,
             total=total,
@@ -519,7 +537,7 @@ async def list_folders(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/folders/{folder_id}")
+@router.get("/folders/{folder_id}")
 async def delete_folder(folder_id: str):
     try:
         file_service = get_file_service()
@@ -533,6 +551,53 @@ async def delete_folder(folder_id: str):
         
         await file_service.delete_folder(folder_id)
         return {"message": "Folder deleted", "folder_id": folder_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/files/by-split-group/{split_group_id}", response_model=FileListResponse)
+async def get_files_by_split_group(split_group_id: str):
+    """
+    Get all file parts belonging to a split group.
+    Returns files sorted by part_index for proper reassembly.
+    """
+    try:
+        db = await get_database()
+        rows = await db.get_files_by_split_group(split_group_id)
+        
+        if not rows:
+            raise HTTPException(status_code=404, detail="No files found for this split group")
+        
+        # Convert to FileInfo objects
+        files = []
+        for row in rows:
+            file_info = FileInfo(
+                file_id=row['file_id'],
+                filename=row['filename'],
+                filesize=row['filesize'],
+                mime_type=row['mime_type'],
+                file_type=FileType(row['file_type']),
+                telegram_message_id=row['telegram_message_id'],
+                thumbnail_message_id=row['thumbnail_message_id'],
+                created_at=datetime.fromisoformat(row['created_at']) if isinstance(row['created_at'], str) else row['created_at'],
+                direct_url=row.get('direct_url'),
+                access_hash=row.get('access_hash'),
+                parent_id=row.get('parent_id'),
+                isDir=bool(row['isDir']) if row.get('isDir') is not None else False
+            )
+            files.append(file_info)
+        
+        # Sort by part_index
+        files.sort(key=lambda f: getattr(f, 'part_index', 0) or 0)
+        
+        return FileListResponse(
+            files=files,
+            total=len(files),
+            page=1,
+            page_size=len(files)
+        )
     except HTTPException:
         raise
     except Exception as e:

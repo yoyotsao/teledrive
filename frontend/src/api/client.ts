@@ -103,6 +103,11 @@ export const api = {
     accessHash?: string;
     parentId?: string;
     thumbnailMessageId?: number;
+    isSplitFile?: boolean;
+    splitGroupId?: string;
+    partIndex?: number;
+    totalParts?: number;
+    originalName?: string;
   }): Promise<FileInfo> => {
     const response = await client.post<FileInfo>('/files/register', {
       filename: params.filename,
@@ -113,12 +118,24 @@ export const api = {
       access_hash: params.accessHash,
       parent_id: params.parentId,
       thumbnail_message_id: params.thumbnailMessageId,
+      is_split_file: params.isSplitFile ?? false,
+      split_group_id: params.splitGroupId,
+      part_index: params.partIndex,
+      total_parts: params.totalParts,
+      original_name: params.originalName,
     });
     return response.data;
   },
 
   deleteFile: async (fileId: string): Promise<void> => {
     await client.delete(`/files/${fileId}`);
+  },
+
+  getSplitGroupFiles: async (splitGroupId: string): Promise<FileListResponse> => {
+    const response = await client.get<FileListResponse>('/files', {
+      params: { split_group_id: splitGroupId, page_size: 10000 },
+    });
+    return response.data;
   },
 };
 

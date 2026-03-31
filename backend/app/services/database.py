@@ -52,9 +52,40 @@ class Database:
                 direct_url TEXT,
                 access_hash TEXT,
                 parent_id TEXT,
-                isDir INTEGER NOT NULL DEFAULT 0
+                isDir INTEGER NOT NULL DEFAULT 0,
+                is_split_file INTEGER NOT NULL DEFAULT 0,
+                original_name TEXT,
+                part_index INTEGER,
+                total_parts INTEGER,
+                split_group_id TEXT
             )
         """)
+        
+        # Add new columns if they don't exist (migration for existing databases)
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN is_split_file INTEGER NOT NULL DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN original_name TEXT")
+        except aiosqlite.OperationalError:
+            pass
+        
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN part_index INTEGER")
+        except aiosqlite.OperationalError:
+            pass
+        
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN total_parts INTEGER")
+        except aiosqlite.OperationalError:
+            pass
+        
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN split_group_id TEXT")
+        except aiosqlite.OperationalError:
+            pass
         
         # Upload sessions table
         await self._conn.execute("""
@@ -97,7 +128,12 @@ class Database:
         direct_url: Optional[str],
         access_hash: Optional[str],
         parent_id: Optional[str],
-        is_dir: bool
+        is_dir: bool,
+        is_split_file: bool = False,
+        original_name: Optional[str] = None,
+        part_index: Optional[int] = None,
+        total_parts: Optional[int] = None,
+        split_group_id: Optional[str] = None
     ) -> None:
         """Insert a new file record."""
         if not self._conn:
@@ -107,12 +143,14 @@ class Database:
             INSERT OR REPLACE INTO files (
                 file_id, filename, filesize, mime_type, file_type,
                 telegram_message_id, thumbnail_message_id,
-                created_at, direct_url, access_hash, parent_id, isDir
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, direct_url, access_hash, parent_id, isDir,
+                is_split_file, original_name, part_index, total_parts, split_group_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_id, filename, filesize, mime_type, file_type,
             telegram_message_id, thumbnail_message_id,
-            created_at, direct_url, access_hash, parent_id, 1 if is_dir else 0
+            created_at, direct_url, access_hash, parent_id, 1 if is_dir else 0,
+            1 if is_split_file else 0, original_name, part_index, total_parts, split_group_id
         ))
         await self._conn.commit()
     
@@ -144,9 +182,10 @@ class Database:
         page: int = 1,
         page_size: int = 50,
         parent_id: Optional[str] = None,
-        is_dir: bool = False
+        is_dir: bool = False,
+        split_group_id: Optional[str] = None
     ) -> Tuple[List[dict], int]:
-        """Get files with pagination, filtered by parent_id and isDir."""
+        """Get files with pagination, filtered by parent_id, isDir, and split_group_id."""
         if not self._conn:
             raise RuntimeError("Database not connected")
         
@@ -159,6 +198,10 @@ class Database:
         else:
             where_clauses.append("parent_id = ?")
             params.append(parent_id)
+        
+        if split_group_id is not None:
+            where_clauses.append("split_group_id = ?")
+            params.append(split_group_id)
         
         where_sql = " AND ".join(where_clauses)
         
@@ -292,6 +335,18 @@ class Database:
         )
         await self._conn.commit()
         return cursor.rowcount > 0
+    
+    async def get_files_by_split_group(self, split_group_id: str) -> List[dict]:
+        """Get all files belonging to a split group, sorted by part_index."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        
+        cursor = await self._conn.execute(
+            "SELECT * FROM files WHERE split_group_id = ? ORDER BY part_index ASC",
+            (split_group_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
 # Singleton instance

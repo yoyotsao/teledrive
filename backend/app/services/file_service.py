@@ -215,6 +215,11 @@ class FileService:
         access_hash: Optional[str] = None,
         parent_id: Optional[str] = None,
         thumbnail_message_id: Optional[int] = None,
+        is_split_file: bool = False,
+        original_name: Optional[str] = None,
+        part_index: Optional[int] = None,
+        total_parts: Optional[int] = None,
+        split_group_id: Optional[str] = None,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -263,12 +268,17 @@ class FileService:
             mime_type=file_info.mime_type,
             file_type=file_info.file_type.value,
             telegram_message_id=file_info.telegram_message_id,
-                thumbnail_message_id=file_info.thumbnail_message_id,
-                created_at=file_info.created_at.isoformat(),
+            thumbnail_message_id=file_info.thumbnail_message_id,
+            created_at=file_info.created_at.isoformat(),
             direct_url=file_info.direct_url,
             access_hash=file_info.access_hash,
             parent_id=file_info.parent_id,
-            is_dir=file_info.isDir
+            is_dir=file_info.isDir,
+            is_split_file=is_split_file,
+            original_name=original_name,
+            part_index=part_index,
+            total_parts=total_parts,
+            split_group_id=split_group_id
         )
         
         logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, thumbnail: {thumbnail_message_id}")
@@ -343,17 +353,22 @@ class FileService:
         self,
         page: int = 1,
         page_size: int = 50,
-        parent_id: Optional[str] = None
+        parent_id: Optional[str] = None,
+        split_group_id: Optional[str] = None
     ) -> tuple[List[FileInfo], int]:
-        """List all stored files (excluding folders)."""
+        """List all stored files (excluding folders). Optionally filter by split_group_id."""
         db = await self._get_db()
         rows, total = await db.get_files_paginated(
             page=page,
             page_size=page_size,
             parent_id=parent_id,
-            is_dir=False
+            is_dir=False,
+            split_group_id=split_group_id
         )
         files = [self._row_to_file_info(row) for row in rows]
+        # Sort by part_index if filtering by split_group_id
+        if split_group_id is not None:
+            files.sort(key=lambda f: getattr(f, 'part_index', 0) or 0)
         return files, total
 
     async def list_folders(

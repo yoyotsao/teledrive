@@ -12,6 +12,12 @@ export interface FileInfo {
   access_hash: string | null;
   parent_id?: string | null;
   isDir?: boolean;
+  // Split file fields
+  is_split_file?: boolean;
+  split_group_id?: string;
+  original_name?: string;
+  part_index?: number;
+  total_parts?: number;
 }
 
 export interface FileListResponse {

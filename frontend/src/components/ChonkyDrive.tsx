@@ -59,22 +59,37 @@ export function ChonkyDrive() {
     
     for (const file of imageOrVideoFiles) {
       if (!thumbnails[file.file_id]) {
-        // Try to load thumbnail from Telegram via thumbnail_message_id
+        // Try to load thumbnail from Telegram
         try {
-          console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id})...`);
+          console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id}, type=${file.file_type})...`);
           
-          // Use thumbnail_message_id if available, otherwise skip
-          const thumbMsgId = (file as any).thumbnail_message_id;
-          if (!thumbMsgId) {
-            console.log(`[Thumb] No thumbnail_message_id for ${file.filename}, skipping`);
-            continue;
+          let thumbUrl: string | null = null;
+          
+          // For videos: use thumbnail_message_id if available
+          if (file.file_type === 'video') {
+            const thumbMsgId = (file as any).thumbnail_message_id;
+            if (thumbMsgId) {
+              const thumbBlob = await telegramClient.downloadThumbnail(thumbMsgId);
+              thumbUrl = URL.createObjectURL(thumbBlob);
+              console.log(`[Thumb] Downloaded video thumbnail for ${file.filename}:`, thumbUrl);
+            } else {
+              console.log(`[Thumb] No thumbnail_message_id for video ${file.filename}`);
+            }
+          } 
+          // For photos (images): use the original file as thumbnail
+          else if (file.file_type === 'photo' || file.mime_type?.startsWith('image/')) {
+            const msgId = (file as any).telegram_message_id;
+            if (msgId) {
+              const mimeType = file.mime_type || 'image/jpeg';
+              const thumbBlob = await telegramClient.downloadFile(msgId, mimeType);
+              thumbUrl = URL.createObjectURL(thumbBlob);
+              console.log(`[Thumb] Downloaded image thumbnail for ${file.filename}:`, thumbUrl);
+            }
           }
           
-          // Download directly from Telegram via GramJS
-          const thumbBlob = await telegramClient.downloadThumbnail(thumbMsgId);
-          const thumbUrl = URL.createObjectURL(thumbBlob);
-          console.log(`[Thumb] Downloaded for ${file.filename}:`, thumbUrl);
-          setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
+          if (thumbUrl) {
+            setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
+          }
         } catch (err: any) {
           console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
         }

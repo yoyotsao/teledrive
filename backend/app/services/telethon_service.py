@@ -221,12 +221,31 @@ class TelethonService:
             if not message:
                 raise ValueError(f"Message {message_id} not found")
             
+            # Debug: log message type and photo info
+            logger.info(f"Message type: photo={getattr(message, 'photo', None) is not None}, document={getattr(message, 'document', None) is not None}")
+            if getattr(message, 'photo', None):
+                photo = message.photo
+                logger.info(f"Photo attributes: size={getattr(photo, 'size', 'N/A')}, file_size={getattr(photo, 'file_size', 'N/A')}, sizes={getattr(photo, 'sizes', 'N/A')}")
+                if hasattr(photo, 'sizes') and photo.sizes:
+                    largest = photo.sizes[-1]
+                    logger.info(f"Largest size: size={getattr(largest, 'size', 'N/A')}, sizes={getattr(largest, 'sizes', 'N/A')}")
+            
             # Determine the file size
             size = 0
             if getattr(message, 'document', None):
-                size = getattr(message.document, 'size', 0) or 0
+                size = getattr(message.document, 'size', 0) or getattr(message.document, 'file_size', 0) or 0
             elif getattr(message, 'photo', None):
-                size = getattr(message.photo, 'size', 0) or 0
+                # For photos, .size is often 0, so get actual size from sizes array
+                photo = message.photo
+                # Try multiple approaches to get the actual size
+                size = getattr(photo, 'size', 0) or getattr(photo, 'file_size', 0) or 0
+                if size == 0 and hasattr(photo, 'sizes') and photo.sizes:
+                    # Get the largest size from the sizes array
+                    largest = photo.sizes[-1]
+                    size = getattr(largest, 'size', 0) or 0
+                    if size == 0 and hasattr(largest, 'sizes'):
+                        # Progressive photo: get the largest size from sizes array
+                        size = max(largest.sizes) if largest.sizes else 0
             
             # Handle offset beyond file size
             if offset >= size:

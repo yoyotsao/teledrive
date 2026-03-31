@@ -1,77 +1,70 @@
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
-
-let ffmpeg: FFmpeg | null = null;
-
 /**
- * Load FFmpeg WASM module. Call this once before using generateVideoThumbnail.
- * Uses CDN to load the ffmpeg-core WASM files.
- */
-export async function loadFFmpeg(): Promise<void> {
-  if (ffmpeg?.loaded) {
-    return;
-  }
-
-  ffmpeg = new FFmpeg();
-
-  const baseURL = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-  });
-}
-
-/**
- * Generate a thumbnail from a video file by extracting a frame at 1 second.
+ * Generate a thumbnail from a video file using browser's video element and canvas.
+ * This is much faster than using FFmpeg WASM - captures first frame instantly.
  * @param videoFile - The video file to extract thumbnail from
+ * @param seekTime - Time in seconds to seek to (default: 0 for first frame)
  * @returns Promise<Blob> - JPEG image blob
  */
-export async function generateVideoThumbnail(videoFile: File): Promise<Blob> {
-  if (!ffmpeg || !ffmpeg.loaded) {
-    await loadFFmpeg();
-  }
+export async function generateVideoThumbnail(videoFile: File, seekTime: number = 0): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
 
-  if (!ffmpeg) {
-    throw new Error("FFmpeg failed to initialize");
-  }
+    if (!ctx) {
+      reject(new Error('Failed to get canvas context'));
+      return;
+    }
 
-  const inputFileName = "input_video";
-  const outputFileName = "thumbnail.jpg";
+    // Set video attributes for thumbnail extraction
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = false;
 
-  // Write video file to FFmpeg virtual filesystem
-  await ffmpeg.writeFile(inputFileName, await fetchFile(videoFile));
+    // Create object URL for the video file
+    const videoUrl = URL.createObjectURL(videoFile);
 
-  // Extract frame at 1 second into JPEG
-  await ffmpeg.exec([
-    "-i",
-    inputFileName,
-    "-ss",
-    "00:00:01",
-    "-vframes",
-    "1",
-    "-q:v",
-    "2",
-    outputFileName,
-  ]);
+    video.onloadedmetadata = () => {
+      // Set canvas size to video dimensions
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
 
-  // Read the generated thumbnail
-  const data = await ffmpeg.readFile(outputFileName);
+      // Seek to the specified time (default: 0 = first frame)
+      // Use 0.1s instead of 0 for more reliable keyframe
+      video.currentTime = Math.min(seekTime || 0.1, video.duration);
+    };
 
-  // Clean up virtual files
-  await ffmpeg.deleteFile(inputFileName);
-  await ffmpeg.deleteFile(outputFileName);
+    video.onseeked = () => {
+      try {
+        // Draw video frame to canvas
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // Handle both Uint8Array and string return types
-  let blobData: ArrayBuffer;
-  if (typeof data === "string") {
-    blobData = new TextEncoder().encode(data).buffer as ArrayBuffer;
-  } else {
-    // Create a new ArrayBuffer with the exact size to avoid SharedArrayBuffer issues
-    const buffer = new ArrayBuffer(data.byteLength);
-    new Uint8Array(buffer).set(data);
-    blobData = buffer;
-  }
+        // Convert canvas to blob
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(videoUrl);
+            if (blob) {
+              resolve(blob);
+            } else {
+              reject(new Error('Failed to create blob from canvas'));
+            }
+          },
+          'image/jpeg',
+          0.85 // JPEG quality
+        );
+      } catch (err) {
+        URL.revokeObjectURL(videoUrl);
+        reject(err);
+      }
+    };
 
-  // Return as Blob
-  return new Blob([blobData], { type: "image/jpeg" });
+    video.onerror = () => {
+      URL.revokeObjectURL(videoUrl);
+      reject(new Error('Failed to load video file'));
+    };
+
+    // Load the video
+    video.src = videoUrl;
+  });
 }

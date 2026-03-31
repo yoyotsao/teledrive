@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-03-27
-**Commit:** d795788
-**Branch:** (current)
+**Generated:** 2026-03-30
+**Commit:** f105e35
+**Branch:** master
 
 ## ⚠️ IMPORTANT: Service Restart After Code Changes
 
@@ -23,7 +23,9 @@ D:\teledrive\restart.bat
 - Code changes require restart to take effect
 
 ### Frontend
-- Vite dev server (port **3000**) or preview server (port 4173)
+
+- **Development**: Vite dev server (port **3000**) - `npm run dev`
+- **Production**: Serve `dist/` folder with nginx/apache
 - Code changes require restart
 
 ### Full Manual Steps (三步驟):
@@ -113,6 +115,8 @@ Telegram Cloud Storage - A personal cloud storage system using Telegram as the b
 | 前端直接連接 Telegram | ✅ | 這是設計目標 |
 | 後端儲存 message_id + path | ✅ | 這是後端職責 |
 
+---
+
 ## STRUCTURE
 
 ```
@@ -126,12 +130,19 @@ teledrive/
 │   │   └── file_service.py  # File operations (SQLite-backed)
 │   └── tests/           # Unit tests
 ├── frontend/            # React + TypeScript (Vite, port 3000)
-│   ├── src/            # React source
-│   └── dist/           # Production build
+│   ├── src/
+│   │   ├── api/        # API client
+│   │   ├── components/ # React components
+│   │   ├── lib/        # GramJS, videoThumbnail
+│   │   └── types/      # TypeScript interfaces
+│   ├── dist/           # Production build
+│   └── vite.config.ts  # Vite config
 ├── start.sh            # Launcher script
 ├── restart.bat         # Restart script (Windows)
 └── generate_session.py # Telegram session generator
 ```
+
+---
 
 ## WHERE TO LOOK
 
@@ -139,18 +150,25 @@ teledrive/
 |------|----------|-------|
 | Backend API | `backend/main.py` + `backend/app/api/routes.py` | FastAPI endpoints |
 | Frontend entry | `frontend/src/main.tsx` | React bootstrap |
-| File browser UI | `frontend/src/components/ChonkyDrive.tsx` | Chonky component |
-| GramJS wrapper | `frontend/src/lib/gramjs.ts` | Browser MTProto client |
+| File browser UI | `frontend/src/components/ChonkyDrive.tsx` | Chonky component, thumbnails, preview |
+| GramJS wrapper | `frontend/src/lib/gramjs.ts` | Browser MTProto client (upload/download) |
+| Video thumbnail | `frontend/src/lib/videoThumbnail.ts` | FFmpeg WASM video thumbnails |
 | Database | `backend/app/services/database.py` | SQLite operations |
 | Config/env | `frontend/.env` | Vite env vars (VITE_ prefix) |
+| Vite config | `frontend/vite.config.ts` | Build config, polyfills |
+
+---
 
 ## CONVENTIONS
 
 - **Strict TypeScript**: `frontend/tsconfig.json` has `strict: true`, `noUnusedLocals`, `noUnusedParameters`
 - **Build**: Frontend uses Vite (`npm run build` → `dist/`)
+- **Dev server**: `npm run dev` (port 3000) - has API proxy
+- **Preview**: `npm run preview` (port 4173) - static only, NO API proxy
 - **Python**: FastAPI with uvicorn, Pydantic v2
 - **Entry**: Backend `python main.py`, Frontend `npm run dev`
-- **Dual package.json**: Root only has playwright, frontend has real deps
+
+---
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
@@ -158,6 +176,9 @@ teledrive/
 - **Traditional upload**: No REST file upload - uses GramJS in browser → Telegram CDN
 - **Forget to restart**: Backend state is in-memory + SQLite, changes require restart
 - **Wrong env prefix**: Frontend env vars MUST use `VITE_` prefix (e.g., `VITE_API_ID`)
+- **Preview for testing**: `npm run preview` has NO API proxy - use `npm run dev` instead
+
+---
 
 ## COMMANDS
 
@@ -165,13 +186,13 @@ teledrive/
 # Restart (Windows)
 restart.bat
 
-# Development
-./start.sh                          # Start both services
-cd backend && python main.py        # Backend only
-cd frontend && npm run dev          # Frontend only
+# Development (ALWAYS use this for testing)
+cd backend && python main.py        # Backend (port 8000)
+cd frontend && npm run dev          # Frontend (port 3000) - has API proxy
 
-# Build
-cd frontend && npm run build        # Production build
+# Production build
+cd frontend && npm run build        # Build to dist/
+npm run preview                     # Preview build (NO API proxy)
 
 # Setup
 python generate_session.py          # Get Telegram session
@@ -191,19 +212,28 @@ cp .env.example .env && edit .env   # Configure
 | Backend 500 error | ✅ | Restarted backend |
 | Upload stuck at "starting GramJS upload" | ✅ | Working now |
 | Thumbnail not showing | ✅ | Modified ChonkyDrive to use GramJS for thumbnails |
+| Double-click preview not showing | ✅ | Added downloadFile() in gramjs.ts, use GramJS instead of backend stream |
+| Preview mode error (crypto require) | ✅ | Added @rollup/plugin-commonjs with ignoreDynamicRequires |
 
 ### Files Modified
 
-- `D:\teledrive\frontend\.env` - Created with VITE_ prefixed credentials
-- `D:\teledrive\frontend\src\components\SessionConfig.tsx` - Added Telegram client initialization on mount
-- `D:\teledrive\frontend\src\lib\gramjs.ts` - Added `downloadThumbnail()` method
-- `D:\teledrive\frontend\src\components\ChonkyDrive.tsx` - Modified `loadThumbnails` to use GramJS directly
+| File | Change |
+|------|--------|
+| `frontend/.env` | Created with VITE_ prefixed credentials |
+| `frontend/src/components/SessionConfig.tsx` | Added Telegram client initialization on mount |
+| `frontend/src/lib/gramjs.ts` | Added `downloadThumbnail()`, `downloadFile()` methods |
+| `frontend/src/components/ChonkyDrive.tsx` | Modified loadThumbnails and handleFileDoubleClick to use GramJS directly |
+| `frontend/src/vite-env.d.ts` | Added Vite ImportMeta type definitions |
+| `frontend/vite.config.ts` | Added commonjsOptions for build |
 
 ### Key Configurations
 
-- **GramJS Version**: 2.10.8 (loaded at runtime)
-- **Frontend Port**: 3000
-- **Backend Port**: 8000
+| Config | Value |
+|--------|-------|
+| GramJS Version | 2.10.8 (loaded at runtime) |
+| Frontend Port | 3000 |
+| Backend Port | 8000 |
+| Preview Port | 4173 (no proxy) |
 
 ---
 
@@ -211,14 +241,48 @@ cp .env.example .env && edit .env   # Configure
 
 ### Runtime Verified ✅
 
-- GramJS connects successfully (`[GramJS] Connected as: name404notfound`)
-- Upload works (`[Upload] File uploaded to Telegram, message_id: 179415`)
-- Thumbnail download works (`[Thumb] Downloaded for 螢幕擷取畫面...`)
+- GramJS connects successfully
+- Upload works
+- Thumbnail download works
+- File preview works (double-click)
 - Backend API returns 200
 
 ### Build Verified ✅
 
-- Frontend builds successfully
+- Frontend builds successfully (`npm run build`)
+- Preview mode works (`npm run preview`)
+
+---
+
+## DEPLOYMENT
+
+### Development
+```bash
+npm run dev  # port 3000, has API proxy
+```
+
+### Production
+```bash
+npm run build                    # Build to dist/
+# Serve dist/ with nginx/apache
+```
+
+### Nginx Example
+```nginx
+server {
+    listen 80;
+    root /path/to/teledrive/frontend/dist;
+    index index.html;
+    
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+    
+    location /api/ {
+        proxy_pass http://localhost:8000;
+    }
+}
+```
 
 ---
 
@@ -230,3 +294,4 @@ cp .env.example .env && edit .env   # Configure
 - No formal CI/CD - manual deployment via shell scripts
 - Minimal testing infrastructure - only unittest in backend
 - **Important**: Session string stored in `frontend/.env` with `VITE_` prefix
+- **Always use `npm run dev` for testing** - preview mode has no API proxy

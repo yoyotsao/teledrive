@@ -6,7 +6,7 @@ import bigInt from "big-integer";
 import { api } from "../api/client";
 
 // Constants for split upload
-const MAX_PARTS = 3900;
+const MAX_PARTS = 1000;
 const PART_SIZE = 512 * 1024; // 512KB
 
 /**
@@ -201,6 +201,10 @@ export class TelegramClientManager {
     // Calculate total parts for current file segment
     let remainingForCurrentFile = file.size;
     let partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
+    
+    console.log('[SplitUpload] File:', file.name, 'Size:', file.size, 'bytes');
+    console.log('[SplitUpload] Total parts needed:', Math.ceil(file.size / PART_SIZE));
+    console.log('[SplitUpload] First file segment - parts:', partsForCurrentFile);
 
     // Process file in chunks
     for (let offset = 0; offset < file.size; offset += PART_SIZE) {
@@ -209,30 +213,88 @@ export class TelegramClientManager {
       // Use globalThis.Buffer (provided by vite-plugin-node-polyfills)
       const bytes = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
 
+      console.log('[SplitUpload] Uploading part', partIndex, '/', partsForCurrentFile, '- offset:', offset);
+
       // Save this part using SaveBigFilePart API
-      await this.client.invoke(
-        new Api.upload.SaveBigFilePart({
-          fileId: fileId,
-          filePart: partIndex,
-          fileTotalParts: partsForCurrentFile,
-          bytes: bytes,
-        })
-      );
+      try {
+        await this.client.invoke(
+          new Api.upload.SaveBigFilePart({
+            fileId: fileId,
+            filePart: partIndex,
+            fileTotalParts: partsForCurrentFile,
+            bytes: bytes,
+          })
+        );
+        console.log('[SplitUpload] Part', partIndex, 'uploaded successfully');
+      } catch (err: any) {
+        console.error('[SplitUpload] Part', partIndex, 'FAILED:', err?.message || err);
+        throw err;
+      }
 
       partIndex++;
       remainingForCurrentFile -= PART_SIZE;
 
       // If we've reached max parts, finalize this file and start a new one
       if (partIndex >= MAX_PARTS) {
+        console.log('[SplitUpload] Reached MAX_PARTS, sending file with', partIndex, 'parts...');
+        
         const inputFileBig = new Api.InputFileBig({
           id: fileId,
           parts: partIndex,
           name: file.name,
         });
 
+        try {
+          const message = await this.client.sendFile("me", { file: inputFileBig });
+          console.log('[SplitUpload] File sent successfully, message_id:', message?.id);
+          
+          // Extract media info
+          const msg = message as Api.Message;
+          const media = msg.media;
+
+          let accessHash: string | undefined;
+          if (media) {
+            const mediaConstructor = (media as { className?: string }).className;
+            if (mediaConstructor === "MessageMediaDocument") {
+              const doc = media as unknown as { document: { id: bigint; accessHash?: bigint } };
+              accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
+            }
+          }
+
+          const segmentSize = partIndex * PART_SIZE;
+          uploadedParts.push({
+            message_id: msg.id,
+            file_id: String(fileId),
+            access_hash: accessHash,
+            size: Math.min(segmentSize, file.size), // Actual size of this segment
+          });
+          console.log('[SplitUpload] Segment registered, parts:', partIndex, 'size:', Math.min(segmentSize, file.size), 'bytes');
+        } catch (err: any) {
+          console.error('[SplitUpload] SendFile FAILED:', err?.message || err);
+          throw err;
+        }
+
+        // Start new file with updated remaining parts
+        fileId = generateRandomBigInt();
+        partIndex = 0;
+        partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
+        console.log('[SplitUpload] Starting new file segment, parts:', partsForCurrentFile, 'remaining:', remainingForCurrentFile);
+      }
+    }
+
+    // Upload final file if there are remaining parts
+    if (partIndex > 0) {
+      console.log('[SplitUpload] Sending final file with', partIndex, 'parts...');
+      const inputFileBig = new Api.InputFileBig({
+        id: fileId,
+        parts: partIndex, // This is the actual number of parts for this final file
+        name: file.name,
+      });
+
+      try {
         const message = await this.client.sendFile("me", { file: inputFileBig });
+        console.log('[SplitUpload] Final file sent, message_id:', message?.id);
         
-        // Extract media info
         const msg = message as Api.Message;
         const media = msg.media;
 
@@ -245,48 +307,18 @@ export class TelegramClientManager {
           }
         }
 
+        const finalSegmentSize = partIndex * PART_SIZE;
         uploadedParts.push({
           message_id: msg.id,
           file_id: String(fileId),
           access_hash: accessHash,
-          size: partIndex * PART_SIZE,
+          size: finalSegmentSize, // Actual size of final segment
         });
-
-        // Start new file with updated remaining parts
-        fileId = generateRandomBigInt();
-        partIndex = 0;
-        partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
+        console.log('[SplitUpload] Final segment registered, parts:', partIndex, 'size:', finalSegmentSize, 'bytes');
+      } catch (err: any) {
+        console.error('[SplitUpload] Final SendFile FAILED:', err?.message || err);
+        throw err;
       }
-    }
-
-    // Upload final file if there are remaining parts
-    if (partIndex > 0) {
-      const inputFileBig = new Api.InputFileBig({
-        id: fileId,
-        parts: partIndex, // This is the actual number of parts for this final file
-        name: file.name,
-      });
-
-      const message = await this.client.sendFile("me", { file: inputFileBig });
-      
-      const msg = message as Api.Message;
-      const media = msg.media;
-
-      let accessHash: string | undefined;
-      if (media) {
-        const mediaConstructor = (media as { className?: string }).className;
-        if (mediaConstructor === "MessageMediaDocument") {
-          const doc = media as unknown as { document: { id: bigint; accessHash?: bigint } };
-          accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
-        }
-      }
-
-      uploadedParts.push({
-        message_id: msg.id,
-        file_id: String(fileId),
-        access_hash: accessHash,
-        size: file.size,
-      });
     }
 
     return {
@@ -326,33 +358,228 @@ export class TelegramClientManager {
   }
 
   /**
-   * Download a file from Telegram by message_id.
+   * Download a file from Telegram by message_id using chunked GetFile API.
    * @param messageId - The Telegram message ID of the file
    * @param mimeType - The MIME type of the file (for Blob type)
    * @returns Promise with Blob of the file
    */
   async downloadFile(messageId: number, mimeType: string = 'application/octet-stream'): Promise<Blob> {
+    console.log('[Download] downloadFile called, messageId:', messageId, 'mimeType:', mimeType);
+    
     if (!this.client) {
+      console.error('[Download] Client not initialized');
       throw new Error("Client not initialized. Call initialize() first.");
     }
 
+    console.log('[Download] Getting message from Saved Messages, messageId:', messageId);
     // Get the message from Saved Messages
+    const messages = await this.client.getMessages("me", { ids: [messageId] });
+    console.log('[Download] Got messages, count:', messages?.length, 'first:', messages?.[0]?.constructor?.name);
+    
+    const message = messages[0] as Api.Message;
+    
+    if (!message) {
+      console.error('[Download] Message not found for id:', messageId);
+      throw new Error("Message not found: " + messageId);
+    }
+    
+    console.log('[Download] Message found, media:', !!message.media, 'type:', message.media?.constructor?.name);
+    
+    if (!message.media) {
+      console.error('[Download] Message has no media');
+      throw new Error("Message has no media for id: " + messageId);
+    }
+
+    // Try chunked download first (better for large files)
+    try {
+      console.log('[Download] Trying chunked GetFile download...');
+      const result = await this.downloadFileChunked(message, mimeType);
+      return result;
+    } catch (err: any) {
+      console.error('[Download] Chunked download failed, trying downloadMedia:', err.message);
+      // Fallback to downloadMedia for small files
+      console.log('[Download] Starting downloadMedia fallback...');
+      const buffer = await this.client.downloadMedia(message.media);
+      if (!buffer || buffer.length === 0) {
+        throw new Error("Failed to download file - empty buffer");
+      }
+      return new Blob([buffer], { type: mimeType });
+    }
+  }
+
+  /**
+   * Download file using streaming - returns blob immediately for playback while downloading continues.
+   */
+  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream'): Promise<Blob> {
+    console.log('[Streaming] Starting streaming download...');
+    
+    // Extract file location from message media
+    let fileSize: number = 0;
+    let docId: bigint = BigInt(0);
+    let accessHash: bigint = BigInt(0);
+    let fileReference: Uint8Array | undefined;
+    
+    const media = message.media as any;
+    
+    if (media?.className === 'MessageMediaDocument') {
+      const doc = media.document;
+      if (!doc) throw new Error('No document in media');
+      docId = doc.id;
+      accessHash = doc.accessHash;
+      fileReference = doc.fileReference;
+      fileSize = Number(doc.size);
+      console.log('[Streaming] Document size:', fileSize);
+    } else if (media?.className === 'MessageMediaPhoto') {
+      const photo = media.photo;
+      if (!photo) throw new Error('No photo in media');
+      docId = photo.id;
+      accessHash = photo.accessHash;
+      fileReference = photo.fileReference;
+      fileSize = Number(photo.size);
+      console.log('[Streaming] Photo size:', fileSize);
+    } else {
+      throw new Error('Unsupported media type: ' + media?.className);
+    }
+
+    const CHUNK_SIZE = 512 * 1024; // 512KB - match upload chunk size
+    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+    console.log('[Streaming] Total size:', fileSize, 'chunks:', totalChunks);
+
+    // Store downloaded chunks
+    const downloadedChunks: Uint8Array[] = [];
+    let isDownloadComplete = false;
+
+    // Start downloading in background immediately
+    const downloadInBackground = async () => {
+      let offset = 0;
+      let chunkIndex = 0;
+      
+      while (offset < fileSize) {
+        const limit = Math.min(CHUNK_SIZE, fileSize - offset);
+        
+        const chunkLocation = new Api.InputDocumentFileLocation({
+          id: docId,
+          accessHash: accessHash,
+          fileReference: fileReference,
+          thumbSize: "",
+        });
+        
+        try {
+          const fileResult = await this.client.invoke(
+            new Api.upload.GetFile({
+              location: chunkLocation,
+              offset: BigInt(offset),
+              limit: limit,
+              precise: true,
+              cdnSupported: true,
+            })
+          );
+          
+          if (fileResult.bytes) {
+            downloadedChunks.push(new Uint8Array(fileResult.bytes));
+            console.log(`[Streaming] Chunk ${chunkIndex + 1}/${totalChunks} ready`);
+          }
+        } catch (err: any) {
+          console.error('[Streaming] GetFile error:', err.message);
+          throw err;
+        }
+        
+        offset += limit;
+        chunkIndex++;
+      }
+      
+      isDownloadComplete = true;
+      console.log('[Streaming] All chunks downloaded!');
+    };
+
+    // Start background download (don't await - run in parallel)
+    downloadInBackground().catch(err => console.error('[Streaming] Background download failed:', err));
+
+    // Wait for enough chunks (at least 10MB) for playback to start reliably - video needs keyframes
+    const waitForEnoughChunks = (minSize: number = 10 * 1024 * 1024): Promise<Blob> => new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      const checkInterval = setInterval(() => {
+        const currentSize = downloadedChunks.reduce((sum, c) => sum + c.length, 0);
+        if (currentSize >= minSize) {
+          clearInterval(checkInterval);
+          // Correct way to create blob from chunks
+          const blob = new Blob(downloadedChunks, { type: mimeType });
+          console.log('[Streaming] Enough chunks ready, size:', blob.size);
+          resolve(blob);
+        }
+        if (isDownloadComplete && downloadedChunks.length > 0) {
+          clearInterval(checkInterval);
+          const blob = new Blob(downloadedChunks, { type: mimeType });
+          console.log('[Streaming] Download complete, final size:', blob.size);
+          resolve(blob);
+        }
+        // Timeout after 60 seconds
+        if (Date.now() - startTime > 60000) {
+          clearInterval(checkInterval);
+          // Return whatever we have even if not enough
+          const blob = new Blob(downloadedChunks, { type: mimeType });
+          console.log('[Streaming] Timeout, returning blob with size:', blob.size);
+          resolve(blob);
+        }
+      }, 100);
+    });
+
+    return await waitForEnoughChunks();
+  }
+
+  /**
+   * Download a specific chunk of a file by offset - for streaming playback.
+   */
+  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number): Promise<Blob> {
+    console.log('[ChunkByOffset] Downloading chunk, messageId:', messageId, 'offset:', offset, 'limit:', limit);
+    
+    if (!this.client) {
+      throw new Error("Client not initialized");
+    }
+
+    // Get message
     const messages = await this.client.getMessages("me", { ids: [messageId] });
     const message = messages[0] as Api.Message;
     
-    if (!message || !message.media) {
-      throw new Error("Message not found or has no media");
+    if (!message?.media) {
+      throw new Error("Message has no media");
     }
 
-    // Download the media
-    const buffer = await this.client.downloadMedia(message.media);
+    const media = message.media as any;
+    let docId: bigint, accessHash: bigint, fileReference: Uint8Array | undefined;
     
-    if (!buffer) {
-      throw new Error("Failed to download file");
+    if (media?.className === 'MessageMediaDocument') {
+      const doc = media.document;
+      docId = doc.id;
+      accessHash = doc.accessHash;
+      fileReference = doc.fileReference;
+    } else {
+      throw new Error('Unsupported media type');
     }
 
-    // Convert Uint8Array to Blob
-    return new Blob([buffer], { type: mimeType });
+    const chunkLocation = new Api.InputDocumentFileLocation({
+      id: docId,
+      accessHash: accessHash,
+      fileReference: fileReference,
+      thumbSize: "",
+    });
+
+    const fileResult = await this.client.invoke(
+      new Api.upload.GetFile({
+        location: chunkLocation,
+        offset: BigInt(offset),
+        limit: limit,
+        precise: true,
+        cdnSupported: true,
+      })
+    );
+
+    if (!fileResult.bytes) {
+      throw new Error('No data returned');
+    }
+
+    console.log('[ChunkByOffset] Got chunk, bytes:', fileResult.bytes.length);
+    return new Blob([new Uint8Array(fileResult.bytes)], { type: 'video/mp4' });
   }
 
   /**
@@ -362,9 +589,11 @@ export class TelegramClientManager {
    * @returns Promise with merged Blob of the complete file
    */
   async downloadFileMerge(splitGroupId: string, mimeType: string = 'application/octet-stream'): Promise<Blob> {
+    console.log('[DownloadMerge] Starting for split_group_id:', splitGroupId);
     // Query backend for all parts in this split group
     const filePartsResponse = await api.getSplitGroupFiles(splitGroupId);
     const fileParts = filePartsResponse.files;
+    console.log('[DownloadMerge] Found parts:', fileParts.length);
 
     if (!fileParts || fileParts.length === 0) {
       throw new Error("No files found for split group: " + splitGroupId);
@@ -377,20 +606,28 @@ export class TelegramClientManager {
       return aIndex - bIndex;
     });
 
+    console.log('[DownloadMerge] Sorted parts:', sortedParts.map(p => ({ idx: (p as any).part_index, msgId: p.telegram_message_id })));
+
     // Download each part sequentially
     const parts: Blob[] = [];
-    for (const part of sortedParts) {
+    for (let i = 0; i < sortedParts.length; i++) {
+      const part = sortedParts[i];
       const messageId = part.telegram_message_id;
+      console.log('[DownloadMerge] Downloading part', i, 'messageId:', messageId);
+      
       if (!messageId) {
         throw new Error(`Missing telegram_message_id for part: ${part.file_id}`);
       }
       
       const blob = await this.downloadFile(messageId, mimeType);
+      console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
       parts.push(blob);
     }
 
+    console.log('[DownloadMerge] All parts downloaded, merging...');
     // Merge all parts using Blob
     const merged = new Blob(parts, { type: mimeType });
+    console.log('[DownloadMerge] Merged size:', merged.size);
     return merged;
   }
 

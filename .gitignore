@@ -33,6 +33,7 @@ backend/teledrive.db
 
 # Frontend
 node_modules/
+frontend/tests/screenshots
 dist/
 .DS_Store
 *.log
@@ -70,3 +71,12 @@ project.tar.gz
 # Logs
 *.log
 logs/
+
+# Playwright Test Results
+test-results/
+
+# Test files (test data for E2E tests)
+test-files/
+
+# Playwright report
+playwright-report/

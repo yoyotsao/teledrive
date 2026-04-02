@@ -108,11 +108,16 @@ export function ChonkyDrive() {
 
       const allOriginal: FileInfo[] = [...foldersResponse.files, ...filesResponse.files];
       
-      // 去重：根據檔名去重，保留最新上傳的
-      const seenNames = new Set<string>();
+      // 去重：根據檔名去重，但 split file 需要保留所有 parts
+      // 使用 split_group_id + filename 來判斷是否為同一個分割檔案
+      const seenKeys = new Set<string>();
       const uniqueFiles = allOriginal.reverse().filter((f) => {
-        if (seenNames.has(f.filename)) return false;
-        seenNames.add(f.filename);
+        // 如果是分割檔案，使用 split_group_id 作為 key
+        const isSplitFile = (f as any).is_split_file && (f as any).split_group_id;
+        const key = isSplitFile ? `split:${(f as any).split_group_id}` : `normal:${f.filename}`;
+        
+        if (seenKeys.has(key)) return false;
+        seenKeys.add(key);
         return true;
       }).reverse();
 
@@ -557,9 +562,12 @@ export function ChonkyDrive() {
             blob = await telegramClient.downloadFile(msgId, mimeType);
           }
           
+          // Store blob reference globally to prevent GC
+          (window as any).__previewBlob = blob;
           const url = URL.createObjectURL(blob);
+          console.log('[Preview] Created blob URL:', url, 'blob size:', blob.size, 'blob type:', blob.type);
           setPreviewUrl(url);
-          console.log('[Preview] Downloaded file:', original.filename);
+          console.log('[Preview] Set previewUrl for:', original.filename);
         } catch (err) {
           console.error('[Preview] Error downloading file:', err);
         }
@@ -1051,18 +1059,10 @@ export function ChonkyDrive() {
                   }}
                 />
               ) : previewFile.mime_type?.startsWith('video/') ? (
-                <video
-                  controls
-                  autoPlay
-                  preload="auto"
-                  style={{
-                    maxWidth: '100%',
-                    maxHeight: 'calc(90vh - 100px)',
-                  }}
-                >
-                  <source src={previewUrl} type={previewFile.mime_type || 'video/mp4'} />
-                  Your browser does not support video playback.
-                </video>
+                <StreamingVideoPlayer
+                  messageId={previewFile.telegram_message_id}
+                  mimeType={previewFile.mime_type || 'video/mp4'}
+                />
               ) : (
                 <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
                   Preview not available for this file type
@@ -1074,4 +1074,111 @@ export function ChonkyDrive() {
       )}
     </div>
   );
+}
+
+// Streaming video player using MediaSource API for large file playback
+function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mimeType: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [downloadedSize, setDownloadedSize] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const isDownloading = useRef(false);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Try MediaSource first
+    const tryMediaSource = () => {
+      if (MediaSource.isTypeSupported(mimeType)) {
+        return startMediaSource();
+      }
+      console.log('[StreamingPlayer] MediaSource not supported, using fallback');
+      return startFallback();
+    };
+
+    const startMediaSource = async () => {
+      const mediaSource = new MediaSource();
+      video.src = URL.createObjectURL(mediaSource);
+      
+      mediaSource.addEventListener('sourceopen', async () => {
+        const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+        isDownloading.current = true;
+        downloadAndAppend(video, mediaSource, sourceBuffer);
+      });
+    };
+
+    const startFallback = async () => {
+      console.log('[StreamingPlayer] Using fallback blob URL method...');
+      isDownloading.current = true;
+      
+      try {
+        const telegramClient = getTelegramClient();
+        const chunks: Uint8Array[] = [];
+        
+        let offset = 0;
+        const CHUNK_SIZE = 512 * 1024;
+        
+        while (isDownloading.current && offset < 100 * 1024 * 1024) { // Max 100MB
+          const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, CHUNK_SIZE);
+          
+          if (!blob || blob.size === 0) break;
+          
+          const buf = await blob.arrayBuffer();
+          chunks.push(new Uint8Array(buf));
+          offset += blob.size;
+          setDownloadedSize(offset);
+          
+          console.log('[StreamingPlayer] Downloaded chunk, total:', offset);
+          
+          // Create blob URL from all downloaded chunks
+          const allChunksBlob = new Blob(chunks, { type: mimeType });
+          const url = URL.createObjectURL(allChunksBlob);
+          
+          // Store blob to prevent GC
+          (window as any).__previewBlob = allChunksBlob;
+          
+          setBlobUrl(url);
+          
+          // Try to play when we have enough data
+          if (offset > 5 * 1024 * 1024 && video.paused) {
+            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
+          }
+          
+          // Wait a bit between chunks
+          await new Promise(r => setTimeout(r, 500));
+        }
+      } catch (err: any) {
+        console.error('[StreamingPlayer] Fallback error:', err);
+        setError(err.message);
+      }
+    };
+
+    tryMediaSource();
+
+    return () => {
+      isDownloading.current = false;
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+    };
+  }, [messageId, mimeType]);
+
+  // For fallback mode, use blob URL directly
+  if (blobUrl) {
+    return (
+      <div style={{ padding: '8px' }}>
+        <video
+          key={blobUrl}
+          src={blobUrl}
+          controls
+          autoPlay
+          style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
+        />
+        <div style={{ color: '#666', fontSize: '12px', padding: '4px' }}>
+          Downloaded: {(downloadedSize / 1024 / 1024).toFixed(1)} MB
+        </div>
+      </div>
+    );
+  }
 }

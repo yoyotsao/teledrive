@@ -1213,6 +1213,21 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
     };
   }, [messageId, mimeType]);
 
+  // Restore playback position when blobUrl changes (e.g., after download completes)
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !blobUrl) return;
+    
+    // Restore currentTime after src changes
+    const currentTime = video.currentTime;
+    const restoreTime = () => {
+      if (video.currentTime !== currentTime) {
+        video.currentTime = currentTime;
+      }
+    };
+    video.addEventListener('loadedmetadata', restoreTime, { once: true });
+  }, [blobUrl]);
+
   // D. IMPLEMENT startMediaSource
   const startMediaSource = (video: HTMLVideoElement, codec: string) => {
     const mediaSource = new MediaSource();
@@ -1432,19 +1447,14 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
           hasStartedPlaying = true;
         }
         
-        // Update blob URL periodically (every 2MB)
-        if (offset > 2 * 1024 * 1024 && offset % (2 * 1024 * 1024) < CHUNK_SIZE) {
-          const allChunksBlob = new Blob(chunks as BlobPart[], { type: mimeType });
-          if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
-          currentBlobUrl = URL.createObjectURL(allChunksBlob);
-          (window as any).__previewBlob = allChunksBlob;
-          setBlobUrl(currentBlobUrl);
-          setDownloadedSize(offset);
-        }
+        // DON'T update blob URL during download - keep the same URL for continuous playback
+        // This prevents React re-renders that restart video playback
         
         await new Promise(r => setTimeout(r, 100));
       }
       
+      // Download complete - update to final full version
+      const currentTime = video.currentTime;
       if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
       const finalBlob = new Blob(chunks as BlobPart[], { type: mimeType });
       currentBlobUrl = URL.createObjectURL(finalBlob);
@@ -1490,7 +1500,6 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
       <div style={{ padding: '8px' }}>
         <video
           ref={videoRef}
-          key={blobUrl}
           src={blobUrl}
           controls
           autoPlay

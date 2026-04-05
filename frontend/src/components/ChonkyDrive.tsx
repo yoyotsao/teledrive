@@ -533,43 +533,52 @@ export function ChonkyDrive() {
       // Double-click file to preview
       const original = originalFiles.find((f) => f.file_id === file.id);
       if (original) {
+        // Show preview modal immediately without waiting for download
         setPreviewFile(original);
         
-        // Download directly from Telegram via GramJS
-        try {
-          const telegramClient = getTelegramClient();
-          if (!telegramClient.isConnected()) {
-            console.error('[Preview] Telegram client not connected');
-            return;
-          }
-          
-          const mimeType = original.mime_type || 'application/octet-stream';
-          let blob: Blob;
-          
-          // Check if this is a split file
-          if ((original as any).is_split_file && (original as any).split_group_id) {
-            // Download and merge all parts
-            console.log('[Preview] Downloading split file, group:', (original as any).split_group_id);
-            blob = await telegramClient.downloadFileMerge((original as any).split_group_id, mimeType);
-            console.log('[Preview] Merged split file, size:', blob.size);
-          } else {
-            // Download single file
-            const msgId = original.telegram_message_id;
-            if (!msgId) {
-              console.error('[Preview] No telegram_message_id for file');
+        const mimeType = original.mime_type || 'application/octet-stream';
+        
+        // For videos: use streaming player, don't wait for full download
+        if (mimeType.startsWith('video/')) {
+          console.log('[Preview] Video file - using streaming player');
+          // StreamingVideoPlayer will handle the download
+          // We set previewUrl to null so the StreamingVideoPlayer component renders
+          setPreviewUrl(null);
+        } else {
+          // For non-videos: download completely first
+          try {
+            const telegramClient = getTelegramClient();
+            if (!telegramClient.isConnected()) {
+              console.error('[Preview] Telegram client not connected');
               return;
             }
-            blob = await telegramClient.downloadFile(msgId, mimeType);
+            
+            let blob: Blob;
+            
+            // Check if this is a split file
+            if ((original as any).is_split_file && (original as any).split_group_id) {
+              console.log('[Preview] Downloading split file, group:', (original as any).split_group_id);
+              blob = await telegramClient.downloadFileMerge((original as any).split_group_id, mimeType);
+              console.log('[Preview] Merged split file, size:', blob.size);
+            } else {
+              // Download single file
+              const msgId = original.telegram_message_id;
+              if (!msgId) {
+                console.error('[Preview] No telegram_message_id for file');
+                return;
+              }
+              blob = await telegramClient.downloadFile(msgId, mimeType);
+            }
+            
+            // Store blob reference globally to prevent GC
+            (window as any).__previewBlob = blob;
+            const url = URL.createObjectURL(blob);
+            console.log('[Preview] Created blob URL:', url, 'blob size:', blob.size, 'blob type:', blob.type);
+            setPreviewUrl(url);
+            console.log('[Preview] Set previewUrl for:', original.filename);
+          } catch (err) {
+            console.error('[Preview] Error downloading file:', err);
           }
-          
-          // Store blob reference globally to prevent GC
-          (window as any).__previewBlob = blob;
-          const url = URL.createObjectURL(blob);
-          console.log('[Preview] Created blob URL:', url, 'blob size:', blob.size, 'blob type:', blob.type);
-          setPreviewUrl(url);
-          console.log('[Preview] Set previewUrl for:', original.filename);
-        } catch (err) {
-          console.error('[Preview] Error downloading file:', err);
         }
       }
     }
@@ -920,7 +929,7 @@ export function ChonkyDrive() {
       )}
 
       {/* Preview Modal */}
-      {previewFile && previewUrl && (
+      {previewFile && (
         <div
           style={{
             position: 'fixed',
@@ -1059,10 +1068,19 @@ export function ChonkyDrive() {
                   }}
                 />
               ) : previewFile.mime_type?.startsWith('video/') ? (
-                <StreamingVideoPlayer
-                  messageId={previewFile.telegram_message_id}
-                  mimeType={previewFile.mime_type || 'video/mp4'}
-                />
+                previewUrl ? (
+                  <video
+                    src={previewUrl}
+                    controls
+                    autoPlay
+                    style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
+                  />
+                ) : (
+                  <StreamingVideoPlayer
+                    messageId={previewFile.telegram_message_id || 0}
+                    mimeType={previewFile.mime_type || 'video/mp4'}
+                  />
+                )
               ) : (
                 <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
                   Preview not available for this file type
@@ -1076,99 +1094,379 @@ export function ChonkyDrive() {
   );
 }
 
+// Helper function to find supported codec for MediaSource
+function findSupportedCodec(mimeType: string): string | null {
+  const codecs = [
+    'video/webm; codecs="vp8, vorbis"',
+    'video/webm; codecs="vp9, opus"',
+    'video/webm; codecs="vp8"',
+    'video/webm; codecs="vp9"',
+    'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+    'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+    'video/mp4; codecs="avc1.42E01E"',
+    'video/mp4; codecs="avc1.42001E"',
+    'video/mp4',
+    'video/webm',
+  ];
+  
+  // Try to match based on mime type
+  if (mimeType.includes('webm')) {
+    for (const codec of ['video/webm; codecs="vp9, opus"', 'video/webm; codecs="vp8, vorbis"', 'video/webm']) {
+      if (MediaSource.isTypeSupported(codec)) return codec;
+    }
+  } else if (mimeType.includes('mp4') || mimeType.includes('video')) {
+    for (const codec of ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', 'video/mp4']) {
+      if (MediaSource.isTypeSupported(codec)) return codec;
+    }
+  }
+  
+  // Fallback: try all codecs
+  for (const codec of codecs) {
+    if (MediaSource.isTypeSupported(codec)) return codec;
+  }
+  
+  return null;
+}
+
 // Streaming video player using MediaSource API for large file playback
 function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mimeType: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  
+  // A. ADD REFS
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const pendingChunksRef = useRef<Uint8Array[]>([]);
+  const isAppendingRef = useRef(false);
+  const isDownloadingRef = useRef(false);
+  const currentOffsetRef = useRef(0);
+  const downloadedChunksRef = useRef<Uint8Array[]>([]);
+  const totalSizeRef = useRef(0); // 用 ref 存儲，避免 state 異步問題
+  
+  // B. ADD STATE
+  const [totalSize, setTotalSize] = useState(0);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [downloadedSize, setDownloadedSize] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const isDownloading = useRef(false);
 
+  // C. IMPLEMENT useEffect
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video) {
+      console.log('[StreamingPlayer] ERROR: videoRef.current is null!');
+      return;
+    }
 
-    // Try MediaSource first
-    const tryMediaSource = () => {
-      if (MediaSource.isTypeSupported(mimeType)) {
-        return startMediaSource();
-      }
-      console.log('[StreamingPlayer] MediaSource not supported, using fallback');
-      return startFallback();
-    };
+    console.log('[StreamingPlayer] ===== COMPONENT MOUNTED =====');
+    console.log('[StreamingPlayer] messageId:', messageId, 'mimeType:', mimeType);
 
-    const startMediaSource = async () => {
-      const mediaSource = new MediaSource();
-      video.src = URL.createObjectURL(mediaSource);
-      
-      mediaSource.addEventListener('sourceopen', async () => {
-        const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
-        isDownloading.current = true;
-        downloadAndAppend(video, mediaSource, sourceBuffer);
-      });
-    };
-
-    const startFallback = async () => {
-      console.log('[StreamingPlayer] Using fallback blob URL method...');
-      isDownloading.current = true;
-      
+    const initPlayer = async () => {
       try {
+        // Get file metadata using downloadFileMetadata
         const telegramClient = getTelegramClient();
-        const chunks: Uint8Array[] = [];
+        console.log('[StreamingPlayer] Got Telegram client, calling downloadFileMetadata...');
         
-        let offset = 0;
-        const CHUNK_SIZE = 512 * 1024;
+        const metadata = await telegramClient.downloadFileMetadata(messageId);
+        console.log('[StreamingPlayer] File metadata - size:', metadata.size, 'mime:', metadata.mimeType);
+        setTotalSize(metadata.size);
+        totalSizeRef.current = metadata.size; // 同時更新 ref
+
+        // Try MediaSource API using findSupportedCodec
+        const codec = findSupportedCodec(metadata.mimeType);
+        console.log('[StreamingPlayer] findSupportedCodec result:', codec);
         
-        while (isDownloading.current && offset < 100 * 1024 * 1024) { // Max 100MB
-          const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, CHUNK_SIZE);
-          
-          if (!blob || blob.size === 0) break;
-          
-          const buf = await blob.arrayBuffer();
-          chunks.push(new Uint8Array(buf));
-          offset += blob.size;
-          setDownloadedSize(offset);
-          
-          console.log('[StreamingPlayer] Downloaded chunk, total:', offset);
-          
-          // Create blob URL from all downloaded chunks
-          const allChunksBlob = new Blob(chunks, { type: mimeType });
-          const url = URL.createObjectURL(allChunksBlob);
-          
-          // Store blob to prevent GC
-          (window as any).__previewBlob = allChunksBlob;
-          
-          setBlobUrl(url);
-          
-          // Try to play when we have enough data
-          if (offset > 5 * 1024 * 1024 && video.paused) {
-            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
-          }
-          
-          // Wait a bit between chunks
-          await new Promise(r => setTimeout(r, 500));
+        if (codec) {
+          console.log('[StreamingPlayer] Using MSE method (MediaSource API)');
+          startMediaSource(video, codec);
+        } else {
+          console.log('[StreamingPlayer] Codec not supported, using fallback method');
+          startFallback(video, metadata.size);
         }
       } catch (err: any) {
-        console.error('[StreamingPlayer] Fallback error:', err);
-        setError(err.message);
+        console.error('[StreamingPlayer] Init error:', err);
+        setError(err.message || 'Failed to initialize player');
       }
     };
 
-    tryMediaSource();
+    initPlayer();
 
     return () => {
-      isDownloading.current = false;
+      console.log('[StreamingPlayer] Cleanup - stopping download');
+      isDownloadingRef.current = false;
+      
+      // Clean up SourceBuffer if exists
+      if (sourceBufferRef.current && mediaSourceRef.current) {
+        try {
+          mediaSourceRef.current.removeSourceBuffer(sourceBufferRef.current);
+        } catch (e) {
+          console.log('[StreamingPlayer] Error removing source buffer:', e);
+        }
+        sourceBufferRef.current = null;
+      }
+      
+      // Clean up MediaSource
+      if (mediaSourceRef.current) {
+        mediaSourceRef.current = null;
+      }
+      
+      // Clean up blob URL if exists
       if (blobUrl) {
         URL.revokeObjectURL(blobUrl);
       }
     };
   }, [messageId, mimeType]);
 
-  // For fallback mode, use blob URL directly
-  if (blobUrl) {
+  // D. IMPLEMENT startMediaSource
+  const startMediaSource = (video: HTMLVideoElement, codec: string) => {
+    const mediaSource = new MediaSource();
+    mediaSourceRef.current = mediaSource;
+    
+    // Add sourceopen event listener BEFORE setting video.src
+    mediaSource.addEventListener('sourceopen', () => {
+      console.log('[StreamingPlayer] MediaSource opened');
+      
+      try {
+        const sourceBuffer = mediaSource.addSourceBuffer(codec);
+        sourceBufferRef.current = sourceBuffer;
+        
+        // Add updateend event for chunk queue processing
+        sourceBuffer.addEventListener('updateend', () => {
+          isAppendingRef.current = false;
+          processQueue();
+        });
+        
+        setIsStreaming(true);
+        startStreaming(video);
+      } catch (e: any) {
+        console.error('[StreamingPlayer] SourceBuffer error:', e);
+        setError('Failed to create source buffer: ' + e.message);
+      }
+    });
+    
+    // Set video src AFTER adding listener
+    video.src = URL.createObjectURL(mediaSource);
+  };
+
+  // E. IMPLEMENT startStreaming with queue mechanism
+  const startStreaming = async (video: HTMLVideoElement) => {
+    console.log('[StreamingPlayer] startStreaming called!');
+    console.log('[StreamingPlayer] totalSize:', totalSize, 'CHUNK_SIZE:', 512 * 1024);
+    
+    const CHUNK_SIZE = 512 * 1024; // 512KB
+    isDownloadingRef.current = true;
+    const telegramClient = getTelegramClient();
+    console.log('[StreamingPlayer] Telegram client obtained, starting download loop...');
+    
+    const downloadNextChunk = async () => {
+      console.log('[StreamingPlayer] downloadNextChunk loop, currentOffset:', currentOffsetRef.current, 'totalSize:', totalSizeRef.current);
+      while (isDownloadingRef.current && currentOffsetRef.current < totalSizeRef.current) {
+        const offset = currentOffsetRef.current;
+        console.log('[StreamingPlayer] Requesting chunk at offset:', offset, 'limit:', CHUNK_SIZE);
+        
+        try {
+          const chunkBlob = await telegramClient.downloadFileChunkedByOffset(
+            messageId, 
+            offset, 
+            CHUNK_SIZE
+          );
+          
+          if (chunkBlob.size === 0) {
+            console.log('[StreamingPlayer] No more data');
+            break;
+          }
+          
+          const buf = await chunkBlob.arrayBuffer();
+          const chunk = new Uint8Array(buf);
+          
+          // Wait for SourceBuffer to be ready
+          while (sourceBufferRef.current && sourceBufferRef.current.updating) {
+            await new Promise(r => setTimeout(r, 10));
+          }
+          
+          if (!sourceBufferRef.current) {
+            console.log('[StreamingPlayer] SourceBuffer no longer available');
+            break;
+          }
+          
+          // Append to SourceBuffer using appendBuffer()
+          sourceBufferRef.current.appendBuffer(chunk);
+          isAppendingRef.current = true;
+          console.log('[StreamingPlayer] Appended chunk at offset:', offset, 'size:', chunk.length);
+          
+          currentOffsetRef.current += chunk.length;
+          
+          // Wait for append to complete before requesting next chunk
+          await new Promise<void>(resolve => {
+            if (sourceBufferRef.current) {
+              sourceBufferRef.current.onupdateend = () => resolve();
+            } else {
+              resolve();
+            }
+          });
+          
+          // Try to play when we have enough data
+          if (offset < 2 * 1024 * 1024 && video.paused) {
+            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
+          }
+          
+        } catch (err: any) {
+          console.error('[StreamingPlayer] Chunk download error:', err);
+          break;
+        }
+        
+        // Small delay between chunks
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      // ===== Task 2: Add proper stream closure =====
+      // After download loop completes, call endOfStream()
+      console.log('[StreamingPlayer] Download complete, closing stream...');
+      
+      // Wait for SourceBuffer to finish updating
+      const waitForBuffer = () => {
+        return new Promise<void>(resolve => {
+          const sb = sourceBufferRef.current;
+          if (!sb || !sb.updating) {
+            resolve();
+          } else {
+            sb.onupdateend = () => resolve();
+          }
+        });
+      };
+      
+      await waitForBuffer();
+      
+      // Call endOfStream if MediaSource is still open
+      const ms = mediaSourceRef.current;
+      if (ms && ms.readyState === 'open') {
+        console.log('[StreamingPlayer] Calling endOfStream()');
+        ms.endOfStream();
+      } else if (ms && ms.readyState === 'ended') {
+        console.log('[StreamingPlayer] Stream already ended');
+      }
+      // ===== End Task 2 =====
+    };
+    
+    downloadNextChunk().catch(err => console.error('[StreamingPlayer] Streaming error:', err));
+  };
+
+  // Process queued chunks
+  const processQueue = () => {
+    if (pendingChunksRef.current.length === 0) return;
+    
+    const sourceBuffer = sourceBufferRef.current;
+    if (!sourceBuffer || sourceBuffer.updating) return;
+    
+    const chunk = pendingChunksRef.current.shift();
+    if (chunk) {
+      sourceBuffer.appendBuffer(chunk.buffer as ArrayBuffer);
+      isAppendingRef.current = true;
+    }
+  };
+
+  // F. IMPLEMENT startFallback (improved)
+  const startFallback = async (video: HTMLVideoElement, fileSize: number) => {
+    console.log('[StreamingPlayer] Using fallback blob URL method...');
+    isDownloadingRef.current = true;
+    
+    const telegramClient = getTelegramClient();
+    const chunks: Uint8Array[] = [];
+    downloadedChunksRef.current = chunks;
+    
+    let offset = 0;
+    const CHUNK_SIZE = 512 * 1024; // 512KB - 有效值 (1MB % 512KB = 0)
+    let currentBlobUrl: string | null = null;
+    let hasStartedPlaying = false;
+    
+    try {
+      while (isDownloadingRef.current && offset < fileSize) {
+        const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, CHUNK_SIZE);
+        
+        if (!blob || blob.size === 0) break;
+        
+        const buf = await blob.arrayBuffer();
+        const chunk = new Uint8Array(buf);
+        chunks.push(chunk);
+        offset += blob.size;
+        
+        console.log('[StreamingPlayer] Downloaded chunk, total:', offset, 'hasStartedPlaying:', hasStartedPlaying);
+        
+        // Create blob URL after first chunk
+        if (!hasStartedPlaying) {
+          const allChunksBlob = new Blob(chunks as BlobPart[], { type: mimeType });
+          currentBlobUrl = URL.createObjectURL(allChunksBlob);
+          
+          (window as any).__previewBlob = allChunksBlob;
+          
+          setBlobUrl(currentBlobUrl);
+          setIsStreaming(true);
+          setDownloadedSize(offset);
+          
+          // Wait for at least 2MB before trying to play (MP4 needs more data to parse)
+          if (offset >= 2 * 1024 * 1024 && video.paused) {
+            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
+          }
+          hasStartedPlaying = true;
+        }
+        
+        // Update blob URL periodically (every 2MB)
+        if (offset > 2 * 1024 * 1024 && offset % (2 * 1024 * 1024) < CHUNK_SIZE) {
+          const allChunksBlob = new Blob(chunks as BlobPart[], { type: mimeType });
+          if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
+          currentBlobUrl = URL.createObjectURL(allChunksBlob);
+          (window as any).__previewBlob = allChunksBlob;
+          setBlobUrl(currentBlobUrl);
+          setDownloadedSize(offset);
+        }
+        
+        await new Promise(r => setTimeout(r, 100));
+      }
+      
+      if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
+      const finalBlob = new Blob(chunks as BlobPart[], { type: mimeType });
+      currentBlobUrl = URL.createObjectURL(finalBlob);
+      (window as any).__previewBlob = finalBlob;
+      setBlobUrl(currentBlobUrl);
+      setDownloadedSize(offset);
+      
+    } catch (err: any) {
+      console.error('[StreamingPlayer] Fallback error:', err);
+      setError(err.message);
+    }
+  };
+
+  // G. ADD JSX RENDER
+  if (error) {
+    return (
+      <div style={{ padding: '20px', textAlign: 'center', color: '#dc2626' }}>
+        <div>Error: {error}</div>
+      </div>
+    );
+  }
+
+  // MSE case: isStreaming is true, video connected via MediaSource
+  if (isStreaming && !blobUrl) {
     return (
       <div style={{ padding: '8px' }}>
         <video
+          ref={videoRef}
+          controls
+          autoPlay
+          style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
+        />
+        <div style={{ color: '#666', fontSize: '12px', padding: '4px' }}>
+          Streaming via MSE... {(currentOffsetRef.current / 1024 / 1024).toFixed(1)} MB / {(totalSize / 1024 / 1024).toFixed(1)} MB
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback case: isStreaming && blobUrl
+  if (isStreaming && blobUrl) {
+    return (
+      <div style={{ padding: '8px' }}>
+        <video
+          ref={videoRef}
           key={blobUrl}
           src={blobUrl}
           controls
@@ -1176,9 +1474,25 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
           style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
         />
         <div style={{ color: '#666', fontSize: '12px', padding: '4px' }}>
-          Downloaded: {(downloadedSize / 1024 / 1024).toFixed(1)} MB
+          Downloaded: {(downloadedSize / 1024 / 1024).toFixed(1)} MB / {(totalSize / 1024 / 1024).toFixed(1)} MB
         </div>
       </div>
     );
   }
+
+  // Loading state
+  return (
+    <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
+      <div>Loading video...</div>
+      <video
+        ref={videoRef}
+        style={{ display: 'none' }}
+      />
+      {totalSize > 0 && (
+        <div style={{ marginTop: '8px' }}>
+          Downloaded: {(downloadedSize / 1024 / 1024).toFixed(1)} MB / {(totalSize / 1024 / 1024).toFixed(1)} MB
+        </div>
+      )}
+    </div>
+  );
 }

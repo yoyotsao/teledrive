@@ -1283,13 +1283,27 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
             await new Promise(r => setTimeout(r, 10));
           }
           
-          if (!sourceBufferRef.current) {
-            console.log('[StreamingPlayer] SourceBuffer no longer available');
+          if (!sourceBufferRef.current || !mediaSourceRef.current) {
+            console.log('[StreamingPlayer] SourceBuffer or MediaSource no longer available');
+            break;
+          }
+          
+          // Check MediaSource is still open
+          if (mediaSourceRef.current.readyState !== 'open') {
+            console.log('[StreamingPlayer] MediaSource not open, state:', mediaSourceRef.current.readyState);
             break;
           }
           
           // Append to SourceBuffer using appendBuffer()
-          sourceBufferRef.current.appendBuffer(chunk);
+          try {
+            sourceBufferRef.current.appendBuffer(chunk);
+          } catch (appendErr: any) {
+            if (appendErr.name === 'InvalidStateError') {
+              console.log('[StreamingPlayer] SourceBuffer removed, stopping download');
+              break;
+            }
+            throw appendErr;
+          }
           isAppendingRef.current = true;
           console.log('[StreamingPlayer] Appended chunk at offset:', offset, 'size:', chunk.length);
           

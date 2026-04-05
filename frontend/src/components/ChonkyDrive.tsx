@@ -1177,9 +1177,11 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
         
         if (codec) {
           console.log('[StreamingPlayer] Using MSE method (MediaSource API)');
+          isDownloadingRef.current = true;
           startMediaSource(video, codec);
         } else {
           console.log('[StreamingPlayer] Codec not supported, using fallback method');
+          isDownloadingRef.current = true;
           startFallback(video, metadata.size);
         }
       } catch (err: any) {

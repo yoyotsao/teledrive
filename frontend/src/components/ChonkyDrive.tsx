@@ -1175,10 +1175,10 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
         const codec = findSupportedCodec(metadata.mimeType);
         console.log('[StreamingPlayer] findSupportedCodec result:', codec);
         
-        // MSE doesn't work with MP4 from Telegram (moov at end), always use fallback
-        console.log('[StreamingPlayer] Using fallback method (Blob URL) for reliable playback');
+        // Strategy: Download head + tail to get moov, then use MSE
+        console.log('[StreamingPlayer] Trying MSE with head+tail chunk strategy...');
         isDownloadingRef.current = true;
-        startFallback(video, metadata.size);
+        startMSEWithMoov(video, metadata.size, codec);
       } catch (err: any) {
         console.error('[StreamingPlayer] Init error:', err);
         setError(err.message || 'Failed to initialize player');
@@ -1402,7 +1402,71 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
     }
   };
 
-  // F. IMPLEMENT startFallback (improved)
+  // F. IMPLEMENT startMSEWithMoov - download head+tail to get moov atom
+  const startMSEWithMoov = async (video: HTMLVideoElement, fileSize: number, codec: string) => {
+    console.log('[StreamingPlayer] startMSEWithMoov - downloading head+tail chunks');
+    const telegramClient = getTelegramClient();
+    const CHUNK_SIZE = 512 * 1024; // 512KB
+    
+    try {
+      // Step 1: Download first chunk (head)
+      console.log('[StreamingPlayer] Downloading head chunk (0-512KB)...');
+      const headChunk = await telegramClient.downloadFileChunkedByOffset(messageId, 0, CHUNK_SIZE);
+      const headBuffer = await headChunk.arrayBuffer();
+      console.log('[StreamingPlayer] Head chunk downloaded:', headBuffer.byteLength);
+      
+      // Step 2: Download last chunk (tail) to get moov atom
+      const tailStart = Math.max(0, fileSize - CHUNK_SIZE);
+      console.log('[StreamingPlayer] Downloading tail chunk (offset:', tailStart, ')...');
+      const tailChunk = await telegramClient.downloadFileChunkedByOffset(messageId, tailStart, CHUNK_SIZE);
+      const tailBuffer = await tailChunk.arrayBuffer();
+      console.log('[StreamingPlayer] Tail chunk downloaded:', tailBuffer.byteLength);
+      
+      // Step 3: Combine head + tail into a single buffer
+      console.log('[StreamingPlayer] Combining head + tail chunks...');
+      const combinedBuffer = new Uint8Array(headBuffer.byteLength + tailBuffer.byteLength);
+      combinedBuffer.set(new Uint8Array(headBuffer), 0);
+      combinedBuffer.set(new Uint8Array(tailBuffer), headBuffer.byteLength);
+      
+      // Step 4: Try to play with combined buffer
+      const combinedBlob = new Blob([combinedBuffer], { type: mimeType });
+      const combinedUrl = URL.createObjectURL(combinedBlob);
+      
+      // Set video src to test if it works
+      video.src = combinedUrl;
+      setIsStreaming(true);
+      
+      // Wait for metadata to load
+      await new Promise<void>((resolve) => {
+        video.addEventListener('loadedmetadata', () => {
+          console.log('[StreamingPlayer] Combined blob loaded - duration:', video.duration);
+          if (isNaN(video.duration) || video.duration === 0) {
+            console.log('[StreamingPlayer] FAILED: moov not found in tail chunk');
+            // Don't fall back - report failure to user
+            setError('MSE failed: moov atom not found. Video format may not be supported.');
+          } else {
+            console.log('[StreamingPlayer] SUCCESS: Video duration detected:', video.duration);
+            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
+          }
+          resolve();
+        }, { once: true });
+        
+        // Timeout after 5 seconds
+        setTimeout(() => {
+          console.log('[StreamingPlayer] FAILED: Timeout waiting for metadata');
+          setError('MSE failed: Timeout waiting for video metadata. Video format may not be supported.');
+          resolve();
+        }, 5000);
+      });
+      
+    } catch (err: any) {
+      console.error('[StreamingPlayer] MSEWithMoov error:', err);
+      // Don't fall back - report failure to user
+      setError('MSE failed: ' + err.message);
+    }
+  };
+
+  // G. IMPLEMENT startFallback (improved)
   const startFallback = async (video: HTMLVideoElement, fileSize: number) => {
     console.log('[StreamingPlayer] Using fallback blob URL method...');
     isDownloadingRef.current = true;

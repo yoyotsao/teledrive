@@ -1175,15 +1175,10 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
         const codec = findSupportedCodec(metadata.mimeType);
         console.log('[StreamingPlayer] findSupportedCodec result:', codec);
         
-        if (codec) {
-          console.log('[StreamingPlayer] Using MSE method (MediaSource API)');
-          isDownloadingRef.current = true;
-          startMediaSource(video, codec);
-        } else {
-          console.log('[StreamingPlayer] Codec not supported, using fallback method');
-          isDownloadingRef.current = true;
-          startFallback(video, metadata.size);
-        }
+        // MSE doesn't work with MP4 from Telegram (moov at end), always use fallback
+        console.log('[StreamingPlayer] Using fallback method (Blob URL) for reliable playback');
+        isDownloadingRef.current = true;
+        startFallback(video, metadata.size);
       } catch (err: any) {
         console.error('[StreamingPlayer] Init error:', err);
         setError(err.message || 'Failed to initialize player');

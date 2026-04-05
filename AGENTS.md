@@ -325,3 +325,19 @@ server {
 - Minimal testing infrastructure - only unittest in backend
 - **Important**: Session string stored in `frontend/.env` with `VITE_` prefix
 - **Always use `npm run dev` for testing** - preview mode has no proxy
+
+---
+
+## LIMITATIONS
+
+### Service Worker Video Streaming
+
+| Limitation | Description |
+|------------|-------------|
+| **Telegram client required** | Video streaming requires the main app to be running with an active Telegram connection. If the Telegram client disconnects, streaming returns 503. |
+| **Single client connection** | The Service Worker communicates with the main app via postMessage. Only one browser tab with the app can be active at a time for streaming. |
+| **No offline playback** | Videos cannot be played offline - they are streamed directly from Telegram CDN via the browser. |
+| **Memory usage** | Large video files stream in chunks, but the preload buffer holds only one chunk ahead. Very large files may cause rebuffering on slower connections. |
+| **Browser compatibility** | Service Workers and Media Source Extensions are required. Some older browsers or incognito modes may not support full functionality. |
+| **Mime type detection** | Relies on Telegram's file metadata for mime type. Some uncommon video formats may fallback to `video/mp4`. |
+| **Chunk retry logic** | Failed chunk downloads retry up to 3 times with exponential backoff (1s, 2s, 4s). After max retries, the stream returns 503. |

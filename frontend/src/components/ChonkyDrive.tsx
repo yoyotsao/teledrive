@@ -1055,7 +1055,7 @@ export function ChonkyDrive() {
             <div style={{ padding: '8px' }}>
               {previewFile.mime_type?.startsWith('image/') ? (
                 <img
-                  src={previewUrl}
+                  src={previewUrl ?? undefined}
                   alt={previewFile.filename}
                   loading="lazy"
                   decoding="async"
@@ -1068,19 +1068,12 @@ export function ChonkyDrive() {
                   }}
                 />
               ) : previewFile.mime_type?.startsWith('video/') ? (
-                previewUrl ? (
-                  <video
-                    src={previewUrl}
-                    controls
-                    autoPlay
-                    style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
-                  />
-                ) : (
-                  <StreamingVideoPlayer
-                    messageId={previewFile.telegram_message_id || 0}
-                    mimeType={previewFile.mime_type || 'video/mp4'}
-                  />
-                )
+                <video
+                  src={`/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}`}
+                  controls
+                  autoPlay
+                  style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
+                />
               ) : (
                 <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
                   Preview not available for this file type
@@ -1094,501 +1087,56 @@ export function ChonkyDrive() {
   );
 }
 
-// Helper function to find supported codec for MediaSource
-function findSupportedCodec(mimeType: string): string | null {
-  const codecs = [
-    'video/webm; codecs="vp8, vorbis"',
-    'video/webm; codecs="vp9, opus"',
-    'video/webm; codecs="vp8"',
-    'video/webm; codecs="vp9"',
-    'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
-    'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
-    'video/mp4; codecs="avc1.42E01E"',
-    'video/mp4; codecs="avc1.42001E"',
-    'video/mp4',
-    'video/webm',
-  ];
-  
-  // Try to match based on mime type
-  if (mimeType.includes('webm')) {
-    for (const codec of ['video/webm; codecs="vp9, opus"', 'video/webm; codecs="vp8, vorbis"', 'video/webm']) {
-      if (MediaSource.isTypeSupported(codec)) return codec;
-    }
-  } else if (mimeType.includes('mp4') || mimeType.includes('video')) {
-    for (const codec of ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', 'video/mp4']) {
-      if (MediaSource.isTypeSupported(codec)) return codec;
-    }
-  }
-  
-  // Fallback: try all codecs
-  for (const codec of codecs) {
-    if (MediaSource.isTypeSupported(codec)) return codec;
-  }
-  
-  return null;
-}
-
-// Streaming video player using MediaSource API for large file playback
-function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mimeType: string }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  
-  // A. ADD REFS
-  const mediaSourceRef = useRef<MediaSource | null>(null);
-  const sourceBufferRef = useRef<SourceBuffer | null>(null);
-  const pendingChunksRef = useRef<Uint8Array[]>([]);
-  const isAppendingRef = useRef(false);
-  const isDownloadingRef = useRef(false);
-  const currentOffsetRef = useRef(0);
-  const downloadedChunksRef = useRef<Uint8Array[]>([]);
-  const totalSizeRef = useRef(0); // 用 ref 存儲，避免 state 異步問題
-  
-  // B. ADD STATE
-  const [totalSize, setTotalSize] = useState(0);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [downloadedSize, setDownloadedSize] = useState(0);
+// Simple loading indicator for video preview via Service Worker streaming
+function VideoPreviewLoader({ fileId, messageId }: { fileId: string; messageId: number; mimeType?: string }) {
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // C. IMPLEMENT useEffect
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) {
-      console.log('[StreamingPlayer] ERROR: videoRef.current is null!');
-      return;
-    }
-
-    console.log('[StreamingPlayer] ===== COMPONENT MOUNTED =====');
-    console.log('[StreamingPlayer] messageId:', messageId, 'mimeType:', mimeType);
-
-    const initPlayer = async () => {
-      try {
-        // Get file metadata using downloadFileMetadata
-        const telegramClient = getTelegramClient();
-        console.log('[StreamingPlayer] Got Telegram client, calling downloadFileMetadata...');
-        
-        const metadata = await telegramClient.downloadFileMetadata(messageId);
-        console.log('[StreamingPlayer] File metadata - size:', metadata.size, 'mime:', metadata.mimeType);
-        setTotalSize(metadata.size);
-        totalSizeRef.current = metadata.size; // 同時更新 ref
-
-        // Try MediaSource API using findSupportedCodec
-        const codec = findSupportedCodec(metadata.mimeType);
-        console.log('[StreamingPlayer] findSupportedCodec result:', codec);
-        
-        // Strategy: Download head + tail to get moov, then use MSE
-        console.log('[StreamingPlayer] Trying MSE with head+tail chunk strategy...');
-        isDownloadingRef.current = true;
-        startMSEWithMoov(video, metadata.size, codec);
-      } catch (err: any) {
-        console.error('[StreamingPlayer] Init error:', err);
-        setError(err.message || 'Failed to initialize player');
-      }
+    const video = document.createElement('video');
+    video.src = `/preview-video/${fileId}/${messageId}`;
+    
+    const onCanPlay = () => {
+      setLoading(false);
     };
-
-    initPlayer();
-
+    
+    const onError = () => {
+      setLoading(false);
+      setError('Failed to load video');
+    };
+    
+    video.addEventListener('canplay', onCanPlay);
+    video.addEventListener('error', onError);
+    
+    // Timeout - assume it works if no error after 3s
+    const timeout = setTimeout(() => setLoading(false), 3000);
+    
     return () => {
-      console.log('[StreamingPlayer] Cleanup - stopping download');
-      isDownloadingRef.current = false;
-      
-      // Clean up SourceBuffer if exists
-      if (sourceBufferRef.current && mediaSourceRef.current) {
-        try {
-          mediaSourceRef.current.removeSourceBuffer(sourceBufferRef.current);
-        } catch (e) {
-          console.log('[StreamingPlayer] Error removing source buffer:', e);
-        }
-        sourceBufferRef.current = null;
-      }
-      
-      // Clean up MediaSource
-      if (mediaSourceRef.current) {
-        mediaSourceRef.current = null;
-      }
-      
-      // Clean up blob URL if exists
-      if (blobUrl) {
-        URL.revokeObjectURL(blobUrl);
-      }
+      video.removeEventListener('canplay', onCanPlay);
+      video.removeEventListener('error', onError);
+      clearTimeout(timeout);
     };
-  }, [messageId, mimeType]);
+  }, [fileId, messageId]);
 
-  // Restore playback position when blobUrl changes (e.g., after download completes)
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !blobUrl) return;
-    
-    // Restore currentTime after src changes
-    const currentTime = video.currentTime;
-    const restoreTime = () => {
-      if (video.currentTime !== currentTime) {
-        video.currentTime = currentTime;
-      }
-    };
-    video.addEventListener('loadedmetadata', restoreTime, { once: true });
-  }, [blobUrl]);
-
-  // D. IMPLEMENT startMediaSource
-  const startMediaSource = (video: HTMLVideoElement, codec: string) => {
-    const mediaSource = new MediaSource();
-    mediaSourceRef.current = mediaSource;
-    
-    // Add sourceopen event listener BEFORE setting video.src
-    mediaSource.addEventListener('sourceopen', () => {
-      console.log('[StreamingPlayer] MediaSource opened, readyState:', mediaSource.readyState);
-      
-      // Verify MediaSource is still open
-      if (mediaSource.readyState !== 'open') {
-        console.log('[StreamingPlayer] MediaSource not open, skipping SourceBuffer');
-        return;
-      }
-      
-      // Verify we still have valid refs (component might have unmounted)
-      if (!mediaSourceRef.current || !isDownloadingRef.current) {
-        console.log('[StreamingPlayer] Component unmounted, skipping SourceBuffer');
-        return;
-      }
-      
-      try {
-        const sourceBuffer = mediaSource.addSourceBuffer(codec);
-        sourceBufferRef.current = sourceBuffer;
-        
-        // Add updateend event for chunk queue processing
-        sourceBuffer.addEventListener('updateend', () => {
-          isAppendingRef.current = false;
-          processQueue();
-        });
-        
-        setIsStreaming(true);
-        startStreaming(video);
-      } catch (e: any) {
-        console.error('[StreamingPlayer] SourceBuffer error:', e);
-        setError('Failed to create source buffer: ' + e.message);
-      }
-    });
-    
-    // Set video src AFTER adding listener
-    video.src = URL.createObjectURL(mediaSource);
-  };
-
-  // E. IMPLEMENT startStreaming with queue mechanism
-  const startStreaming = async (video: HTMLVideoElement) => {
-    console.log('[StreamingPlayer] startStreaming called!');
-    console.log('[StreamingPlayer] totalSize:', totalSize, 'CHUNK_SIZE:', 512 * 1024);
-    
-    const CHUNK_SIZE = 512 * 1024; // 512KB
-    isDownloadingRef.current = true;
-    const telegramClient = getTelegramClient();
-    console.log('[StreamingPlayer] Telegram client obtained, starting download loop...');
-    
-    const downloadNextChunk = async () => {
-      console.log('[StreamingPlayer] downloadNextChunk loop, currentOffset:', currentOffsetRef.current, 'totalSize:', totalSizeRef.current);
-      while (isDownloadingRef.current && currentOffsetRef.current < totalSizeRef.current) {
-        const offset = currentOffsetRef.current;
-        console.log('[StreamingPlayer] Requesting chunk at offset:', offset, 'limit:', CHUNK_SIZE);
-        
-        try {
-          const chunkBlob = await telegramClient.downloadFileChunkedByOffset(
-            messageId, 
-            offset, 
-            CHUNK_SIZE
-          );
-          
-          if (chunkBlob.size === 0) {
-            console.log('[StreamingPlayer] No more data');
-            break;
-          }
-          
-          const buf = await chunkBlob.arrayBuffer();
-          const chunk = new Uint8Array(buf);
-          
-          // Wait for SourceBuffer to be ready
-          while (sourceBufferRef.current && sourceBufferRef.current.updating) {
-            await new Promise(r => setTimeout(r, 10));
-          }
-          
-          if (!sourceBufferRef.current || !mediaSourceRef.current) {
-            console.log('[StreamingPlayer] SourceBuffer or MediaSource no longer available');
-            break;
-          }
-          
-          // Check MediaSource is still open
-          if (mediaSourceRef.current.readyState !== 'open') {
-            console.log('[StreamingPlayer] MediaSource not open, state:', mediaSourceRef.current.readyState);
-            break;
-          }
-          
-          // Append to SourceBuffer using appendBuffer()
-          try {
-            sourceBufferRef.current.appendBuffer(chunk);
-          } catch (appendErr: any) {
-            if (appendErr.name === 'InvalidStateError') {
-              console.log('[StreamingPlayer] SourceBuffer removed, stopping download');
-              break;
-            }
-            throw appendErr;
-          }
-          isAppendingRef.current = true;
-          console.log('[StreamingPlayer] Appended chunk at offset:', offset, 'size:', chunk.length);
-          
-          currentOffsetRef.current += chunk.length;
-          
-          // Wait for append to complete before requesting next chunk
-          await new Promise<void>(resolve => {
-            if (sourceBufferRef.current) {
-              sourceBufferRef.current.onupdateend = () => resolve();
-            } else {
-              resolve();
-            }
-          });
-          
-          // Try to play when we have enough data
-          if (offset < 2 * 1024 * 1024 && video.paused) {
-            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
-          }
-          
-        } catch (err: any) {
-          console.error('[StreamingPlayer] Chunk download error:', err);
-          break;
-        }
-        
-        // Small delay between chunks
-        await new Promise(r => setTimeout(r, 100));
-      }
-
-      // ===== Task 2: Add proper stream closure =====
-      // After download loop completes, call endOfStream()
-      console.log('[StreamingPlayer] Download complete, closing stream...');
-      
-      // Wait for SourceBuffer to finish updating
-      const waitForBuffer = () => {
-        return new Promise<void>(resolve => {
-          const sb = sourceBufferRef.current;
-          if (!sb || !sb.updating) {
-            resolve();
-          } else {
-            sb.onupdateend = () => resolve();
-          }
-        });
-      };
-      
-      await waitForBuffer();
-      
-      // Call endOfStream if MediaSource is still open
-      const ms = mediaSourceRef.current;
-      if (ms && ms.readyState === 'open') {
-        console.log('[StreamingPlayer] Calling endOfStream()');
-        ms.endOfStream();
-      } else if (ms && ms.readyState === 'ended') {
-        console.log('[StreamingPlayer] Stream already ended');
-      }
-      // ===== End Task 2 =====
-    };
-    
-    downloadNextChunk().catch(err => console.error('[StreamingPlayer] Streaming error:', err));
-  };
-
-  // Process queued chunks
-  const processQueue = () => {
-    if (pendingChunksRef.current.length === 0) return;
-    
-    const sourceBuffer = sourceBufferRef.current;
-    if (!sourceBuffer || sourceBuffer.updating) return;
-    
-    const chunk = pendingChunksRef.current.shift();
-    if (chunk) {
-      sourceBuffer.appendBuffer(chunk.buffer as ArrayBuffer);
-      isAppendingRef.current = true;
-    }
-  };
-
-  // F. IMPLEMENT startMSEWithMoov - download head+tail to get moov atom
-  const startMSEWithMoov = async (video: HTMLVideoElement, fileSize: number, codec: string) => {
-    console.log('[StreamingPlayer] startMSEWithMoov - downloading head+tail chunks');
-    const telegramClient = getTelegramClient();
-    const CHUNK_SIZE = 512 * 1024; // 512KB
-    
-    try {
-      // Step 1: Download first chunk (head)
-      console.log('[StreamingPlayer] Downloading head chunk (0-512KB)...');
-      const headChunk = await telegramClient.downloadFileChunkedByOffset(messageId, 0, CHUNK_SIZE);
-      const headBuffer = await headChunk.arrayBuffer();
-      console.log('[StreamingPlayer] Head chunk downloaded:', headBuffer.byteLength);
-      
-      // Step 2: Download last chunk (tail) to get moov atom
-      const tailStart = Math.max(0, fileSize - CHUNK_SIZE);
-      console.log('[StreamingPlayer] Downloading tail chunk (offset:', tailStart, ')...');
-      const tailChunk = await telegramClient.downloadFileChunkedByOffset(messageId, tailStart, CHUNK_SIZE);
-      const tailBuffer = await tailChunk.arrayBuffer();
-      console.log('[StreamingPlayer] Tail chunk downloaded:', tailBuffer.byteLength);
-      
-      // Step 3: Combine head + tail into a single buffer
-      console.log('[StreamingPlayer] Combining head + tail chunks...');
-      const combinedBuffer = new Uint8Array(headBuffer.byteLength + tailBuffer.byteLength);
-      combinedBuffer.set(new Uint8Array(headBuffer), 0);
-      combinedBuffer.set(new Uint8Array(tailBuffer), headBuffer.byteLength);
-      
-      // Step 4: Try to play with combined buffer
-      const combinedBlob = new Blob([combinedBuffer], { type: mimeType });
-      const combinedUrl = URL.createObjectURL(combinedBlob);
-      
-      // Set video src to test if it works
-      video.src = combinedUrl;
-      setIsStreaming(true);
-      
-      // Wait for metadata to load
-      await new Promise<void>((resolve) => {
-        video.addEventListener('loadedmetadata', () => {
-          console.log('[StreamingPlayer] Combined blob loaded - duration:', video.duration);
-          if (isNaN(video.duration) || video.duration === 0) {
-            console.log('[StreamingPlayer] FAILED: moov not found in tail chunk');
-            // Don't fall back - report failure to user
-            setError('MSE failed: moov atom not found. Video format may not be supported.');
-          } else {
-            console.log('[StreamingPlayer] SUCCESS: Video duration detected:', video.duration);
-            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
-          }
-          resolve();
-        }, { once: true });
-        
-        // Timeout after 5 seconds
-        setTimeout(() => {
-          console.log('[StreamingPlayer] FAILED: Timeout waiting for metadata');
-          setError('MSE failed: Timeout waiting for video metadata. Video format may not be supported.');
-          resolve();
-        }, 5000);
-      });
-      
-    } catch (err: any) {
-      console.error('[StreamingPlayer] MSEWithMoov error:', err);
-      // Don't fall back - report failure to user
-      setError('MSE failed: ' + err.message);
-    }
-  };
-
-  // G. IMPLEMENT startFallback (improved)
-  const startFallback = async (video: HTMLVideoElement, fileSize: number) => {
-    console.log('[StreamingPlayer] Using fallback blob URL method...');
-    isDownloadingRef.current = true;
-    
-    const telegramClient = getTelegramClient();
-    const chunks: Uint8Array[] = [];
-    downloadedChunksRef.current = chunks;
-    
-    let offset = 0;
-    const CHUNK_SIZE = 512 * 1024; // 512KB - 有效值 (1MB % 512KB = 0)
-    let currentBlobUrl: string | null = null;
-    let hasStartedPlaying = false;
-    
-    try {
-      while (isDownloadingRef.current && offset < fileSize) {
-        const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, CHUNK_SIZE);
-        
-        if (!blob || blob.size === 0) break;
-        
-        const buf = await blob.arrayBuffer();
-        const chunk = new Uint8Array(buf);
-        chunks.push(chunk);
-        offset += blob.size;
-        
-        console.log('[StreamingPlayer] Downloaded chunk, total:', offset, 'hasStartedPlaying:', hasStartedPlaying);
-        
-        // Create blob URL after first chunk
-        if (!hasStartedPlaying) {
-          const allChunksBlob = new Blob(chunks as BlobPart[], { type: mimeType });
-          currentBlobUrl = URL.createObjectURL(allChunksBlob);
-          
-          (window as any).__previewBlob = allChunksBlob;
-          
-          setBlobUrl(currentBlobUrl);
-          setIsStreaming(true);
-          setDownloadedSize(offset);
-          
-          // Wait for at least 2MB before trying to play (MP4 needs more data to parse)
-          if (offset >= 2 * 1024 * 1024 && video.paused) {
-            video.play().catch(e => console.log('[StreamingPlayer] Play error:', e));
-          }
-          hasStartedPlaying = true;
-        }
-        
-        // DON'T update blob URL during download - keep the same URL for continuous playback
-        // This prevents React re-renders that restart video playback
-        
-        await new Promise(r => setTimeout(r, 100));
-      }
-      
-      // Download complete - update to final full version
-      const currentTime = video.currentTime;
-      if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
-      const finalBlob = new Blob(chunks as BlobPart[], { type: mimeType });
-      currentBlobUrl = URL.createObjectURL(finalBlob);
-      (window as any).__previewBlob = finalBlob;
-      setBlobUrl(currentBlobUrl);
-      setDownloadedSize(offset);
-      
-    } catch (err: any) {
-      console.error('[StreamingPlayer] Fallback error:', err);
-      setError(err.message);
-    }
-  };
-
-  // G. ADD JSX RENDER
-  if (error) {
-    return (
-      <div style={{ padding: '20px', textAlign: 'center', color: '#dc2626' }}>
-        <div>Error: {error}</div>
-      </div>
-    );
-  }
-
-  // MSE case: isStreaming is true, video connected via MediaSource
-  if (isStreaming && !blobUrl) {
-    return (
-      <div style={{ padding: '8px' }}>
-        <video
-          ref={videoRef}
-          controls
-          autoPlay
-          style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
-        />
-        <div style={{ color: '#666', fontSize: '12px', padding: '4px' }}>
-          Streaming via MSE... {(currentOffsetRef.current / 1024 / 1024).toFixed(1)} MB / {(totalSize / 1024 / 1024).toFixed(1)} MB
-        </div>
-      </div>
-    );
-  }
-
-  // Fallback case: isStreaming && blobUrl
-  if (isStreaming && blobUrl) {
-    return (
-      <div style={{ padding: '8px' }}>
-        <video
-          ref={videoRef}
-          src={blobUrl}
-          controls
-          autoPlay
-          style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
-        />
-        <div style={{ color: '#666', fontSize: '12px', padding: '4px' }}>
-          Downloaded: {(downloadedSize / 1024 / 1024).toFixed(1)} MB / {(totalSize / 1024 / 1024).toFixed(1)} MB
-        </div>
-      </div>
-    );
-  }
-
-  // Loading state
   return (
-    <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
-      <div>Loading video...</div>
-      <video
-        ref={videoRef}
-        style={{ display: 'none' }}
-      />
-      {totalSize > 0 && (
-        <div style={{ marginTop: '8px' }}>
-          Downloaded: {(downloadedSize / 1024 / 1024).toFixed(1)} MB / {(totalSize / 1024 / 1024).toFixed(1)} MB
+    <div style={{ padding: '8px', minHeight: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      {loading && (
+        <div style={{ textAlign: 'center', color: '#6b7280' }}>
+          <div style={{ fontSize: '24px', marginBottom: '8px' }}>⏳</div>
+          <div>Loading video...</div>
         </div>
       )}
+      {error && (
+        <div style={{ color: '#dc2626', textAlign: 'center' }}>{error}</div>
+      )}
+      <video
+        src={`/preview-video/${fileId}/${messageId}`}
+        controls
+        autoPlay
+        style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', display: loading ? 'none' : 'block' }}
+      />
     </div>
   );
 }
+
+export { VideoPreviewLoader };

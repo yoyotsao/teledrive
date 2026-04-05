@@ -4,6 +4,30 @@
 **Commit:** f105e35
 **Branch:** master
 
+---
+
+## 🛑 核心架構紅線 (CRITICAL ARCHITECTURE CONSTRAINTS)
+
+**在提出任何技術方案前，必須嚴格遵守以下紅線。若方案違反任一條，該方案即為「非法」，禁止提出：**
+
+### 檔案流向絕對限制
+
+- 檔案的二進位數據 (Binary Data) **嚴禁經過或觸碰 Python 後端 (port 8000)**
+- 後端職責**僅限於**讀寫 SQLite、存取 message_id、access_hash 與 path 等 Metadata
+
+### 下載/串流路徑限制
+
+- **禁止**任何形式的「後端代理下載」或「後端轉發流」方案
+- 所有檔案傳輸**必須**是：`Telegram CDN <-> Browser (GramJS)`
+
+### 優化邏輯限制
+
+- 任何關於播放、上傳的優化，**僅限於**前端邏輯
+- 例如：調整 Buffer、Parallel chunks、WASM 處理
+- **嚴禁**為了「實現功能」或「播放穩定性」而要求後端處理檔案流
+
+---
+
 ## ⚠️ IMPORTANT: Service Restart After Code Changes
 
 **Both frontend and backend must be restarted after code changes.**
@@ -72,11 +96,11 @@ Telegram Cloud Storage - A personal cloud storage system using Telegram as the b
 
 ### Frontend (port 3000)
 
-**職責：所有運算邏輯都在前端**
-- **上傳**：使用 GramJS (瀏覽器 MTProto) 直接連接 Telegram CDN
-- **下載**：使用 GramJS 直接從 Telegram CDN 下載
+**職責：所有運算與檔案處理邏輯都在前端**
+- **上傳**：使用 GramJS (瀏覽器 MTProto) 直接連接 Telegram CDN，完全繞過後端
+- **下載**：使用 GramJS 直接從 Telegram CDN 下載，完全繞過後端
 - **縮圖產生**：在前端使用 FFmpeg WASM 或 Canvas 產生影片/圖片縮圖
-- **所有資料運算** - 檔案處理、壓縮、格式轉換等
+- **所有資料運算** - 檔案處理、壓縮、格式轉換、串流緩衝控制（Chunked streaming）
 - 僅將最終的 `message_id` 和 `access_hash` 傳給後端儲存
 
 ### Telegram
@@ -106,14 +130,16 @@ Telegram Cloud Storage - A personal cloud storage system using Telegram as the b
 
 ---
 
-### 開發守則
+## 開發守則 (SUMMARY)
 
 | 行為 | 允許 | 禁止 |
 |------|------|------|
-| 檔案經過後端 | ❌ | 後端只存取 metadata |
-| 後端處理上傳邏輯 | ❌ | 前端負責 |
-| 前端直接連接 Telegram | ✅ | 這是設計目標 |
-| 後端儲存 message_id + path | ✅ | 這是後端職責 |
+| 檔案經過後端 | ❌ | 檔案絕對不經過後端 |
+| 後端只存取 metadata | ✅ | 這是後端職責 |
+| 後端處理下載流 | ❌ | 禁止 |
+| 前端透過 GramJS 直接對 Telegram | ✅ | 這是設計目標 |
+| 前端調整 Chunk 閾值 | ✅ | 這是前端優化的正確方向 |
+| 後端代理 HTTP Stream | ❌ | 違反架構核心原則 |
 
 ---
 
@@ -170,13 +196,17 @@ teledrive/
 
 ---
 
-## ANTI-PATTERNS (THIS PROJECT)
+## ANTI-PATTERNS (本專案絕對禁止模式)
 
-- **Files through backend**: NEVER - all file transfer bypasses server (direct MTProto)
-- **Traditional upload**: No REST file upload - uses GramJS in browser → Telegram CDN
-- **Forget to restart**: Backend state is in-memory + SQLite, changes require restart
-- **Wrong env prefix**: Frontend env vars MUST use `VITE_` prefix (e.g., `VITE_API_ID`)
-- **Preview for testing**: `npm run preview` has NO API proxy - use `npm run dev` instead
+| 模式 | 狀態 | 說明 |
+|------|------|------|
+| Files through backend | ❌ NEVER | 檔案絕對不經過後端 |
+| Traditional Streaming | ❌ 禁止 | 禁止在後端建立 Stream Pipe 或使用後端進行轉碼播放 |
+| Backend Upload/Download | ❌ 禁止 | 禁止使用 REST API 進行檔案傳輸 - 必須使用 GramJS 在瀏覽器端處理 |
+| Backend Proxy HTTP | ❌ 禁止 | 禁止後端代理 HTTP 請求進行檔案傳輸 |
+| Wrong env prefix | ❌ | Frontend env vars MUST use `VITE_` prefix (e.g., `VITE_API_ID`) |
+| Preview for testing | ❌ | `npm run preview` has NO API proxy - use `npm run dev` instead |
+| Forget to restart | ❌ | Backend state is in-memory + SQLite, changes require restart |
 
 ---
 
@@ -294,4 +324,4 @@ server {
 - No formal CI/CD - manual deployment via shell scripts
 - Minimal testing infrastructure - only unittest in backend
 - **Important**: Session string stored in `frontend/.env` with `VITE_` prefix
-- **Always use `npm run dev` for testing** - preview mode has no API proxy
+- **Always use `npm run dev` for testing** - preview mode has no proxy

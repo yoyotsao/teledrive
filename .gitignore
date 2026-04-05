@@ -43,6 +43,7 @@ yarn-error.log*
 
 # Sisyphus (AI session notes)
 .sisyphus/
+.playwright-mcp/
 
 # IDE
 .idea/

@@ -358,6 +358,53 @@ export class TelegramClientManager {
   }
 
   /**
+   * Download file metadata (size and mime type) from Telegram by message_id.
+   * @param messageId - The Telegram message ID of the file
+   * @returns Promise with { size: number; mimeType: string }
+   */
+  async downloadFileMetadata(messageId: number): Promise<{ size: number; mimeType: string }> {
+    console.log('[FileMetadata] Getting metadata for message:', messageId);
+    
+    if (!this.client) {
+      throw new Error("Client not initialized. Call initialize() first.");
+    }
+
+    // Get the message from Saved Messages
+    const messages = await this.client.getMessages("me", { ids: [messageId] });
+    const message = messages[0] as Api.Message;
+    
+    if (!message || !message.media) {
+      throw new Error("No media found for message: " + messageId);
+    }
+
+    const media = message.media as any;
+    let size = 0;
+    let mimeType = 'application/octet-stream';
+
+    if (media?.className === 'MessageMediaDocument') {
+      const doc = media.document;
+      if (!doc) {
+        throw new Error("No document in media");
+      }
+      size = Number(doc.size || 0);
+      mimeType = doc.mimeType || 'application/octet-stream';
+    } else if (media?.className === 'MessageMediaPhoto') {
+      const photo = media.photo;
+      if (!photo) {
+        throw new Error("No photo in media");
+      }
+      size = Number(photo.size || 0);
+      mimeType = 'image/jpeg';
+    } else {
+      throw new Error("Unsupported media type: " + media?.className);
+    }
+
+    console.log('[FileMetadata] Got metadata - size:', size, 'mimeType:', mimeType);
+    
+    return { size, mimeType };
+  }
+
+  /**
    * Download a file from Telegram by message_id using chunked GetFile API.
    * @param messageId - The Telegram message ID of the file
    * @param mimeType - The MIME type of the file (for Blob type)
@@ -388,6 +435,21 @@ export class TelegramClientManager {
     if (!message.media) {
       console.error('[Download] Message has no media');
       throw new Error("Message has no media for id: " + messageId);
+    }
+
+    let fileSize = 0;
+    const media = message.media as any;
+    if (media?.className === 'MessageMediaDocument' && media.document) {
+      fileSize = Number(media.document.size || 0);
+    }
+
+    if (mimeType.startsWith('video/') && fileSize < 10 * 1024 * 1024) {
+      console.log('[Download] Video file under 10MB, using downloadMedia for reliable playback...');
+      const buffer = await this.client.downloadMedia(message.media);
+      if (!buffer || buffer.length === 0) {
+        throw new Error("Failed to download file - empty buffer");
+      }
+      return new Blob([buffer], { type: mimeType });
     }
 
     // Try chunked download first (better for large files)
@@ -441,7 +503,7 @@ export class TelegramClientManager {
       throw new Error('Unsupported media type: ' + media?.className);
     }
 
-    const CHUNK_SIZE = 512 * 1024; // 512KB - match upload chunk size
+    const CHUNK_SIZE = 32 * 1024;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
     console.log('[Streaming] Total size:', fileSize, 'chunks:', totalChunks);
 
@@ -531,14 +593,21 @@ export class TelegramClientManager {
    * Download a specific chunk of a file by offset - for streaming playback.
    */
   async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number): Promise<Blob> {
+    console.log('[ChunkByOffset] ===== START =====');
     console.log('[ChunkByOffset] Downloading chunk, messageId:', messageId, 'offset:', offset, 'limit:', limit);
+    console.log('[ChunkByOffset] limit in KB:', (limit / 1024).toFixed(1), 'KB');
+    console.log('[ChunkByOffset] limit is valid:', limit % 4096 === 0 ? 'YES (divisible by 4KB)' : 'NO!');
+    console.log('[ChunkByOffset] 1MB % limit:', 1048576 % limit, '(should be 0 for non-precise)');
     
     if (!this.client) {
       throw new Error("Client not initialized");
     }
 
     // Get message
+    console.log('[ChunkByOffset] Getting message from Telegram...');
     const messages = await this.client.getMessages("me", { ids: [messageId] });
+    console.log('[ChunkByOffset] Got messages, count:', messages.length);
+    
     const message = messages[0] as Api.Message;
     
     if (!message?.media) {
@@ -553,10 +622,12 @@ export class TelegramClientManager {
       docId = doc.id;
       accessHash = doc.accessHash;
       fileReference = doc.fileReference;
+      console.log('[ChunkByOffset] Document: id=', docId, 'size=', doc.size, 'mime=', doc.mimeType);
     } else {
-      throw new Error('Unsupported media type');
+      throw new Error('Unsupported media type: ' + media?.className);
     }
 
+    console.log('[ChunkByOffset] Creating InputDocumentFileLocation...');
     const chunkLocation = new Api.InputDocumentFileLocation({
       id: docId,
       accessHash: accessHash,
@@ -564,21 +635,35 @@ export class TelegramClientManager {
       thumbSize: "",
     });
 
-    const fileResult = await this.client.invoke(
-      new Api.upload.GetFile({
-        location: chunkLocation,
-        offset: BigInt(offset),
-        limit: limit,
-        precise: true,
-        cdnSupported: true,
-      })
-    );
+    console.log('[ChunkByOffset] Calling upload.getFile API...');
+    console.log('[ChunkByOffset] API params: offset=', offset, 'limit=', limit, 'precise=true');
+    
+    let fileResult: any;
+    try {
+      fileResult = await this.client.invoke(
+        new Api.upload.GetFile({
+          location: chunkLocation,
+          offset: BigInt(offset),
+          limit: limit,
+          precise: true,
+          cdnSupported: true,
+        })
+      );
+      console.log('[ChunkByOffset] API call SUCCESS, bytes length:', fileResult.bytes?.length);
+    } catch (err: any) {
+      console.error('[ChunkByOffset] API call FAILED!');
+      console.error('[ChunkByOffset] Error:', err);
+      console.error('[ChunkByOffset] Error code:', err.errorCode);
+      console.error('[ChunkByOffset] Error message:', err.message);
+      console.error('[ChunkByOffset] Error type:', err.type);
+      throw err;
+    }
 
     if (!fileResult.bytes) {
       throw new Error('No data returned');
     }
 
-    console.log('[ChunkByOffset] Got chunk, bytes:', fileResult.bytes.length);
+    console.log('[ChunkByOffset] ===== END =====');
     return new Blob([new Uint8Array(fileResult.bytes)], { type: 'video/mp4' });
   }
 

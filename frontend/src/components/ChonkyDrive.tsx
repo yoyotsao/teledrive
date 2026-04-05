@@ -1223,7 +1223,19 @@ function StreamingVideoPlayer({ messageId, mimeType }: { messageId: number; mime
     
     // Add sourceopen event listener BEFORE setting video.src
     mediaSource.addEventListener('sourceopen', () => {
-      console.log('[StreamingPlayer] MediaSource opened');
+      console.log('[StreamingPlayer] MediaSource opened, readyState:', mediaSource.readyState);
+      
+      // Verify MediaSource is still open
+      if (mediaSource.readyState !== 'open') {
+        console.log('[StreamingPlayer] MediaSource not open, skipping SourceBuffer');
+        return;
+      }
+      
+      // Verify we still have valid refs (component might have unmounted)
+      if (!mediaSourceRef.current || !isDownloadingRef.current) {
+        console.log('[StreamingPlayer] Component unmounted, skipping SourceBuffer');
+        return;
+      }
       
       try {
         const sourceBuffer = mediaSource.addSourceBuffer(codec);

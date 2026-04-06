@@ -92,17 +92,10 @@ self.addEventListener('fetch', (event: FetchEvent) => {
 
   console.log('[ServiceWorker] Fetch intercepted:', url.pathname);
 
-  // For now, only handle /preview-video/* routes
-  // Return 404 for non-video routes (Phase 1 requirement)
+  // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - returning 404:', url.pathname);
-    event.respondWith(
-      new Response(null, {
-        status: 404,
-        statusText: 'Not Found',
-      })
-    );
-    return;
+    console.log('[ServiceWorker] Non-video route - letting through:', url.pathname);
+    return; // Don't call respondWith - let browser handle normally
   }
 
   // Phase 2: Handle Range header for video requests

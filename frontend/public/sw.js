@@ -37,28 +37,33 @@ function parseRangeHeader(rangeHeader, totalSize) {
   if (!rangeHeader) {
     return { offset: 0, limit: 0, valid: false, error: 416 };
   }
+  // Handle formats: "bytes=0-1023" (specific end) and "bytes=0-" (no end specified)
   const rangeRegex = /^bytes=(\d+)-(\d*)$/;
   const match = rangeHeader.match(rangeRegex);
   if (!match) {
     return { offset: 0, limit: 0, valid: false, error: 416 };
   }
   const start = parseInt(match[1], 10);
-  const end = match[2] ? parseInt(match[2], 10) : null;
+  const endStr = match[2];
+  
   if (start >= totalSize) {
     return { offset: 0, limit: 0, valid: false, error: 416 };
   }
+  
   let offset;
   let limit;
-  if (end !== null) {
+  
+  if (endStr && endStr.length > 0) {
+    // Specific end specified: "bytes=0-1023"
+    const end = parseInt(endStr, 10);
     offset = start;
     limit = end - start + 1;
-  } else if (match[2] === '') {
+  } else {
+    // No end specified: "bytes=0-" - get everything from start to end of file
     offset = start;
     limit = totalSize - start;
-  } else {
-    offset = totalSize - start;
-    limit = start;
   }
+  
   return { offset, limit, valid: true };
 }
 
@@ -224,12 +229,10 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   console.log('[ServiceWorker] Fetch intercepted:', url.pathname);
 
+  // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - returning 404:', url.pathname);
-    event.respondWith(
-      new Response(null, { status: 404, statusText: 'Not Found' })
-    );
-    return;
+    console.log('[ServiceWorker] Non-video route - letting through:', url.pathname);
+    return; // Don't call respondWith - let browser handle normally
   }
 
   // Phase 3: Parse fileId and messageId from URL
@@ -282,15 +285,28 @@ self.addEventListener('fetch', (event) => {
         }
 
         // Telegram API requires limit to be divisible by 4096 for precise downloads
+        // Round up to nearest 4096 multiple
+        // NOTE: Telegram API has a maximum limit per request - use smaller chunks
         const CHUNK_ALIGNMENT = 4096;
-        const alignedLimit = Math.ceil(rawRange.limit / CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT;
-        const limit = Math.min(alignedLimit, metadata.size - rawRange.offset);
+        const MAX_CHUNK_SIZE = 512 * 1024; // 512KB max per request
+        
+        // Calculate the chunk size - use smaller chunks for large files
+        const requestedBytes = rawRange.limit;
+        const chunkSize = Math.min(
+          Math.ceil(requestedBytes / CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT,
+          MAX_CHUNK_SIZE
+        );
+        
+        // For the API call, use the aligned limit (Telegram requires 4KB alignment)
+        // For the response, use the actual bytes needed (don't exceed file size)
+        const apiLimit = chunkSize;
+        const actualBytesNeeded = Math.min(rawRange.limit, metadata.size - rawRange.offset);
         
         console.log('[ServiceWorker] Raw Range - offset:', rawRange.offset, 'limit:', rawRange.limit);
-        console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB)');
+        console.log('[ServiceWorker] Using chunk size:', chunkSize, '(max 512KB, aligned to 4KB)');
 
         // Check preloaded chunk first (Phase 3.4 - buffer preload)
-        const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, limit);
+        const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, apiLimit);
         
         let chunkData;
         
@@ -303,7 +319,7 @@ self.addEventListener('fetch', (event) => {
             urlParams.fileId,
             urlParams.messageId,
             rawRange.offset,
-            limit
+            apiLimit
           );
           console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
         }
@@ -313,24 +329,34 @@ self.addEventListener('fetch', (event) => {
           urlParams.fileId,
           urlParams.messageId,
           rawRange.offset,
-          limit
+          apiLimit
         );
 
         // Return HTTP 206 Partial Content
         const responseEndByte = Math.min(rawRange.offset + rawRange.limit, metadata.size) - 1;
         
-        return new Response(chunkData, {
+        // Trim the chunk if it was larger due to 4KB alignment
+        // The API might return more bytes than needed (e.g., request 512KB but get 516KB aligned)
+        let responseData = chunkData;
+        let contentLength = chunkData.byteLength;
+        
+        if (chunkData.byteLength > actualBytesNeeded) {
+          console.log('[ServiceWorker] Trimming aligned chunk from', chunkData.byteLength, 'to', actualBytesNeeded);
+          responseData = chunkData.slice(0, actualBytesNeeded);
+          contentLength = actualBytesNeeded;
+        }
+        
+        return new Response(responseData, {
           status: 206,
           statusText: 'Partial Content',
           headers: {
             'Content-Type': metadata.mimeType || 'video/mp4',
             'Content-Range': `bytes ${rawRange.offset}-${responseEndByte}/${metadata.size}`,
             'Accept-Ranges': 'bytes',
-            'Content-Length': chunkData.byteLength,
+            'Content-Length': contentLength,
             'Cache-Control': 'no-cache',
           },
         });
-          range.limit
       } catch (err) {
         // Phase 3.3: Handle download errors gracefully
         console.error('[ServiceWorker] Error:', err?.message || err);

@@ -72,7 +72,7 @@ async function handleGetFileChunk(event: MessageEvent) {
     
     console.log('[App] Getting chunk - messageId:', messageId, 'offset:', offset, 'limit:', limit);
     
-    // Use GramJS to download chunk
+    // Use GramJS to download chunk - limit is already 4KB-aligned by Service Worker
     const blob = await telegramClient.downloadFileChunkedByOffset(
       messageId, 
       offset, 

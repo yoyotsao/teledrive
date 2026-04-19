@@ -11,7 +11,8 @@ FastAPI application for:
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
 import sys
 
@@ -25,7 +26,7 @@ logger.remove()
 logger.add(
     sys.stderr,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO"
+    level="INFO",
 )
 
 
@@ -34,20 +35,22 @@ async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown."""
     logger.info("Starting Telegram Cloud Storage API...")
     logger.info("Initializing services...")
-    
+
     # Initialize database
     logger.info("Initializing SQLite database...")
     db = await get_database()
     logger.info(f"Database initialized: {db.db_path}")
-    
+
     # Startup
     settings = get_settings()
-    logger.info(f"Server configuration: {settings.backend_host}:{settings.backend_port}")
+    logger.info(
+        f"Server configuration: {settings.backend_host}:{settings.backend_port}"
+    )
     logger.info(f"Max file size: {settings.max_file_size / (1024**3):.2f} GB")
     logger.info(f"Chunk size: {settings.chunk_size / (1024**2):.2f} MB")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down Telegram Cloud Storage API...")
     await close_database()
@@ -74,7 +77,7 @@ app = FastAPI(
     the browser download directly from Telegram's CDN.
     """,
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
@@ -89,6 +92,19 @@ app.add_middleware(
 )
 
 
+# No-cache middleware to prevent browser caching
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+
+app.add_middleware(NoCacheMiddleware)
+
+
 # Include routers
 app.include_router(router)
 
@@ -100,7 +116,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Telegram Cloud Storage API",
-        "version": "1.0.0"
+        "version": "1.0.0",
     }
 
 
@@ -121,8 +137,8 @@ async def root():
             "delete_file": "DELETE /api/v1/files/{file_id}",
             "download": "GET /api/v1/download/{file_id}",
             "gatekeeper": "GET /api/v1/download/gatekeeper/{file_id}",
-            "create_link": "POST /api/v1/download/gatekeeper"
-        }
+            "create_link": "POST /api/v1/download/gatekeeper",
+        },
     }
 
 
@@ -132,23 +148,19 @@ async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler."""
     logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "detail": str(exc)
-        }
+        status_code=500, content={"error": "Internal server error", "detail": str(exc)}
     )
 
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     settings = get_settings()
-    
+
     uvicorn.run(
         "main:app",
         host=settings.backend_host,
         port=settings.backend_port,
         reload=False,
-        log_level="info"
+        log_level="info",
     )

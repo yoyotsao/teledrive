@@ -213,6 +213,10 @@ test.describe('teleDrive E2E Tests', () => {
     const testFilesDir = path.join(__dirname, '..', '..', 'test-files');
     const videoPath = path.join(testFilesDir, 'test_small.mp4');
     
+    // DEBUG: Log the path and existence check
+    console.log(`[DEBUG] Checking path: ${videoPath}`);
+    console.log(`[DEBUG] File exists: ${fs.existsSync(videoPath)}`);
+    
     if (!fs.existsSync(videoPath)) {
       throw new Error(`Test video not found at: ${videoPath}`);
     }
@@ -326,9 +330,30 @@ test.describe('teleDrive E2E Tests', () => {
         throw new Error('Video not playing after play() called');
       }
       
+      // ===== Step 4: Seek to middle =====
+      console.log('\n[Step 4] Seek to middle...');
+      const duration = await videoElement.evaluate((el: HTMLVideoElement) => el.duration);
+      const seekTime = duration * 0.5;
+      
+      await videoElement.evaluate((el: HTMLVideoElement) => {
+        el.currentTime = seekTime;
+      });
+      
+      // Wait for seek to complete
+      await page.waitForTimeout(500);
+      
+      // Verify currentTime is approximately at seek position (allow 1 second tolerance)
+      const currentTime = await videoElement.evaluate((el: HTMLVideoElement) => el.currentTime);
+      const timeDiff = Math.abs(currentTime - seekTime);
+      
+      if (timeDiff > 1.0) {
+        throw new Error(`Seek failed - expected ~${seekTime}s, got ${currentTime}s (diff: ${timeDiff}s)`);
+      }
+      console.log(`✅ Seek working - jumped to ${currentTime.toFixed(1)}s of ${duration.toFixed(1)}s`);
+      
       // Pause it
       await videoElement.evaluate((el: HTMLVideoElement) => el.pause());
-      console.log(`✅ Short video plays successfully, src: ${videoSrc.substring(0, 50)}...`);
+      console.log(`✅ Short video plays and seeks successfully, src: ${videoSrc.substring(0, 50)}...`);
     } else {
       // Check streaming player
       const previewOverlay = page.locator('div').filter({ hasStyle: 'background: rgba(0, 0, 0, 0.8)' });
@@ -353,6 +378,10 @@ test.describe('teleDrive E2E Tests', () => {
   test('should upload and verify long video streaming', async ({ page }) => {
     const testFilesDir = path.join(__dirname, '..', '..', 'test-files');
     const videoPath = path.join(testFilesDir, 'test_large.mp4');
+    
+    // DEBUG: Log the path and existence check
+    console.log(`[DEBUG] Checking path: ${videoPath}`);
+    console.log(`[DEBUG] File exists: ${fs.existsSync(videoPath)}`);
     
     if (!fs.existsSync(videoPath)) {
       throw new Error(`Test video not found at: ${videoPath}`);

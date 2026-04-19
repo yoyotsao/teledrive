@@ -384,14 +384,14 @@ self.addEventListener('fetch', (event) => {
         // NOTE: Telegram API has a maximum limit per request - use smaller chunks
         const CHUNK_ALIGNMENT = 4096;
         const MAX_CHUNK_SIZE = 512 * 1024; // 512KB max per request
-        
+
         // Calculate the chunk size - use smaller chunks for large files
         const requestedBytes = rawRange.limit;
         const chunkSize = Math.min(
           Math.ceil(requestedBytes / CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT,
           MAX_CHUNK_SIZE
         );
-        
+
         // For the API call, use the aligned limit (Telegram requires 4KB alignment)
         // For the response, use the actual bytes needed (don't exceed file size)
         const apiLimit = chunkSize;

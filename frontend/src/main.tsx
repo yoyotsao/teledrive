@@ -242,29 +242,19 @@ async function handleGetFileChunk(event: MessageEvent) {
     
     const telegramClient = getTelegramClient();
     
-    console.log('[App] About to download chunk - messageId:', messageId, 'offset:', offset, 'limit:', limit);
+    let arrayBuffer: ArrayBuffer;
     
-    // Use GramJS to download chunk - limit is already 4KB-aligned by Service Worker
-    const blob = await telegramClient.downloadFileChunkedByOffset(
-      messageId, 
-      offset, 
-      limit
-    );
-    console.log('[App] downloadFileChunkedByOffset completed, blob size:', blob.size);
+    try {
+      const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, limit);
+      arrayBuffer = await blob.arrayBuffer();
+      console.log('[App] Got chunk, size:', arrayBuffer.byteLength);
+    } catch (chunkErr: any) {
+      console.error('[App] Chunked download failed, falling back to full download:', chunkErr?.message);
+      const fullBlob = await telegramClient.downloadFile(messageId, 'video/mp4');
+      arrayBuffer = await fullBlob.arrayBuffer();
+      console.log('[App] Full file downloaded, size:', arrayBuffer.byteLength);
+    }
     
-    // Convert Blob to ArrayBuffer for transfer
-    const arrayBuffer = await blob.arrayBuffer();
-    
-    console.log('[App] Got chunk, size:', arrayBuffer.byteLength);
-    
-    // Update last chunk time
-    lastChunkTime = Date.now();
-    
-    // Check for idle timeout
-    checkIdleTimeout();
-    
-    // Send chunk back to Service Worker
-    console.log('[App] Sending chunk to Service Worker...');
     port?.postMessage({ requestId, chunk: arrayBuffer }, [arrayBuffer]);
     console.log('[App] ========== handleGetFileChunk END ==========');
     

@@ -34,6 +34,7 @@ backend/teledrive.db
 # Frontend
 node_modules/
 frontend/tests/screenshots
+frontend/.vite/
 dist/
 .DS_Store
 *.log

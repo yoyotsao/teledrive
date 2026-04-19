@@ -523,66 +523,29 @@ export function ChonkyDrive() {
     }
   }, [selectedFiles, loadContents]);
 
-  // Double-click handler for folder navigation and file preview
-  const handleFileDoubleClick = useCallback(async (file: FileData) => {
-    if (file.isDir) {
-      // Double-click folder to navigate into it
-      setCurrentFolderId(file.id);
-      setBreadcrumb((prev) => [...prev, file]);
-    } else {
-      // Double-click file to preview
-      const original = originalFiles.find((f) => f.file_id === file.id);
-      if (original) {
-        // Show preview modal immediately without waiting for download
-        setPreviewFile(original);
-        
-        const mimeType = original.mime_type || 'application/octet-stream';
-        
-        // For videos: use streaming player, don't wait for full download
-        if (mimeType.startsWith('video/')) {
-          console.log('[Preview] Video file - using streaming player');
-          // StreamingVideoPlayer will handle the download
-          // We set previewUrl to null so the StreamingVideoPlayer component renders
-          setPreviewUrl(null);
-        } else {
-          // For non-videos: download completely first
-          try {
-            const telegramClient = getTelegramClient();
-            if (!telegramClient.isConnected()) {
-              console.error('[Preview] Telegram client not connected');
-              return;
-            }
-            
-            let blob: Blob;
-            
-            // Check if this is a split file
-            if ((original as any).is_split_file && (original as any).split_group_id) {
-              console.log('[Preview] Downloading split file, group:', (original as any).split_group_id);
-              blob = await telegramClient.downloadFileMerge((original as any).split_group_id, mimeType);
-              console.log('[Preview] Merged split file, size:', blob.size);
-            } else {
-              // Download single file
-              const msgId = original.telegram_message_id;
-              if (!msgId) {
-                console.error('[Preview] No telegram_message_id for file');
-                return;
-              }
-              blob = await telegramClient.downloadFile(msgId, mimeType);
-            }
-            
-            // Store blob reference globally to prevent GC
-            (window as any).__previewBlob = blob;
-            const url = URL.createObjectURL(blob);
-            console.log('[Preview] Created blob URL:', url, 'blob size:', blob.size, 'blob type:', blob.type);
-            setPreviewUrl(url);
-            console.log('[Preview] Set previewUrl for:', original.filename);
-          } catch (err) {
-            console.error('[Preview] Error downloading file:', err);
-          }
-        }
-      }
-    }
-  }, [originalFiles]);
+   // Double-click handler for folder navigation and file preview
+   const handleFileDoubleClick = useCallback(async (file: FileData) => {
+     if (file.isDir) {
+       // Double-click folder to navigate into it
+       setCurrentFolderId(file.id);
+       setBreadcrumb((prev) => [...prev, file]);
+     } else {
+       // Double-click file to preview
+       const original = originalFiles.find((f) => f.file_id === file.id);
+       if (original) {
+         setPreviewFile(original);
+         
+         const mimeType = original.mime_type || 'application/octet-stream';
+         
+         if (mimeType.startsWith('video/')) {
+           console.log('[Preview] Video file - using streaming player via Service Worker');
+           setPreviewUrl(null);
+         } else {
+           setPreviewUrl(null);
+         }
+       }
+     }
+   }, [originalFiles]);
 
   // Close preview modal
   const closePreview = useCallback(() => {

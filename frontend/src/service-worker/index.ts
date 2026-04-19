@@ -397,12 +397,11 @@ self.addEventListener('fetch', (event: FetchEvent) => {
           });
         }
 
-        // Telegram API requires limit to be divisible by 4096 for precise downloads
-        // Round up to nearest 4096 multiple
-        const CHUNK_ALIGNMENT = 4096;
-        const alignedLimit = Math.ceil(rawRange.limit / CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT;
-        // Don't exceed file size
-        const limit = Math.min(alignedLimit, metadata.size - rawRange.offset);
+        const ALIGN = 4096;
+        const MAX_CHUNK = 512 * 1024;
+        const available = metadata.size - rawRange.offset;
+        const maxBytes = Math.floor(Math.min(available, MAX_CHUNK) / ALIGN) * ALIGN;
+        const limit = Math.max(Math.min(rawRange.limit, maxBytes), ALIGN);
         
         console.log('[ServiceWorker] Raw Range - offset:', rawRange.offset, 'limit:', rawRange.limit);
         console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB)');
@@ -435,10 +434,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
           limit
         );
 
-        // Return HTTP 206 Partial Content
-        // Use the ACTUAL bytes returned (may be larger than requested due to alignment)
-        const actualEndByte = Math.min(rawRange.offset + limit, metadata.size);
-        const responseEndByte = Math.min(rawRange.offset + rawRange.limit, metadata.size) - 1;
+        const responseEndByte = Math.min(rawRange.offset + limit, metadata.size) - 1;
         
         return new Response(chunkData, {
           status: 206,
@@ -448,7 +444,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
             'Content-Range': `bytes ${rawRange.offset}-${responseEndByte}/${metadata.size}`,
             'Accept-Ranges': 'bytes',
             'Content-Length': String(chunkData.byteLength),
-            'Cache-Control': 'no-cache',
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
           },
         });
       } catch (err: any) {

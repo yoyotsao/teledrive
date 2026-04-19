@@ -520,24 +520,25 @@ export class TelegramClientManager {
         const limit = Math.min(CHUNK_SIZE, fileSize - offset);
         
         const chunkLocation = new Api.InputDocumentFileLocation({
-          id: docId,
-          accessHash: accessHash,
+          id: docId as any,
+          accessHash: accessHash as any,
           fileReference: fileReference,
           thumbSize: "",
         });
         
+        const client = this.client;
         try {
-          const fileResult = await this.client.invoke(
+          const fileResult = await client!.invoke(
             new Api.upload.GetFile({
-              location: chunkLocation,
-              offset: BigInt(offset),
+              location: chunkLocation!,
+              offset: BigInt(offset) as any,
               limit: limit,
-              precise: true,
+              precise: false,
               cdnSupported: true,
             })
-          );
+          ) as any;
           
-          if (fileResult.bytes) {
+          if (fileResult?.bytes) {
             downloadedChunks.push(new Uint8Array(fileResult.bytes));
             console.log(`[Streaming] Chunk ${chunkIndex + 1}/${totalChunks} ready`);
           }
@@ -558,28 +559,28 @@ export class TelegramClientManager {
     downloadInBackground().catch(err => console.error('[Streaming] Background download failed:', err));
 
     // Wait for enough chunks (at least 10MB) for playback to start reliably - video needs keyframes
-    const waitForEnoughChunks = (minSize: number = 10 * 1024 * 1024): Promise<Blob> => new Promise((resolve, reject) => {
+    const waitForEnoughChunks = (minSize: number = 10 * 1024 * 1024): Promise<Blob> => new Promise((resolve) => {
       const startTime = Date.now();
       const checkInterval = setInterval(() => {
         const currentSize = downloadedChunks.reduce((sum, c) => sum + c.length, 0);
         if (currentSize >= minSize) {
           clearInterval(checkInterval);
-          // Correct way to create blob from chunks
-          const blob = new Blob(downloadedChunks, { type: mimeType });
+          const blobs = downloadedChunks.map(c => new Uint8Array(c).buffer);
+          const blob = new Blob(blobs as ArrayBuffer[], { type: mimeType });
           console.log('[Streaming] Enough chunks ready, size:', blob.size);
           resolve(blob);
         }
         if (isDownloadComplete && downloadedChunks.length > 0) {
           clearInterval(checkInterval);
-          const blob = new Blob(downloadedChunks, { type: mimeType });
+          const blobs = downloadedChunks.map(c => new Uint8Array(c).buffer);
+          const blob = new Blob(blobs as ArrayBuffer[], { type: mimeType });
           console.log('[Streaming] Download complete, final size:', blob.size);
           resolve(blob);
         }
-        // Timeout after 60 seconds
         if (Date.now() - startTime > 60000) {
           clearInterval(checkInterval);
-          // Return whatever we have even if not enough
-          const blob = new Blob(downloadedChunks, { type: mimeType });
+          const blobs = downloadedChunks.map(c => new Uint8Array(c).buffer);
+          const blob = new Blob(blobs as ArrayBuffer[], { type: mimeType });
           console.log('[Streaming] Timeout, returning blob with size:', blob.size);
           resolve(blob);
         }
@@ -629,23 +630,23 @@ export class TelegramClientManager {
 
     console.log('[ChunkByOffset] Creating InputDocumentFileLocation...');
     const chunkLocation = new Api.InputDocumentFileLocation({
-      id: docId,
-      accessHash: accessHash,
+      id: docId as any,
+      accessHash: accessHash as any,
       fileReference: fileReference,
       thumbSize: "",
     });
 
     console.log('[ChunkByOffset] Calling upload.getFile API...');
-    console.log('[ChunkByOffset] API params: offset=', offset, 'limit=', limit, 'precise=true');
+    console.log('[ChunkByOffset] API params: offset=', offset, 'limit=', limit, 'precise=false, cdnSupported=true');
     
     let fileResult: any;
     try {
       fileResult = await this.client.invoke(
         new Api.upload.GetFile({
-          location: chunkLocation,
-          offset: BigInt(offset),
+          location: chunkLocation!,
+          offset: BigInt(offset) as any,
           limit: limit,
-          precise: true,
+          precise: false,
           cdnSupported: true,
         })
       );

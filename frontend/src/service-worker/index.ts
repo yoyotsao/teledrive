@@ -139,6 +139,7 @@ async function requestChunkFromApp(
   messageId: string,
   offset: number,
   limit: number,
+  fileSize?: number,
   retries = 3,
   baseDelay = 1000
 ): Promise<ArrayBuffer> {
@@ -146,7 +147,7 @@ async function requestChunkFromApp(
   
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      return await requestChunkOnce(fileId, messageId, offset, limit);
+      return await requestChunkOnce(fileId, messageId, offset, limit, fileSize);
     } catch (err: any) {
       lastError = err;
       
@@ -175,14 +176,14 @@ function requestChunkOnce(
   fileId: string,
   messageId: string,
   offset: number,
-  limit: number
+  limit: number,
+  fileSize?: number
 ): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
     const channel = new MessageChannel();
     
-    // Timeout after 30 seconds
     const timeout = setTimeout(() => {
       channel.port1.close();
       reject(new Error(`Chunk request timeout: offset=${offset}, limit=${limit}`));
@@ -201,7 +202,6 @@ function requestChunkOnce(
       }
     };
 
-    // Send request to all clients (main app)
     self.clients.matchAll().then((clients) => {
       for (const client of clients) {
         client.postMessage({
@@ -211,10 +211,10 @@ function requestChunkOnce(
           messageId: parseInt(messageId, 10),
           offset,
           limit,
+          fileSize,
         }, [channel.port2]);
       }
       
-      // If no clients available, reject
       if (clients.length === 0) {
         clearTimeout(timeout);
         channel.port1.close();
@@ -301,7 +301,7 @@ function preloadNextChunk(
     inProgress: true,
   };
   
-  requestChunkFromApp(fileId, messageId, nextOffset, limit)
+  requestChunkFromApp(fileId, messageId, nextOffset, limit, fileSize)
     .then((data) => {
       preloadState!.data = data;
       preloadState!.inProgress = false;
@@ -336,10 +336,9 @@ self.addEventListener('fetch', (event: FetchEvent) => {
 
   console.log('[ServiceWorker] Fetch intercepted:', url.pathname);
 
-  // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - letting through:', url.pathname);
-    return; // Don't call respondWith - let browser handle normally
+    console.log('[ServiceWorker] Non-video route - passing through:', url.pathname);
+    return;
   }
 
   // Phase 3: Parse fileId and messageId from URL
@@ -420,13 +419,13 @@ self.addEventListener('fetch', (event: FetchEvent) => {
           console.log('[ServiceWorker] Using preloaded chunk');
           chunkData = preloaded;
         } else {
-          // Request chunk from main app via postMessage
           console.log('[ServiceWorker] Requesting chunk from main app...');
           chunkData = await requestChunkFromApp(
             urlParams.fileId,
             urlParams.messageId,
             rawRange.offset,
-            limit
+            limit,
+            metadata.size
           );
           console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
         }

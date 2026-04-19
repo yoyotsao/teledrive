@@ -332,8 +332,8 @@ self.addEventListener('fetch', (event) => {
 
   // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - letting through:', url.pathname);
-    return; // Don't call respondWith - let browser handle normally
+    console.log('[ServiceWorker] Non-video route - passing through:', url.pathname);
+    return;
   }
 
   // Phase 3: Parse fileId and messageId from URL

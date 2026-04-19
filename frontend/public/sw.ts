@@ -92,10 +92,9 @@ self.addEventListener('fetch', (event: FetchEvent) => {
 
   console.log('[ServiceWorker] Fetch intercepted:', url.pathname);
 
-  // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - letting through:', url.pathname);
-    return; // Don't call respondWith - let browser handle normally
+    console.log('[ServiceWorker] Non-video route - passing through:', url.pathname);
+    return;
   }
 
   // Phase 2: Handle Range header for video requests

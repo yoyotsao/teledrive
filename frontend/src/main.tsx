@@ -219,7 +219,7 @@ async function handleReconnectTelegram(event: MessageEvent) {
 async function handleGetFileChunk(event: MessageEvent) {
   console.log('[App] ========== handleGetFileChunk START ==========');
   const msg = event.data;
-  const { requestId, messageId, offset, limit } = msg;
+  const { requestId, messageId, offset, limit, fileSize } = msg;
   const port = event.ports[0];
   
   try {
@@ -241,26 +241,26 @@ async function handleGetFileChunk(event: MessageEvent) {
     }
     
     const telegramClient = getTelegramClient();
+
+    console.log('[App] Getting chunk - messageId:', messageId, 'offset:', offset, 'limit:', limit, 'fileSize:', fileSize);
     
-    let arrayBuffer: ArrayBuffer;
-    
-    try {
-      const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, limit);
-      arrayBuffer = await blob.arrayBuffer();
-      console.log('[App] Got chunk, size:', arrayBuffer.byteLength);
-    } catch (chunkErr: any) {
-      console.error('[App] Chunked download failed, falling back to full download:', chunkErr?.message);
-      const fullBlob = await telegramClient.downloadFile(messageId, 'video/mp4');
-      arrayBuffer = await fullBlob.arrayBuffer();
-      console.log('[App] Full file downloaded, size:', arrayBuffer.byteLength);
+    let actualFileSize = fileSize;
+    if (actualFileSize === undefined) {
+      console.log('[App] fileSize not provided, fetching metadata...');
+      const metadata = await telegramClient.downloadFileMetadata(messageId);
+      actualFileSize = metadata.size;
+      console.log('[App] Retrieved fileSize from Telegram:', actualFileSize);
     }
+    
+    const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, limit, actualFileSize);
+    const arrayBuffer = await blob.arrayBuffer();
+    console.log('[App] Got chunk, size:', arrayBuffer.byteLength);
     
     port?.postMessage({ requestId, chunk: arrayBuffer }, [arrayBuffer]);
     console.log('[App] ========== handleGetFileChunk END ==========');
     
   } catch (err: any) {
-    console.error('[App] Error getting chunk:', err?.message || err);
-    console.error('[App] Stack:', err?.stack);
+    console.error('[App] Chunk download failed:', err?.message || err);
     port?.postMessage({ requestId, error: err?.message || 'Failed to get chunk' });
   }
 }

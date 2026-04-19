@@ -597,13 +597,53 @@ export class TelegramClientManager {
 
     const MAX_LIMIT = 512 * 1024;
     const ALIGN_1KB = 1024;
+    const MB = 1024 * 1024;
     const alignedLimit = Math.min(limit, MAX_LIMIT);
     const finalLimit = Math.floor(alignedLimit / ALIGN_1KB) * ALIGN_1KB;
     
+    console.log('[ChunkByOffset] Limit calc - fileSize:', fileSize, 'offset:', offset, 'finalLimit:', finalLimit);
+    
     let actualLimit = finalLimit;
-    if (fileSize !== undefined && offset + finalLimit > fileSize) {
-      actualLimit = fileSize - offset;
-      actualLimit = Math.floor(actualLimit / ALIGN_1KB) * ALIGN_1KB;
+    if (fileSize !== undefined) {
+      if (offset >= fileSize) {
+        actualLimit = 0;
+        console.log('[ChunkByOffset] Offset >= fileSize, returning empty');
+      } else {
+        const startChunk = Math.floor(offset / MB);
+        const chunkStart = startChunk * MB;
+        const chunkEnd = (startChunk + 1) * MB - 1;
+        const maxLimitForChunk = chunkEnd - offset + 1;
+        
+        console.log('[ChunkByOffset] Chunk info - start:', startChunk, 'chunkStart:', chunkStart, 'chunkEnd:', chunkEnd, 'maxLimit:', maxLimitForChunk);
+        
+        const validDivisors = [1048576, 524288, 262144, 131072, 65536, 32768, 16384, 8192, 4096];
+        let validLimit = 0;
+        
+        for (const d of validDivisors) {
+          if (d <= maxLimitForChunk && d <= finalLimit) {
+            if (offset % d === 0) {
+              validLimit = d;
+              break;
+            }
+          }
+        }
+        
+        if (validLimit === 0) {
+          for (const d of validDivisors) {
+            if (d <= maxLimitForChunk && d <= finalLimit) {
+              validLimit = d;
+              break;
+            }
+          }
+        }
+        
+        if (validLimit === 0) {
+          validLimit = Math.floor(maxLimitForChunk / ALIGN_1KB) * ALIGN_1KB;
+        }
+        
+        actualLimit = validLimit;
+        console.log('[ChunkByOffset] Adjusted limit to valid divisor:', actualLimit, 'max was:', maxLimitForChunk);
+      }
     }
     
     if (actualLimit <= 0) {

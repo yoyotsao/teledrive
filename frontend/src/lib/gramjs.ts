@@ -590,19 +590,28 @@ export class TelegramClientManager {
     return await waitForEnoughChunks();
   }
 
-  /**
-   * Download a specific chunk of a file by offset - for streaming playback.
-   */
-  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number): Promise<Blob> {
-    console.log('[ChunkByOffset] ===== START =====');
-    console.log('[ChunkByOffset] Downloading chunk, messageId:', messageId, 'offset:', offset, 'limit:', limit);
-    console.log('[ChunkByOffset] limit in KB:', (limit / 1024).toFixed(1), 'KB');
-    console.log('[ChunkByOffset] limit is valid:', limit % 4096 === 0 ? 'YES (divisible by 4KB)' : 'NO!');
-    console.log('[ChunkByOffset] 1MB % limit:', 1048576 % limit, '(should be 0 for non-precise)');
-    
+  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number, fileSize?: number): Promise<Blob> {
     if (!this.client) {
       throw new Error("Client not initialized");
     }
+
+    const MAX_LIMIT = 512 * 1024;
+    const ALIGN_1KB = 1024;
+    const alignedLimit = Math.min(limit, MAX_LIMIT);
+    const finalLimit = Math.floor(alignedLimit / ALIGN_1KB) * ALIGN_1KB;
+    
+    let actualLimit = finalLimit;
+    if (fileSize !== undefined && offset + finalLimit > fileSize) {
+      actualLimit = fileSize - offset;
+      actualLimit = Math.floor(actualLimit / ALIGN_1KB) * ALIGN_1KB;
+    }
+    
+    if (actualLimit <= 0) {
+      throw new Error('Invalid chunk request: offset=' + offset + ', limit=' + finalLimit);
+    }
+
+    console.log('[ChunkByOffset] ===== START =====');
+    console.log('[ChunkByOffset] Downloading chunk, messageId:', messageId, 'offset:', offset, 'rawLimit:', limit, 'actualLimit:', actualLimit);
 
     // Get message
     console.log('[ChunkByOffset] Getting message from Telegram...');
@@ -637,7 +646,7 @@ export class TelegramClientManager {
     });
 
     console.log('[ChunkByOffset] Calling upload.getFile API...');
-    console.log('[ChunkByOffset] API params: offset=', offset, 'limit=', limit, 'precise=false, cdnSupported=true');
+    console.log('[ChunkByOffset] API params: offset=', offset, 'limit=', actualLimit, 'precise=false, cdnSupported=true');
     
     let fileResult: any;
     try {
@@ -645,7 +654,7 @@ export class TelegramClientManager {
         new Api.upload.GetFile({
           location: chunkLocation!,
           offset: BigInt(offset) as any,
-          limit: limit,
+          limit: actualLimit,
           precise: false,
           cdnSupported: true,
         })

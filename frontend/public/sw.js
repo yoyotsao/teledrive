@@ -270,16 +270,22 @@ async function requestFileMetadata(fileId, messageId) {
 /**
  * Preload next chunk while current plays (Phase 3.4)
  */
-function preloadNextChunk(fileId, messageId, currentOffset, limit) {
+function preloadNextChunk(fileId, messageId, currentOffset, limit, fileSize) {
+  const nextOffset = currentOffset + limit;
+  if (nextOffset >= fileSize) {
+    console.log('[ServiceWorker] Skipping preload - at end of file');
+    return;
+  }
+
   if (preloadState?.inProgress && 
       preloadState.fileId === fileId && 
       preloadState.messageId === messageId &&
-      preloadState.offset === currentOffset + limit) {
+      preloadState.offset === nextOffset) {
     console.log('[ServiceWorker] Already preloading next chunk');
     return;
   }
   
-  console.log('[ServiceWorker] Preloading next chunk, offset:', currentOffset + limit);
+  console.log('[ServiceWorker] Preloading next chunk, offset:', nextOffset);
   
   preloadState = {
     fileId,
@@ -379,42 +385,31 @@ self.addEventListener('fetch', (event) => {
           });
         }
 
-        // Telegram API requires limit to be divisible by 4096 for precise downloads
-        // Round up to nearest 4096 multiple
-        // NOTE: Telegram API has a maximum limit per request - use smaller chunks
-        const CHUNK_ALIGNMENT = 4096;
-        const MAX_CHUNK_SIZE = 512 * 1024; // 512KB max per request
+        const ALIGN = 4096;
+        const MAX_CHUNK = 512 * 1024;
+        const available = metadata.size - rawRange.offset;
+        const boundedLimit = Math.min(rawRange.limit, available);
+        const maxBytes = Math.floor(Math.min(boundedLimit, MAX_CHUNK) / ALIGN) * ALIGN;
+        const limit = Math.max(Math.min(boundedLimit, maxBytes), ALIGN);
 
-        // Calculate the chunk size - use smaller chunks for large files
-        const requestedBytes = rawRange.limit;
-        const chunkSize = Math.min(
-          Math.ceil(requestedBytes / CHUNK_ALIGNMENT) * CHUNK_ALIGNMENT,
-          MAX_CHUNK_SIZE
-        );
-
-        // For the API call, use the aligned limit (Telegram requires 4KB alignment)
-        // For the response, use the actual bytes needed (don't exceed file size)
-        const apiLimit = chunkSize;
-        const actualBytesNeeded = Math.min(rawRange.limit, metadata.size - rawRange.offset);
-        
         console.log('[ServiceWorker] Raw Range - offset:', rawRange.offset, 'limit:', rawRange.limit);
-        console.log('[ServiceWorker] Using chunk size:', chunkSize, '(max 512KB, aligned to 4KB)');
+        console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB)');
 
         // Check preloaded chunk first (Phase 3.4 - buffer preload)
-        const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, apiLimit);
-        
+        const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, limit);
+
         let chunkData;
-        
+
         if (preloaded) {
           console.log('[ServiceWorker] Using preloaded chunk');
           chunkData = preloaded;
         } else {
-          console.log('[ServiceWorker] Requesting chunk from main app... offset:', rawRange.offset, 'limit:', apiLimit);
+          console.log('[ServiceWorker] Requesting chunk from main app... offset:', rawRange.offset, 'limit:', limit);
           chunkData = await requestChunkFromApp(
             urlParams.fileId,
             urlParams.messageId,
             rawRange.offset,
-            apiLimit
+            limit
           );
           console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
         }
@@ -424,7 +419,8 @@ self.addEventListener('fetch', (event) => {
           urlParams.fileId,
           urlParams.messageId,
           rawRange.offset,
-          apiLimit
+          limit,
+          metadata.size
         );
 
         // Return HTTP 206 Partial Content

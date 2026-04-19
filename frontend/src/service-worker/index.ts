@@ -269,36 +269,39 @@ async function requestFileMetadata(fileId: string, messageId: string): Promise<{
   });
 }
 
-/**
- * Preload next chunk while current plays (Phase 3.4)
- */
 function preloadNextChunk(
   fileId: string,
   messageId: string,
   currentOffset: number,
-  limit: number
+  limit: number,
+  fileSize: number
 ): void {
-  // Don't preload if already preloading same range
+  const nextOffset = currentOffset + limit;
+  if (nextOffset >= fileSize) {
+    console.log('[ServiceWorker] Skipping preload - at end of file');
+    return;
+  }
+
   if (preloadState?.inProgress && 
       preloadState.fileId === fileId && 
       preloadState.messageId === messageId &&
-      preloadState.offset === currentOffset + limit) {
+      preloadState.offset === nextOffset) {
     console.log('[ServiceWorker] Already preloading next chunk');
     return;
   }
   
-  console.log('[ServiceWorker] Preloading next chunk, offset:', currentOffset + limit);
+  console.log('[ServiceWorker] Preloading next chunk, offset:', nextOffset);
   
   preloadState = {
     fileId,
     messageId,
-    offset: currentOffset + limit,
+    offset: nextOffset,
     limit,
     data: null,
     inProgress: true,
   };
   
-  requestChunkFromApp(fileId, messageId, currentOffset + limit, limit)
+  requestChunkFromApp(fileId, messageId, nextOffset, limit)
     .then((data) => {
       preloadState!.data = data;
       preloadState!.inProgress = false;
@@ -400,11 +403,13 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         const ALIGN = 4096;
         const MAX_CHUNK = 512 * 1024;
         const available = metadata.size - rawRange.offset;
-        const maxBytes = Math.floor(Math.min(available, MAX_CHUNK) / ALIGN) * ALIGN;
-        const limit = Math.max(Math.min(rawRange.limit, maxBytes), ALIGN);
+        const boundedLimit = Math.min(rawRange.limit, available);
+        const maxBytes = Math.floor(Math.min(boundedLimit, MAX_CHUNK) / ALIGN) * ALIGN;
+        const limit = Math.max(Math.min(boundedLimit, maxBytes), ALIGN);
         
         console.log('[ServiceWorker] Raw Range - offset:', rawRange.offset, 'limit:', rawRange.limit);
-        console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB)');
+        console.log('[ServiceWorker] File size:', metadata.size, 'Available:', available);
+        console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB, capped at 512KB)');
 
         // Check preloaded chunk first (Phase 3.4 - buffer preload)
         const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, limit);
@@ -426,12 +431,13 @@ self.addEventListener('fetch', (event: FetchEvent) => {
           console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
         }
 
-        // Preload next chunk while current plays (Phase 3.4)
+        // Preload next chunk while current plays
         preloadNextChunk(
           urlParams.fileId,
           urlParams.messageId,
           rawRange.offset,
-          limit
+          limit,
+          metadata.size
         );
 
         const responseEndByte = Math.min(rawRange.offset + limit, metadata.size) - 1;

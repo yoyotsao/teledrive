@@ -70,6 +70,9 @@ export function ChonkyDrive() {
             const thumbMsgId = (file as any).thumbnail_message_id;
             if (thumbMsgId) {
               const thumbBlob = await telegramClient.downloadThumbnail(thumbMsgId);
+              const arrayBuf = await thumbBlob.arrayBuffer();
+              const firstBytes = arrayBuf.byteLength > 0 ? Array.from(new Uint8Array(arrayBuf.slice(0, 16))).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'empty';
+              console.log(`[Thumb] Video thumb blob size=${thumbBlob.size}, type=${thumbBlob.type}, firstBytes=${firstBytes}`);
               thumbUrl = URL.createObjectURL(thumbBlob);
               console.log(`[Thumb] Downloaded video thumbnail for ${file.filename}:`, thumbUrl);
             } else {
@@ -82,13 +85,21 @@ export function ChonkyDrive() {
             if (msgId) {
               const mimeType = file.mime_type || 'image/jpeg';
               const thumbBlob = await telegramClient.downloadFile(msgId, mimeType);
+              const arrayBuf = await thumbBlob.arrayBuffer();
+              const firstBytes = arrayBuf.byteLength > 0 ? Array.from(new Uint8Array(arrayBuf.slice(0, 16))).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'empty';
+              console.log(`[Thumb] Image thumb blob size=${thumbBlob.size}, type=${thumbBlob.type}, firstBytes=${firstBytes}`);
               thumbUrl = URL.createObjectURL(thumbBlob);
               console.log(`[Thumb] Downloaded image thumbnail for ${file.filename}:`, thumbUrl);
             }
           }
           
           if (thumbUrl) {
-            setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
+            console.log(`[Thumb] Setting thumbnail state for ${file.file_id}, total thumbnails: ${Object.keys(thumbnails).length + 1}`);
+            setThumbnails((prev) => {
+              const newState = { ...prev, [file.file_id]: thumbUrl };
+              console.log(`[Thumb] New thumbnails state keys: ${Object.keys(newState).join(',')}`);
+              return newState;
+            });
           }
         } catch (err: any) {
           console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
@@ -155,6 +166,44 @@ export function ChonkyDrive() {
   useEffect(() => {
     loadContents();
   }, [loadContents]);
+
+  useEffect(() => {
+    if (!originalFiles.length) return;
+    
+    const neededThumbCount = originalFiles.filter(
+      (f) => f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/')
+    ).length;
+    
+    if (neededThumbCount === 0) return;
+    const currentLoadedCount = Object.keys(thumbnails).length;
+    if (currentLoadedCount >= neededThumbCount) return;
+    
+    let retryTimeout: ReturnType<typeof setTimeout>;
+    
+    const tryLoadThumbnails = async () => {
+      try {
+        const telegramClient = getTelegramClient();
+        if (telegramClient.isConnected()) {
+          console.log('[Thumb] Telegram connected, retrying thumbnails...');
+          loadThumbnails(originalFiles);
+        } else {
+          retryTimeout = setTimeout(tryLoadThumbnails, 1000);
+        }
+      } catch {
+        retryTimeout = setTimeout(tryLoadThumbnails, 1000);
+      }
+    };
+    
+    tryLoadThumbnails();
+    
+    return () => clearTimeout(retryTimeout);
+  }, [originalFiles, thumbnails, loadThumbnails]);
+
+  useEffect(() => {
+    if (Object.keys(thumbnails).length > 0) {
+      setFiles((prev) => prev.map(f => ({ ...f })));
+    }
+  }, [thumbnails]);
 
   // Handle keyboard delete
   useEffect(() => {
@@ -547,14 +596,24 @@ export function ChonkyDrive() {
      }
    }, [originalFiles]);
 
-  // Close preview modal
-  const closePreview = useCallback(() => {
+  const closePreview = useCallback(async () => {
+    if (previewFile?.mime_type?.startsWith('video/')) {
+      try {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        for (const registration of registrations) {
+          registration.active?.postMessage({ type: 'CLEANUP' });
+        }
+      } catch (err) {
+        console.log('[Preview] Could not send CLEANUP to Service Worker:', err);
+      }
+    }
+    
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
     }
     setPreviewFile(null);
     setPreviewUrl(null);
-  }, [previewUrl]);
+  }, [previewUrl, previewFile]);
 
   return (
     <div
@@ -843,7 +902,7 @@ export function ChonkyDrive() {
                     {file.isDir ? (
                       <span style={{ fontSize: viewMode === 'grid' ? '60px' : '20px' }}>📁</span>
                     ) : (isImage || isVideo) && thumbnailUrl ? (
-                      <>
+                      <div style={{ position: 'relative', width: '100%', height: '100%' }}>
                         <img 
                           src={thumbnailUrl} 
                           alt={file.name}
@@ -856,10 +915,17 @@ export function ChonkyDrive() {
                         {isVideo && (
                           <span style={{
                             position: 'absolute',
-                            fontSize: '24px',
-                          }}>▶️</span>
+                            top: '50%',
+                            left: '50%',
+                            transform: 'translate(-50%, -50%)',
+                            fontSize: viewMode === 'grid' ? '32px' : '16px',
+                            textShadow: '0 0 4px rgba(0,0,0,0.5)',
+                            pointerEvents: 'none',
+                          }}>
+                            ▶️
+                          </span>
                         )}
-                      </>
+                      </div>
                     ) : (isImage || isVideo) ? (
                       <span style={{ fontSize: viewMode === 'grid' ? '60px' : '20px' }}>
                         {isVideo ? '🎬' : '🖼️'}

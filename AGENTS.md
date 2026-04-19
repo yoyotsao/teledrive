@@ -8,7 +8,7 @@
 2. Development Standards
 - Port Locking: Port 8000 (Backend), Port 3000 (Frontend).
 - Environment: Frontend variables MUST use VITE_ prefix.
-- Verification: NO manual testing. Use Playwright MCP to verify video (currentTime > 5s).
+- Verification: NO manual testing. Use Playwright MCP to verify.
 
 3. Execution Commands
 - Kill Backend: powershell -Command "Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { taskkill /F /PID $_.OwningProcess }"

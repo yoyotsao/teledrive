@@ -38,6 +38,7 @@ export function ChonkyDrive() {
     Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>
   >([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   const loadThumbnails = useCallback(async (files: FileInfo[]) => {
     const imageOrVideoFiles = files.filter(
@@ -369,11 +370,26 @@ export function ChonkyDrive() {
     dragCounterRef.current = 0;
     isDraggingRef.current = false;
 
-    // Skip if this is an internal file drag (not external file drop)
-    // Internal drags use custom MIME type
     const dragData = event.dataTransfer.getData('application/x-teledrive-file-id');
     if (dragData) {
-      // This is an internal file drag - let the folder drop handler deal with it
+      return;
+    }
+
+    const items = event.dataTransfer.items;
+    if (!items || items.length === 0) return;
+
+    let hasFolders = false;
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry?.();
+      if (entry?.isDirectory) {
+        hasFolders = true;
+        break;
+      }
+    }
+
+    if (hasFolders) {
+      await uploadFolder(items, currentFolderId);
+      loadContents();
       return;
     }
 
@@ -446,6 +462,157 @@ export function ChonkyDrive() {
 
   const handleUploadClick = () => {
     fileInputRef.current?.click();
+  };
+
+  const handleUploadFolderClick = () => {
+    folderInputRef.current?.click();
+  };
+
+  const uploadFolder = async (items: DataTransferItemList, parentFolderId: string | null): Promise<void> => {
+    const allFiles: { file: File; path: string }[] = [];
+    const folderPaths = new Set<string>();
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const entry = item.webkitGetAsEntry?.();
+      if (!entry) continue;
+
+      const processEntry = async (entry: any, basePath: string = '') => {
+        if (entry.isFile) {
+          return new Promise<void>((resolve) => {
+            entry.file((file: File) => {
+              allFiles.push({ file, path: basePath + file.name });
+              resolve();
+            });
+          });
+        } else if (entry.isDirectory) {
+          folderPaths.add(basePath + entry.name);
+          const reader = entry.createReader();
+          const readEntries = (): Promise<any[]> => {
+            return new Promise((resolve) => {
+              reader.readEntries((results: any[]) => resolve(results));
+            });
+          };
+          let entries = await readEntries();
+          while (entries.length === 100) {
+            const moreEntries = await readEntries();
+            entries = [...entries, ...moreEntries];
+          }
+          for (const subEntry of entries) {
+            await processEntry(subEntry, basePath + entry.name + '/');
+          }
+        }
+      };
+      await processEntry(entry);
+    }
+
+    const sortedFolders = Array.from(folderPaths).sort((a, b) => {
+      const depthA = a.split('/').filter(Boolean).length;
+      const depthB = b.split('/').filter(Boolean).length;
+      return depthB - depthA;
+    });
+
+    const folderIdMap: Record<string, string | null> = { '': parentFolderId };
+
+    for (const folderPath of sortedFolders) {
+      const folderName = folderPath.split('/').pop() || 'Folder';
+      const parentPath = folderPath.substring(0, folderPath.length - folderName.length - 1);
+      const parentId = folderIdMap[parentPath] ?? parentFolderId;
+      try {
+        const result = await api.createFolder(folderName, parentId);
+        folderIdMap[folderPath] = result.file_id;
+      } catch (err) {
+        folderIdMap[folderPath] = parentId;
+      }
+    }
+
+    const initialFiles = allFiles.map((f) => ({
+      name: f.path,
+      progress: 0,
+      status: 'uploading' as const,
+    }));
+    setUploadingFiles(initialFiles);
+
+    const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
+
+    for (let i = 0; i < allFiles.length; i++) {
+      const { file, path } = allFiles[i];
+      const pathParts = path.split('/');
+      pathParts.pop();
+      const fileDir = pathParts.join('/');
+      const targetFolderId = folderIdMap[fileDir] ?? parentFolderId;
+
+      try {
+        const isImage = file.type.startsWith('image/');
+        const isVideo = file.type.startsWith('video/');
+        const isImageOrVideo = isImage || isVideo;
+        const telegramClient = getTelegramClient();
+        const uploadResult = await telegramClient.uploadFileSplit(file);
+        const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+        for (let j = 0; j < uploadResult.parts.length; j++) {
+          const part = uploadResult.parts[j];
+          await api.registerFile({
+            filename: file.name,
+            filesize: part.size,
+            mimeType: file.type || undefined,
+            messageId: part.message_id,
+            fileId: part.file_id,
+            accessHash: part.access_hash,
+            parentId: targetFolderId ?? undefined,
+            isSplitFile: true,
+            splitGroupId: splitGroupId,
+            partIndex: j,
+            totalParts: uploadResult.parts.length,
+            originalName: file.name,
+          });
+        }
+
+        if (isImageOrVideo) {
+          if (isVideo) {
+            try {
+              const thumbBlob = await generateVideoThumbnail(file);
+              const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+              await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
+            } catch (err: any) {
+              console.error('[Thumb] Video thumbnail failed:', err?.response?.data || err.message);
+            }
+          } else {
+            const thumbBlob = await generateThumbnail(file, 200);
+            if (thumbBlob) {
+              try {
+                const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+                await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
+              } catch (err: any) {
+                console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+              }
+            }
+          }
+        }
+
+        results[i] = { name: path, progress: 100, status: 'complete' };
+      } catch (err: any) {
+        results[i] = {
+          name: path,
+          progress: 0,
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Upload failed',
+        };
+      }
+      setUploadingFiles([...results]);
+    }
+  };
+
+  const handleFolderSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const items = event.target.files;
+    if (!items || items.length === 0) return;
+    const dataTransfer = new DataTransfer();
+    for (let i = 0; i < items.length; i++) {
+      dataTransfer.items.add(items[i]);
+    }
+    await uploadFolder(dataTransfer.items, currentFolderId);
+    loadContents();
+    if (folderInputRef.current) folderInputRef.current.value = '';
   };
 
   // Selection handlers
@@ -781,11 +948,38 @@ export function ChonkyDrive() {
           ↑ Upload Files
         </button>
 
+        <button
+          onClick={handleUploadFolderClick}
+          style={{
+            background: '#8b5cf6',
+            border: 'none',
+            cursor: 'pointer',
+            color: 'white',
+            fontSize: '14px',
+            padding: '8px 16px',
+            borderRadius: '6px',
+            marginLeft: '8px',
+            fontWeight: 500,
+          }}
+        >
+          ↑ Upload Folder
+        </button>
+
         <input
           ref={fileInputRef}
           type="file"
           multiple
           onChange={handleFileSelect}
+          style={{ display: 'none' }}
+        />
+
+        <input
+          ref={folderInputRef}
+          type="file"
+          // @ts-ignore - webkitdirectory is not in React types but works in browsers
+          webkitdirectory=""
+          multiple
+          onChange={handleFolderSelect}
           style={{ display: 'none' }}
         />
       </div>

@@ -165,8 +165,10 @@ export function ChonkyDrive() {
   }, [currentFolderId, loadThumbnails]);
 
   useEffect(() => {
-    loadContents();
-  }, [loadContents]);
+    if (currentFolderId !== undefined) {
+      loadContents();
+    }
+  }, [currentFolderId]);
 
   useEffect(() => {
     if (!originalFiles.length) return;

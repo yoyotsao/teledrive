@@ -298,11 +298,10 @@ export function ChonkyDrive() {
     const isVideo = file.type.startsWith('video/');
     const isImageOrVideo = isImage || isVideo;
     
-    // Step 1: Upload file using split upload to Telegram via GramJS
     const telegramClient = getTelegramClient();
-    console.log('[Upload] Starting split upload for:', file.name);
+    console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
     const uploadResult = await telegramClient.uploadFileSplit(file);
-    console.log('[Upload] Split upload completed, parts:', uploadResult.parts.length);
+    console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
     
     // Generate split_group_id for this file
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;

@@ -79,9 +79,9 @@ export class TelegramClientManager {
       throw new Error("Client not initialized. Call initialize() first.");
     }
 
-    // For browser File objects, convert to array buffer then to Uint8Array
+    // For browser File objects, convert to array buffer then to Buffer (polyfilled)
     const arrayBuffer = await file.arrayBuffer();
-    const buffer = new Uint8Array(arrayBuffer);
+    const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
 
     // Create a CustomFile with buffer for browser environment
     // Signature: CustomFile(name: string, size: number, path: string, buffer?: Buffer)
@@ -140,9 +140,9 @@ export class TelegramClientManager {
       throw new Error("Client not initialized. Call initialize() first.");
     }
 
-    // Convert Blob to array buffer then to Uint8Array
+    // Convert Blob to array buffer then to Buffer (polyfilled)
     const arrayBuffer = await file.arrayBuffer();
-    const buffer = new Uint8Array(arrayBuffer);
+    const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
 
     // Create CustomFile for thumbnail
     const customFile = new CustomFile(filename, file.size, "", buffer);
@@ -194,28 +194,60 @@ export class TelegramClientManager {
       throw new Error("Client not initialized. Call initialize() first.");
     }
 
+    const useBigFile = file.size > 10 * 1024 * 1024;
+    console.log('[SplitUpload] File:', file.name, 'Size:', file.size, 'bytes, useBigFile:', useBigFile);
+
+    if (!useBigFile) {
+      console.log('[SplitUpload] Small file - using CustomFile approach');
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+      const customFile = new CustomFile(file.name, file.size, "", buffer);
+      
+      const message = await this.client.sendFile("me", {
+        file: customFile,
+        workers: 4,
+      });
+      
+      const msg = message as Api.Message;
+      let fileId = "";
+      let accessHash: string | undefined;
+      
+      if (msg.media) {
+        const mediaConstructor = (msg.media as { className?: string }).className;
+        if (mediaConstructor === "MessageMediaDocument") {
+          const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
+          fileId = String(doc.document.id);
+          accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
+        } else if (mediaConstructor === "MessageMediaPhoto") {
+          const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
+          fileId = String(photo.photo.id);
+          accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
+        }
+      }
+      
+      console.log('[SplitUpload] Small file uploaded, message_id:', msg.id);
+      return {
+        parts: [{ message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size }],
+        originalName: file.name,
+        totalParts: 1,
+      };
+    }
+
     const uploadedParts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }> = [];
     let fileId = generateRandomBigInt();
     let partIndex = 0;
-    
-    // Calculate total parts for current file segment
     let remainingForCurrentFile = file.size;
     let partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
     
-    console.log('[SplitUpload] File:', file.name, 'Size:', file.size, 'bytes');
-    console.log('[SplitUpload] Total parts needed:', Math.ceil(file.size / PART_SIZE));
-    console.log('[SplitUpload] First file segment - parts:', partsForCurrentFile);
+    console.log('[SplitUpload] Large file - total parts:', Math.ceil(file.size / PART_SIZE));
 
-    // Process file in chunks
     for (let offset = 0; offset < file.size; offset += PART_SIZE) {
       const chunk = file.slice(offset, offset + PART_SIZE);
       const arrayBuffer = await chunk.arrayBuffer();
-      // Use globalThis.Buffer (provided by vite-plugin-node-polyfills)
       const bytes = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
 
       console.log('[SplitUpload] Uploading part', partIndex, '/', partsForCurrentFile, '- offset:', offset);
 
-      // Save this part using SaveBigFilePart API
       try {
         await this.client.invoke(
           new Api.upload.SaveBigFilePart({
@@ -234,7 +266,6 @@ export class TelegramClientManager {
       partIndex++;
       remainingForCurrentFile -= PART_SIZE;
 
-      // If we've reached max parts, finalize this file and start a new one
       if (partIndex >= MAX_PARTS) {
         console.log('[SplitUpload] Reached MAX_PARTS, sending file with', partIndex, 'parts...');
         
@@ -248,7 +279,6 @@ export class TelegramClientManager {
           const message = await this.client.sendFile("me", { file: inputFileBig });
           console.log('[SplitUpload] File sent successfully, message_id:', message?.id);
           
-          // Extract media info
           const msg = message as Api.Message;
           const media = msg.media;
 
@@ -266,7 +296,7 @@ export class TelegramClientManager {
             message_id: msg.id,
             file_id: String(fileId),
             access_hash: accessHash,
-            size: Math.min(segmentSize, file.size), // Actual size of this segment
+            size: Math.min(segmentSize, file.size),
           });
           console.log('[SplitUpload] Segment registered, parts:', partIndex, 'size:', Math.min(segmentSize, file.size), 'bytes');
         } catch (err: any) {
@@ -274,7 +304,6 @@ export class TelegramClientManager {
           throw err;
         }
 
-        // Start new file with updated remaining parts
         fileId = generateRandomBigInt();
         partIndex = 0;
         partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
@@ -282,12 +311,11 @@ export class TelegramClientManager {
       }
     }
 
-    // Upload final file if there are remaining parts
     if (partIndex > 0) {
       console.log('[SplitUpload] Sending final file with', partIndex, 'parts...');
       const inputFileBig = new Api.InputFileBig({
         id: fileId,
-        parts: partIndex, // This is the actual number of parts for this final file
+        parts: partIndex,
         name: file.name,
       });
 
@@ -312,7 +340,7 @@ export class TelegramClientManager {
           message_id: msg.id,
           file_id: String(fileId),
           access_hash: accessHash,
-          size: finalSegmentSize, // Actual size of final segment
+          size: finalSegmentSize,
         });
         console.log('[SplitUpload] Final segment registered, parts:', partIndex, 'size:', finalSegmentSize, 'bytes');
       } catch (err: any) {
@@ -445,6 +473,16 @@ export class TelegramClientManager {
 
     if (mimeType.startsWith('video/') && fileSize < 10 * 1024 * 1024) {
       console.log('[Download] Video file under 10MB, using downloadMedia for reliable playback...');
+      const buffer = await this.client.downloadMedia(message.media);
+      if (!buffer || buffer.length === 0) {
+        throw new Error("Failed to download file - empty buffer");
+      }
+      return new Blob([buffer], { type: mimeType });
+    }
+
+    // For photos, use downloadMedia directly (Telegram photos don't have direct size property)
+    if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType.startsWith('image/')) {
+      console.log('[Download] Image file, using downloadMedia...');
       const buffer = await this.client.downloadMedia(message.media);
       if (!buffer || buffer.length === 0) {
         throw new Error("Failed to download file - empty buffer");

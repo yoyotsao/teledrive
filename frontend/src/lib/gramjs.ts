@@ -4,10 +4,15 @@ import { CustomFile } from "telegram/client/uploads";
 import { Api } from "telegram/tl";
 import bigInt from "big-integer";
 import { api } from "../api/client";
+import { MAX_UPLOAD_CONCURRENCY, CHUNK_RETRY_COUNT } from "../config";
+import { Semaphore } from "./semaphore";
 
 // Constants for split upload
 const MAX_PARTS = 1000;
 const PART_SIZE = 512 * 1024; // 512KB
+
+// Module-level semaphore shared across all file uploads
+const uploadSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
 
 /**
  * Generate a random BigInteger for fileId in SaveBigFilePart operations.
@@ -235,93 +240,70 @@ export class TelegramClientManager {
 
     const uploadedParts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }> = [];
     let fileId = generateRandomBigInt();
-    let partIndex = 0;
-    let remainingForCurrentFile = file.size;
-    let partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
+    let segmentStartOffset = 0;
+    let remainingSize = file.size;
     
     console.log('[SplitUpload] Large file - total parts:', Math.ceil(file.size / PART_SIZE));
 
-    for (let offset = 0; offset < file.size; offset += PART_SIZE) {
-      const chunk = file.slice(offset, offset + PART_SIZE);
-      const arrayBuffer = await chunk.arrayBuffer();
-      const bytes = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+    const client = this.client;
 
-      console.log('[SplitUpload] Uploading part', partIndex, '/', partsForCurrentFile, '- offset:', offset);
-
-      try {
-        await this.client.invoke(
-          new Api.upload.SaveBigFilePart({
-            fileId: fileId,
-            filePart: partIndex,
-            fileTotalParts: partsForCurrentFile,
-            bytes: bytes,
+    while (remainingSize > 0) {
+      const partsInSegment = Math.min(MAX_PARTS, Math.ceil(remainingSize / PART_SIZE));
+      const isBoundarySegment = partsInSegment === MAX_PARTS;
+      const segmentSize = partsInSegment * PART_SIZE;
+      
+      console.log('[SplitUpload] Starting segment with', partsInSegment, 'parts, offset:', segmentStartOffset);
+      
+      // Upload all chunks in this segment in parallel (bounded by semaphore)
+      const chunkPromises: Promise<void>[] = [];
+      
+      for (let i = 0; i < partsInSegment; i++) {
+        const partIdx = i;
+        const offset = segmentStartOffset + i * PART_SIZE;
+        
+        chunkPromises.push(
+          uploadSemaphore.withSlot(async () => {
+            const chunk = file.slice(offset, Math.min(offset + PART_SIZE, file.size));
+            const arrayBuffer = await chunk.arrayBuffer();
+            const bytes = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+            
+            for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
+              try {
+                await client!.invoke(
+                  new Api.upload.SaveBigFilePart({
+                    fileId: fileId,
+                    filePart: partIdx,
+                    fileTotalParts: partsInSegment,
+                    bytes: bytes,
+                  })
+                );
+                console.log('[SplitUpload] Part', partIdx, 'uploaded successfully');
+                return;
+              } catch (err: any) {
+                console.error('[SplitUpload] Part', partIdx, 'attempt', retry + 1, 'FAILED:', err?.message || err);
+                if (retry === CHUNK_RETRY_COUNT - 1) {
+                  throw err;
+                }
+              }
+            }
           })
         );
-        console.log('[SplitUpload] Part', partIndex, 'uploaded successfully');
-      } catch (err: any) {
-        console.error('[SplitUpload] Part', partIndex, 'FAILED:', err?.message || err);
-        throw err;
       }
-
-      partIndex++;
-      remainingForCurrentFile -= PART_SIZE;
-
-      if (partIndex >= MAX_PARTS) {
-        console.log('[SplitUpload] Reached MAX_PARTS, sending file with', partIndex, 'parts...');
-        
-        const inputFileBig = new Api.InputFileBig({
-          id: fileId,
-          parts: partIndex,
-          name: file.name,
-        });
-
-        try {
-          const message = await this.client.sendFile("me", { file: inputFileBig });
-          console.log('[SplitUpload] File sent successfully, message_id:', message?.id);
-          
-          const msg = message as Api.Message;
-          const media = msg.media;
-
-          let accessHash: string | undefined;
-          if (media) {
-            const mediaConstructor = (media as { className?: string }).className;
-            if (mediaConstructor === "MessageMediaDocument") {
-              const doc = media as unknown as { document: { id: bigint; accessHash?: bigint } };
-              accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
-            }
-          }
-
-          const segmentSize = partIndex * PART_SIZE;
-          uploadedParts.push({
-            message_id: msg.id,
-            file_id: String(fileId),
-            access_hash: accessHash,
-            size: Math.min(segmentSize, file.size),
-          });
-          console.log('[SplitUpload] Segment registered, parts:', partIndex, 'size:', Math.min(segmentSize, file.size), 'bytes');
-        } catch (err: any) {
-          console.error('[SplitUpload] SendFile FAILED:', err?.message || err);
-          throw err;
-        }
-
-        fileId = generateRandomBigInt();
-        partIndex = 0;
-        partsForCurrentFile = Math.min(MAX_PARTS, Math.ceil(remainingForCurrentFile / PART_SIZE));
-        console.log('[SplitUpload] Starting new file segment, parts:', partsForCurrentFile, 'remaining:', remainingForCurrentFile);
-      }
-    }
-
-    if (partIndex > 0) {
-      console.log('[SplitUpload] Sending final file with', partIndex, 'parts...');
+      
+      await Promise.all(chunkPromises);
+      
+      // Serial: send InputFileBig for this segment
+      console.log('[SplitUpload] All chunks uploaded, sending file with', partsInSegment, 'parts...');
+      
       const inputFileBig = new Api.InputFileBig({
         id: fileId,
-        parts: partIndex,
+        parts: partsInSegment,
         name: file.name,
       });
 
       try {
         const message = await this.client.sendFile("me", { file: inputFileBig });
-        console.log('[SplitUpload] Final file sent, message_id:', message?.id);
+        console.log('[SplitUpload] File sent successfully, message_id:', message?.id);
         
         const msg = message as Api.Message;
         const media = msg.media;
@@ -335,19 +317,25 @@ export class TelegramClientManager {
           }
         }
 
-        const finalSegmentSize = partIndex * PART_SIZE;
         uploadedParts.push({
           message_id: msg.id,
           file_id: String(fileId),
           access_hash: accessHash,
-          size: finalSegmentSize,
+          size: isBoundarySegment ? Math.min(segmentSize, file.size) : segmentSize,
         });
-        console.log('[SplitUpload] Final segment registered, parts:', partIndex, 'size:', finalSegmentSize, 'bytes');
+        console.log('[SplitUpload] Segment registered, parts:', partsInSegment, 'size:', isBoundarySegment ? Math.min(segmentSize, file.size) : segmentSize, 'bytes');
       } catch (err: any) {
-        console.error('[SplitUpload] Final SendFile FAILED:', err?.message || err);
+        console.error('[SplitUpload] SendFile FAILED:', err?.message || err);
         throw err;
       }
+
+      fileId = generateRandomBigInt();
+      segmentStartOffset += segmentSize;
+      remainingSize -= segmentSize;
     }
+
+    // Sort uploadedParts by segment order after parallel chunk collection
+    uploadedParts.sort((a, b) => a.message_id - b.message_id);
 
     return {
       parts: uploadedParts,

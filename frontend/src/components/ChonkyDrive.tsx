@@ -5,6 +5,7 @@ import { getTelegramClient } from '../lib/gramjs';
 import { generateVideoThumbnail } from '../lib/videoThumbnail';
 import { FileInfo } from '../types';
 
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -309,62 +310,59 @@ export function ChonkyDrive() {
     // Generate split_group_id for this file
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     
-    // Step 2: Register each part with backend
-    for (let i = 0; i < uploadResult.parts.length; i++) {
-      const part = uploadResult.parts[i];
-      
-      await api.registerFile({
-        filename: file.name,  // Use original filename for all parts
-        filesize: part.size,
-        mimeType: file.type || undefined,
-        messageId: part.message_id,
-        fileId: part.file_id,
-        accessHash: part.access_hash,
-        parentId: currentFolderId ?? undefined,
-        isSplitFile: true,
-        splitGroupId: splitGroupId,
-        partIndex: i,
-        totalParts: uploadResult.parts.length,
-        originalName: file.name,  // Store original name for all parts
-      });
-    }
-    console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
-    
-    // Step 3: Upload thumbnail if needed
-    if (isImageOrVideo) {
-      if (isVideo) {
-        // For videos: generate thumbnail client-side using FFmpeg WASM, then upload via GramJS
-        console.log('[Thumb] Generating video thumbnail via FFmpeg WASM for:', file.name);
-        try {
-          const thumbBlob = await generateVideoThumbnail(file);
-          console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
-          const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-          console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
-          // Update first part with thumbnail
-          await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-          console.log('[Thumb] Updated file with video thumbnail metadata');
-        } catch (err: any) {
-          console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
-        }
-      } else {
-        // For images: generate thumbnail client-side and upload via GramJS
-        const thumbBlob = await generateThumbnail(file, 200);
-        if (thumbBlob) {
-          console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
+    // Register all parts and generate/upload thumbnail in parallel
+    await Promise.all([
+      // Register all parts in parallel
+      Promise.all(uploadResult.parts.map((part, i) =>
+        api.registerFile({
+          filename: file.name,
+          filesize: part.size,
+          mimeType: file.type || undefined,
+          messageId: part.message_id,
+          fileId: part.file_id,
+          accessHash: part.access_hash,
+          parentId: currentFolderId ?? undefined,
+          isSplitFile: true,
+          splitGroupId: splitGroupId,
+          partIndex: i,
+          totalParts: uploadResult.parts.length,
+          originalName: file.name,
+        })
+      )),
+      // Generate and upload thumbnail (if image/video)
+      (async () => {
+        if (!isImageOrVideo) return;
+        if (isVideo) {
+          console.log('[Thumb] Generating video thumbnail via FFmpeg WASM for:', file.name);
           try {
+            const thumbBlob = await generateVideoThumbnail(file);
+            console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
             const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
             console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
-            // Update first part with thumbnail
             await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-            console.log('[Thumb] Updated file with thumbnail_message_id');
+            console.log('[Thumb] Updated file with video thumbnail metadata');
           } catch (err: any) {
-            console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+            console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
           }
         } else {
-          console.log('[Thumb] generateThumbnail returned null for:', file.name);
+          const thumbBlob = await generateThumbnail(file, 200);
+          if (thumbBlob) {
+            console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
+            try {
+              const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+              console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
+              await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
+              console.log('[Thumb] Updated file with thumbnail_message_id');
+            } catch (err: any) {
+              console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+            }
+          } else {
+            console.log('[Thumb] generateThumbnail returned null for:', file.name);
+          }
         }
-      }
-    }
+      })(),
+    ]);
+    console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
   };
 
   const handleDrop = useCallback(async (event: React.DragEvent) => {
@@ -410,21 +408,16 @@ export function ChonkyDrive() {
       status: 'uploading' as const,
     }));
 
-    for (let i = 0; i < droppedFiles.length; i++) {
-      const file = droppedFiles[i];
-      try {
-        await uploadWithThumbnail(file);
+    const uploadPromises = droppedFiles.map((file, i) =>
+      uploadWithThumbnail(file).then(() => {
         results[i] = { name: file.name, progress: 100, status: 'complete' };
-      } catch (err: any) {
-        results[i] = {
-          name: file.name,
-          progress: 0,
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Upload failed',
-        };
-      }
-      setUploadingFiles([...results]);
-    }
+      }).catch((err: any) => {
+        results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+      }).finally(() => {
+        setUploadingFiles([...results]);
+      })
+    );
+    await Promise.allSettled(uploadPromises);
 
     loadContents();
   }, [currentFolderId, loadContents, uploadWithThumbnail, isDraggingInternal]);
@@ -442,21 +435,16 @@ export function ChonkyDrive() {
 
     const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
 
-    for (let i = 0; i < selectedFiles.length; i++) {
-      const file = selectedFiles[i];
-      try {
-        await uploadWithThumbnail(file);
+    const uploadPromises = selectedFiles.map((file, i) =>
+      uploadWithThumbnail(file).then(() => {
         results[i] = { name: file.name, progress: 100, status: 'complete' };
-      } catch (err: any) {
-        results[i] = {
-          name: file.name,
-          progress: 0,
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Upload failed',
-        };
-      }
-      setUploadingFiles([...results]);
-    }
+      }).catch((err: any) => {
+        results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+      }).finally(() => {
+        setUploadingFiles([...results]);
+      })
+    );
+    await Promise.allSettled(uploadPromises);
 
     loadContents();
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -537,72 +525,70 @@ export function ChonkyDrive() {
 
     const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
 
-    for (let i = 0; i < allFiles.length; i++) {
-      const { file, path } = allFiles[i];
+    const uploadPromises = allFiles.map(({ file, path }, i) => {
       const pathParts = path.split('/');
       pathParts.pop();
       const fileDir = pathParts.join('/');
       const targetFolderId = folderIdMap[fileDir] ?? parentFolderId;
 
-      try {
-        const isImage = file.type.startsWith('image/');
-        const isVideo = file.type.startsWith('video/');
-        const isImageOrVideo = isImage || isVideo;
+      const isImage = file.type.startsWith('image/');
+      const isVideo = file.type.startsWith('video/');
+      const isImageOrVideo = isImage || isVideo;
+
+      return (async () => {
         const telegramClient = getTelegramClient();
         const uploadResult = await telegramClient.uploadFileSplit(file);
         const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
-        for (let j = 0; j < uploadResult.parts.length; j++) {
-          const part = uploadResult.parts[j];
-          await api.registerFile({
-            filename: file.name,
-            filesize: part.size,
-            mimeType: file.type || undefined,
-            messageId: part.message_id,
-            fileId: part.file_id,
-            accessHash: part.access_hash,
-            parentId: targetFolderId ?? undefined,
-            isSplitFile: true,
-            splitGroupId: splitGroupId,
-            partIndex: j,
-            totalParts: uploadResult.parts.length,
-            originalName: file.name,
-          });
-        }
-
-        if (isImageOrVideo) {
-          if (isVideo) {
-            try {
-              const thumbBlob = await generateVideoThumbnail(file);
-              const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-              await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-            } catch (err: any) {
-              console.error('[Thumb] Video thumbnail failed:', err?.response?.data || err.message);
-            }
-          } else {
-            const thumbBlob = await generateThumbnail(file, 200);
-            if (thumbBlob) {
+        await Promise.all([
+          Promise.all(uploadResult.parts.map((part, j) =>
+            api.registerFile({
+              filename: file.name,
+              filesize: part.size,
+              mimeType: file.type || undefined,
+              messageId: part.message_id,
+              fileId: part.file_id,
+              accessHash: part.access_hash,
+              parentId: targetFolderId ?? undefined,
+              isSplitFile: true,
+              splitGroupId: splitGroupId,
+              partIndex: j,
+              totalParts: uploadResult.parts.length,
+              originalName: file.name,
+            })
+          )),
+          (async () => {
+            if (!isImageOrVideo) return;
+            if (isVideo) {
               try {
+                const thumbBlob = await generateVideoThumbnail(file);
                 const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
                 await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
               } catch (err: any) {
-                console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+                console.error('[Thumb] Video thumbnail failed:', err?.response?.data || err.message);
+              }
+            } else {
+              const thumbBlob = await generateThumbnail(file, 200);
+              if (thumbBlob) {
+                try {
+                  const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+                  await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
+                } catch (err: any) {
+                  console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
+                }
               }
             }
-          }
-        }
-
+          })(),
+        ]);
+      })().then(() => {
         results[i] = { name: path, progress: 100, status: 'complete' };
-      } catch (err: any) {
-        results[i] = {
-          name: path,
-          progress: 0,
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Upload failed',
-        };
-      }
-      setUploadingFiles([...results]);
-    }
+      }).catch((err: any) => {
+        results[i] = { name: path, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+      }).finally(() => {
+        setUploadingFiles([...results]);
+      });
+    });
+    await Promise.allSettled(uploadPromises);
   };
 
   const handleFolderSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {

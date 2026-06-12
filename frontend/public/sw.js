@@ -88,46 +88,141 @@ function parseVideoUrl(pathname) {
 
 /**
  * Request file chunk from main app via postMessage
+ * Includes retry logic with exponential backoff (1s, 2s, 4s)
  */
 async function requestChunkFromApp(fileId, messageId, offset, limit) {
-  return new Promise((resolve, reject) => {
-    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const channel = new MessageChannel();
-    const timeout = setTimeout(() => {
-      channel.port1.close();
-      reject(new Error(`Chunk request timeout: offset=${offset}, limit=${limit}`));
-    }, 30000);
+  const MAX_RETRIES = 3;
+  const RETRY_DELAYS = [1000, 2000, 4000]; // Exponential backoff: 1s, 2s, 4s
+  
+  // Helper: Send request to main app via MessageChannel
+  function sendChunkRequest() {
+    return new Promise((resolve, reject) => {
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const channel = new MessageChannel();
+      const timeout = setTimeout(() => {
+        channel.port1.close();
+        reject(new Error(`Chunk request timeout: offset=${offset}, limit=${limit}`));
+      }, 30000);
 
-    channel.port1.onmessage = (event) => {
-      clearTimeout(timeout);
-      channel.port1.close();
-      if (event.data?.error) {
-        reject(new Error(event.data.error));
-      } else if (event.data?.chunk) {
-        resolve(event.data.chunk);
-      } else {
-        reject(new Error('Invalid response from main app'));
-      }
-    };
-
-    self.clients.matchAll().then((clients) => {
-      for (const client of clients) {
-        client.postMessage({
-          type: 'GET_FILE_CHUNK',
-          requestId,
-          fileId,
-          messageId: parseInt(messageId, 10),
-          offset,
-          limit,
-        }, [channel.port2]);
-      }
-      if (clients.length === 0) {
+      channel.port1.onmessage = (event) => {
         clearTimeout(timeout);
         channel.port1.close();
-        reject(new Error('No clients available - main app may not be running'));
-      }
+        if (event.data?.error) {
+          reject(new Error(event.data.error));
+        } else if (event.data?.chunk) {
+          resolve(event.data.chunk);
+        } else {
+          reject(new Error('Invalid response from main app'));
+        }
+      };
+
+      self.clients.matchAll().then((clients) => {
+        for (const client of clients) {
+          client.postMessage({
+            type: 'GET_FILE_CHUNK',
+            requestId,
+            fileId,
+            messageId: parseInt(messageId, 10),
+            offset,
+            limit,
+          }, [channel.port2]);
+        }
+        if (clients.length === 0) {
+          clearTimeout(timeout);
+          channel.port1.close();
+          reject(new Error('No clients available - main app may not be running'));
+        }
+      });
     });
-  });
+  }
+
+  // Helper: Check if Telegram needs reconnection
+  async function checkTelegramConnection() {
+    return new Promise((resolve) => {
+      const channel = new MessageChannel();
+      const requestId = `check_${Date.now()}`;
+      const timeout = setTimeout(() => {
+        channel.port1.close();
+        resolve(false); // Assume disconnected on timeout
+      }, 5000);
+
+      channel.port1.onmessage = (event) => {
+        clearTimeout(timeout);
+        channel.port1.close();
+        if (event.data?.type === 'CONNECTION_STATUS') {
+          resolve(event.data.connected === true);
+        } else {
+          resolve(false);
+        }
+      };
+
+      self.clients.matchAll().then((clients) => {
+        for (const client of clients) {
+          client.postMessage({
+            type: 'CHECK_CONNECTION',
+            requestId,
+          }, [channel.port2]);
+        }
+        if (clients.length === 0) {
+          clearTimeout(timeout);
+          channel.port1.close();
+          resolve(false);
+        }
+      });
+    });
+  }
+
+  // Retry loop with exponential backoff
+  let lastError = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log('[ServiceWorker] Chunk request attempt', attempt + 1, '/', MAX_RETRIES + 1);
+      
+      // If this is a retry (not first attempt), check connection first
+      if (attempt > 0) {
+        console.log(`[ServiceWorker] Retry attempt ${attempt}/${MAX_RETRIES} for chunk offset=${offset}, waiting ${RETRY_DELAYS[attempt - 1]}ms...`);
+        
+        // Wait with exponential backoff
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt - 1]));
+        
+        // Check if Telegram needs reconnection
+        const isConnected = await checkTelegramConnection();
+        if (!isConnected) {
+          console.log('[ServiceWorker] Telegram disconnected, triggering reconnect...');
+          // Send reconnect request to main app
+          await new Promise((resolve) => {
+            const channel = new MessageChannel();
+            self.clients.matchAll().then((clients) => {
+              for (const client of clients) {
+                client.postMessage({ type: 'RECONNECT_TELEGRAM' }, [channel.port2]);
+              }
+              // Wait briefly for reconnect to happen
+              setTimeout(resolve, 2000);
+            });
+          });
+        }
+      }
+      
+      // Attempt to get chunk
+      const chunk = await sendChunkRequest();
+      if (attempt > 0) {
+        console.log(`[ServiceWorker] Retry successful on attempt ${attempt} for chunk offset=${offset}`);
+      }
+      return chunk;
+      
+    } catch (error) {
+      lastError = error;
+      console.log(`[ServiceWorker] Chunk request failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error.message}`);
+      
+      // If this was the last attempt, throw the error
+      if (attempt >= MAX_RETRIES) {
+        throw new Error(`Chunk request failed after ${MAX_RETRIES + 1} attempts: ${error.message}`);
+      }
+    }
+  }
+  
+  // Should never reach here, but just in case
+  throw lastError || new Error('Unknown error in chunk request');
 }
 
 /**
@@ -227,7 +322,7 @@ function getPreloadedChunk(fileId, messageId, offset, limit) {
 // Fetch event handler - intercept requests
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  console.log('[ServiceWorker] Fetch intercepted:', url.pathname);
+  console.log('[ServiceWorker] Fetch intercepted:', url.pathname, 'range:', event.request.headers.get('Range'));
 
   // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
@@ -314,7 +409,7 @@ self.addEventListener('fetch', (event) => {
           console.log('[ServiceWorker] Using preloaded chunk');
           chunkData = preloaded;
         } else {
-          console.log('[ServiceWorker] Requesting chunk from main app...');
+          console.log('[ServiceWorker] Requesting chunk from main app... offset:', rawRange.offset, 'limit:', apiLimit);
           chunkData = await requestChunkFromApp(
             urlParams.fileId,
             urlParams.messageId,

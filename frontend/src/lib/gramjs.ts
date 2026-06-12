@@ -735,6 +735,36 @@ export class TelegramClientManager {
   }
 
   /**
+   * Connect/reconnect the Telegram client.
+   * Used for reconnection after connection drops.
+   */
+  async connect(): Promise<void> {
+    if (this.client && !this.client.connected) {
+      console.log('[GramJS] Reconnecting to Telegram...');
+      await this.client.connect();
+      console.log('[GramJS] Reconnected successfully');
+    }
+  }
+
+  /**
+   * Ping Telegram to test if connection is alive.
+   * This is more reliable than just checking isConnected().
+   */
+  async invokePing(): Promise<boolean> {
+    if (!this.client || !this.client.connected) {
+      return false;
+    }
+    try {
+      // Try to get current user as a ping test
+      await this.client.getMe();
+      return true;
+    } catch (err) {
+      console.log('[GramJS] Ping failed:', err);
+      return false;
+    }
+  }
+
+  /**
    * Get the current session string for storage.
    * This can be saved and used to restore the session later.
    */

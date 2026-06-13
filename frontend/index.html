@@ -7,6 +7,55 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Runs synchronously before any ES module so GramJS W3CWebSocket captures the patched constructor.
+         On HTTPS, browsers block ws:// (mixed content). Maps Telegram DC IPs to their official
+         wss:// domain endpoints (pluto/venus/aurora/vesta/flora.web.telegram.org) so the browser
+         connects directly to Telegram with valid TLS — no backend proxy needed. -->
+    <script>
+    (function () {
+      if (window.location.protocol !== 'https:') return;
+
+      // Maps Telegram DC IP prefixes to official wss:// domain endpoints.
+      // These domains have valid TLS certs — same endpoints used by web.telegram.org.
+      function getTelegramDomain(hostname) {
+        if (hostname.startsWith('149.154.175.')) {
+          var last = parseInt(hostname.split('.')[3], 10);
+          return last >= 100 ? 'aurora.web.telegram.org' : 'pluto.web.telegram.org';
+        }
+        if (hostname.startsWith('149.154.167.') || hostname.startsWith('149.154.166.')) {
+          var last = parseInt(hostname.split('.')[3], 10);
+          return last >= 91 ? 'vesta.web.telegram.org' : 'venus.web.telegram.org';
+        }
+        if (hostname.startsWith('91.108.56.') || hostname.startsWith('91.108.4.')) {
+          return 'flora.web.telegram.org';
+        }
+        return null;
+      }
+
+      var NativeWS = window.WebSocket;
+      function PatchedWebSocket(url, protocols) {
+        if (typeof url === 'string' && url.indexOf('/apiws') !== -1) {
+          try {
+            var p = new URL(url);
+            var domain = getTelegramDomain(p.hostname);
+            if (domain) {
+              url = 'wss://' + domain + '/apiws';
+            }
+          } catch (e) {}
+        }
+        if (protocols !== undefined) {
+          return new NativeWS(url, protocols);
+        }
+        return new NativeWS(url);
+      }
+      PatchedWebSocket.prototype = NativeWS.prototype;
+      PatchedWebSocket.CONNECTING = NativeWS.CONNECTING;
+      PatchedWebSocket.OPEN       = NativeWS.OPEN;
+      PatchedWebSocket.CLOSING    = NativeWS.CLOSING;
+      PatchedWebSocket.CLOSED     = NativeWS.CLOSED;
+      window.WebSocket = PatchedWebSocket;
+    })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -7,6 +7,38 @@ import { api } from "../api/client";
 import { MAX_UPLOAD_CONCURRENCY, CHUNK_RETRY_COUNT } from "../config";
 import { Semaphore } from "./semaphore";
 
+/**
+ * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
+ * Browsers block ws:// (plain WebSocket) from https:// pages. Our proxy accepts
+ * wss:// (valid SSL via Cloudflare) and forwards to Telegram via plain ws://.
+ * Called once before TelegramClient initialization when on HTTPS.
+ */
+function installTelegramWsProxy(): void {
+  if ((window as any).__telegramWsProxyInstalled) return;
+  (window as any).__telegramWsProxyInstalled = true;
+
+  const OrigWebSocket = window.WebSocket;
+
+  class TelegramProxiedWebSocket extends OrigWebSocket {
+    constructor(url: string, protocols?: string | string[]) {
+      let finalUrl = url;
+      if (url.includes('/apiws')) {
+        try {
+          const tgUrl = new URL(url);
+          const port = tgUrl.port || '80';
+          const proxyPath = `/api/v1/ws-proxy?host=${encodeURIComponent(tgUrl.hostname)}&port=${port}`;
+          finalUrl = `wss://${window.location.host}${proxyPath}`;
+        } catch {
+          // keep original url on parse failure
+        }
+      }
+      super(finalUrl, protocols);
+    }
+  }
+
+  (window as any).WebSocket = TelegramProxiedWebSocket;
+}
+
 // Constants for split upload
 const MAX_PARTS = 1000;
 const PART_SIZE = 512 * 1024; // 512KB
@@ -39,6 +71,8 @@ function generateRandomBigInt(): ReturnType<typeof bigInt> {
 export class TelegramClientManager {
   private client: TelegramClient | null = null;
   private session: StringSession | null = null;
+  // Limit concurrent sendFile calls — parallel sendFile before "me" entity is cached causes ID 0 errors
+  private readonly sendFileSemaphore = new Semaphore(2);
 
   /**
    * Initialize the Telegram client with API credentials and session.
@@ -47,13 +81,18 @@ export class TelegramClientManager {
    * @param sessionString - Saved session string for authentication
    */
   async initialize(apiId: number, apiHash: string, sessionString: string): Promise<void> {
-    // Create session - use empty string for new session or existing string for restore
+    // On HTTPS, browsers block plain ws:// connections (mixed content).
+    // Monkey-patch WebSocket so GramJS's Telegram connections are routed through
+    // our backend proxy (/api/v1/ws-proxy), which forwards to Telegram via plain ws://.
+    if (window.location.protocol === 'https:') {
+      installTelegramWsProxy();
+    }
+
     this.session = new StringSession(sessionString || "");
 
-    // Initialize client with session and API credentials
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: false, // Use regular TCP connections in browser
+      useWSS: false,
       deviceModel: "TeleDrive Browser",
       appVersion: "1.0.0",
     });
@@ -68,6 +107,30 @@ export class TelegramClientManager {
     } catch (err) {
       console.warn('[GramJS] Session might need re-authentication:', err);
     }
+  }
+
+  /**
+   * Send a file through sendFileSemaphore with retry on entity-ID-0 errors.
+   * GramJS can fail with "Missing MTProto Entity ID 0" when concurrent sendFile
+   * calls race before the "me" entity is cached; serialising them (max 2) and
+   * refreshing the cache on failure fixes this.
+   */
+  private async sendFileLocked(params: any, maxRetries = 3): Promise<unknown> {
+    return this.sendFileSemaphore.withSlot(async () => {
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          return await this.client!.sendFile("me", params);
+        } catch (err: any) {
+          const isEntityZero = err?.message?.includes('ID 0') || err?.message?.includes('Entity');
+          if (isEntityZero && attempt < maxRetries - 1) {
+            console.warn(`[GramJS] sendFile entity-0 error (attempt ${attempt + 1}), refreshing entity cache...`);
+            try { await this.client!.getMe(); } catch { /* ignore */ }
+            continue;
+          }
+          throw err;
+        }
+      }
+    });
   }
 
   /**
@@ -190,7 +253,7 @@ export class TelegramClientManager {
    * @param file - The file to upload (Browser File object)
    * @returns Promise with upload results containing message_id, file_id, access_hash, and size for each part
    */
-  async uploadFileSplit(file: File): Promise<{
+  async uploadFileSplit(file: File, onProgress?: (pct: number) => void): Promise<{
     parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>;
     originalName: string;
     totalParts: number;
@@ -207,16 +270,17 @@ export class TelegramClientManager {
       const arrayBuffer = await file.arrayBuffer();
       const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
       const customFile = new CustomFile(file.name, file.size, "", buffer);
-      
-      const message = await this.client.sendFile("me", {
+
+      const message = await this.sendFileLocked({
         file: customFile,
         workers: 4,
+        forceDocument: true,
       });
-      
+
       const msg = message as Api.Message;
       let fileId = "";
       let accessHash: string | undefined;
-      
+
       if (msg.media) {
         const mediaConstructor = (msg.media as { className?: string }).className;
         if (mediaConstructor === "MessageMediaDocument") {
@@ -229,8 +293,9 @@ export class TelegramClientManager {
           accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
         }
       }
-      
+
       console.log('[SplitUpload] Small file uploaded, message_id:', msg.id);
+      onProgress?.(100);
       return {
         parts: [{ message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size }],
         originalName: file.name,
@@ -242,8 +307,10 @@ export class TelegramClientManager {
     let fileId = generateRandomBigInt();
     let segmentStartOffset = 0;
     let remainingSize = file.size;
-    
-    console.log('[SplitUpload] Large file - total parts:', Math.ceil(file.size / PART_SIZE));
+    const totalChunks = Math.ceil(file.size / PART_SIZE);
+    let completedChunks = 0;
+
+    console.log('[SplitUpload] Large file - total parts:', totalChunks);
 
     const client = this.client;
 
@@ -277,6 +344,8 @@ export class TelegramClientManager {
                     bytes: bytes,
                   })
                 );
+                completedChunks++;
+                onProgress?.(Math.min(99, Math.round((completedChunks / totalChunks) * 100)));
                 console.log('[SplitUpload] Part', partIdx, 'uploaded successfully');
                 return;
               } catch (err: any) {
@@ -302,10 +371,9 @@ export class TelegramClientManager {
       });
 
       try {
-        const message = await this.client.sendFile("me", { file: inputFileBig });
-        console.log('[SplitUpload] File sent successfully, message_id:', message?.id);
-        
+        const message = await this.sendFileLocked({ file: inputFileBig, forceDocument: true });
         const msg = message as Api.Message;
+        console.log('[SplitUpload] File sent successfully, message_id:', msg?.id);
         const media = msg.media;
 
         let accessHash: string | undefined;
@@ -621,89 +689,50 @@ export class TelegramClientManager {
       throw new Error("Client not initialized");
     }
 
-    const MAX_LIMIT = 512 * 1024;
-    const ALIGN_1KB = 1024;
+    if (fileSize !== undefined && offset >= fileSize) {
+      throw new Error('Invalid chunk request: offset=' + offset + ' >= fileSize=' + fileSize);
+    }
+
+    // MTProto upload.GetFile (precise=true) constraints:
+    //   1. offset must be 4KB-aligned
+    //   2. limit must be a multiple of 4KB, ≤ 512KB
+    //   3. offset + limit must NOT cross a 1MB boundary
+    // Note: precise=true does NOT require offset % limit == 0
+    const ALIGN = 4096;
     const MB = 1024 * 1024;
-    const alignedLimit = Math.min(limit, MAX_LIMIT);
-    const finalLimit = Math.floor(alignedLimit / ALIGN_1KB) * ALIGN_1KB;
-    
-    console.log('[ChunkByOffset] Limit calc - fileSize:', fileSize, 'offset:', offset, 'finalLimit:', finalLimit);
-    
-    let actualLimit = finalLimit;
-    if (fileSize !== undefined) {
-      if (offset >= fileSize) {
-        actualLimit = 0;
-        console.log('[ChunkByOffset] Offset >= fileSize, returning empty');
-      } else {
-        const startChunk = Math.floor(offset / MB);
-        const chunkStart = startChunk * MB;
-        const chunkEnd = (startChunk + 1) * MB - 1;
-        const maxLimitForChunk = chunkEnd - offset + 1;
-        
-        console.log('[ChunkByOffset] Chunk info - start:', startChunk, 'chunkStart:', chunkStart, 'chunkEnd:', chunkEnd, 'maxLimit:', maxLimitForChunk);
-        
-        const validDivisors = [1048576, 524288, 262144, 131072, 65536, 32768, 16384, 8192, 4096];
-        let validLimit = 0;
-        
-        for (const d of validDivisors) {
-          if (d <= maxLimitForChunk && d <= finalLimit) {
-            if (offset % d === 0) {
-              validLimit = d;
-              break;
-            }
-          }
-        }
-        
-        if (validLimit === 0) {
-          for (const d of validDivisors) {
-            if (d <= maxLimitForChunk && d <= finalLimit) {
-              validLimit = d;
-              break;
-            }
-          }
-        }
-        
-        if (validLimit === 0) {
-          validLimit = Math.floor(maxLimitForChunk / ALIGN_1KB) * ALIGN_1KB;
-        }
-        
-        actualLimit = validLimit;
-        console.log('[ChunkByOffset] Adjusted limit to valid divisor:', actualLimit, 'max was:', maxLimitForChunk);
+
+    const alignedOffset = Math.floor(offset / ALIGN) * ALIGN;
+    const prefix = offset - alignedOffset;
+
+    // Max bytes fetchable before hitting the next 1MB boundary (constraint 3)
+    const nextMb = (Math.floor(alignedOffset / MB) + 1) * MB;
+    const maxFromBoundary = nextMb - alignedOffset;
+
+    // Pick the largest candidate that fits within the 1MB boundary
+    const candidates = [524288, 262144, 131072, 65536, 32768, 16384, 8192, 4096];
+    let downloadLimit = ALIGN;
+    for (const c of candidates) {
+      if (c <= maxFromBoundary) {
+        downloadLimit = c;
+        break;
       }
     }
-    
-    if (actualLimit <= 0) {
-      throw new Error('Invalid chunk request: offset=' + offset + ', limit=' + finalLimit);
-    }
 
-    console.log('[ChunkByOffset] ===== START =====');
-    console.log('[ChunkByOffset] Downloading chunk, messageId:', messageId, 'offset:', offset, 'rawLimit:', limit, 'actualLimit:', actualLimit);
-
-    // Get message
-    console.log('[ChunkByOffset] Getting message from Telegram...');
     const messages = await this.client.getMessages("me", { ids: [messageId] });
-    console.log('[ChunkByOffset] Got messages, count:', messages.length);
-    
     const message = messages[0] as Api.Message;
-    
-    if (!message?.media) {
-      throw new Error("Message has no media");
-    }
+    if (!message?.media) throw new Error("Message has no media");
 
     const media = message.media as any;
     let docId: bigint, accessHash: bigint, fileReference: Uint8Array | undefined;
-    
     if (media?.className === 'MessageMediaDocument') {
       const doc = media.document;
       docId = doc.id;
       accessHash = doc.accessHash;
       fileReference = doc.fileReference;
-      console.log('[ChunkByOffset] Document: id=', docId, 'size=', doc.size, 'mime=', doc.mimeType);
     } else {
       throw new Error('Unsupported media type: ' + media?.className);
     }
 
-    console.log('[ChunkByOffset] Creating InputDocumentFileLocation...');
     const chunkLocation = new Api.InputDocumentFileLocation({
       id: docId as any,
       accessHash: accessHash as any,
@@ -711,36 +740,59 @@ export class TelegramClientManager {
       thumbSize: "",
     });
 
-    console.log('[ChunkByOffset] Calling upload.getFile API...');
-    console.log('[ChunkByOffset] API params: offset=', offset, 'limit=', actualLimit, 'precise=false, cdnSupported=true');
-    
     let fileResult: any;
     try {
       fileResult = await this.client.invoke(
         new Api.upload.GetFile({
-          location: chunkLocation!,
-          offset: BigInt(offset) as any,
-          limit: actualLimit,
-          precise: false,
+          location: chunkLocation,
+          offset: BigInt(alignedOffset) as any,
+          limit: downloadLimit,
+          precise: true,
           cdnSupported: true,
         })
       );
-      console.log('[ChunkByOffset] API call SUCCESS, bytes length:', fileResult.bytes?.length);
     } catch (err: any) {
-      console.error('[ChunkByOffset] API call FAILED!');
-      console.error('[ChunkByOffset] Error:', err);
-      console.error('[ChunkByOffset] Error code:', err.errorCode);
-      console.error('[ChunkByOffset] Error message:', err.message);
-      console.error('[ChunkByOffset] Error type:', err.type);
+      console.error('[ChunkByOffset] GetFile failed — alignedOffset:', alignedOffset, 'limit:', downloadLimit, err?.message);
       throw err;
     }
 
-    if (!fileResult.bytes) {
-      throw new Error('No data returned');
+    if (!fileResult.bytes) throw new Error('No data returned');
+
+    let bytes = new Uint8Array(fileResult.bytes);
+
+    // If Telegram returned fewer bytes than downloadLimit AND file has more data,
+    // retry with 512KB alignment to fetch the full upload-part chunk
+    if (bytes.length < downloadLimit && fileSize !== undefined && alignedOffset + bytes.length < fileSize) {
+      const PART_SIZE = 524288;
+      const aligned512 = Math.floor(offset / PART_SIZE) * PART_SIZE;
+      const retryLimit = Math.min(PART_SIZE, fileSize - aligned512);
+      let retryResult: any;
+      try {
+        retryResult = await this.client.invoke(
+          new Api.upload.GetFile({
+            location: chunkLocation,
+            offset: BigInt(aligned512) as any,
+            limit: retryLimit,
+            precise: true,
+            cdnSupported: true,
+          })
+        );
+      } catch (err: any) {
+        console.error('[ChunkByOffset] Retry GetFile failed:', err?.message);
+        throw err;
+      }
+      if (retryResult?.bytes && retryResult.bytes.length > bytes.length) {
+        bytes = new Uint8Array(retryResult.bytes);
+        // Adjust prefix to start from original aligned offset
+        const adjustedPrefix = alignedOffset - aligned512;
+        const sliced2 = bytes.slice(adjustedPrefix + prefix, adjustedPrefix + prefix + limit);
+        return new Blob([sliced2], { type: 'video/mp4' });
+      }
     }
 
-    console.log('[ChunkByOffset] ===== END =====');
-    return new Blob([new Uint8Array(fileResult.bytes)], { type: 'video/mp4' });
+    // Discard prefix bytes so caller gets exactly offset..offset+limit
+    const sliced = bytes.slice(prefix, prefix + limit);
+    return new Blob([sliced], { type: 'video/mp4' });
   }
 
   /**

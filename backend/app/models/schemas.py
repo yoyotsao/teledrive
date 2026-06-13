@@ -52,6 +52,9 @@ class FileInfo(BaseModel):
     access_hash: Optional[str] = Field(None, description="File access hash for MTProto download")
     parent_id: Optional[str] = Field(None, description="Parent folder ID, if any")
     isDir: bool = Field(False, description="Is this item a directory?")
+    is_split_file: bool = Field(False, description="Whether this file is part of a split upload")
+    split_group_id: Optional[str] = Field(None, description="Group ID shared by all parts of a split file")
+    part_index: Optional[int] = Field(None, description="Zero-based index of this part within the split group")
 
 
 class UploadInitResponse(BaseModel):

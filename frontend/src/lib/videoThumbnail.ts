@@ -26,12 +26,12 @@ export async function generateVideoThumbnail(videoFile: File, seekTime: number =
     const videoUrl = URL.createObjectURL(videoFile);
 
     video.onloadedmetadata = () => {
-      // Set canvas size to video dimensions
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      // Scale down to max 320px wide to keep JPEG well under 256KB
+      const MAX_WIDTH = 320;
+      const ratio = Math.min(1, MAX_WIDTH / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * ratio);
+      canvas.height = Math.round(video.videoHeight * ratio);
 
-      // Seek to the specified time (default: 0 = first frame)
-      // Use 0.1s instead of 0 for more reliable keyframe
       video.currentTime = Math.min(seekTime || 0.1, video.duration);
     };
 

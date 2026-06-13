@@ -25,3 +25,6 @@ loguru>=0.7.2
 
 # Database
 aiosqlite>=0.20.0
+
+# WebSocket proxy (for HTTPS — browsers block ws:// from https:// pages)
+websockets>=12.0

@@ -21,7 +21,7 @@
     "axios": "^1.6.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "telegram": "^2.10.10"
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

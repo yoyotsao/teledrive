@@ -10,6 +10,7 @@ export const api = {
   listFiles: async (page: number = 1, pageSize: number = 50, parentId?: string): Promise<FileListResponse> => {
     const response = await client.get<FileListResponse>('/files', {
       params: { page, page_size: pageSize, parent_id: parentId },
+      timeout: 15000,
     });
     return response.data;
   },
@@ -17,6 +18,7 @@ export const api = {
   listFolders: async (parentId: string | null = null): Promise<FileListResponse> => {
     const response = await client.get<FileListResponse>('/folders', {
       params: { parent_id: parentId },
+      timeout: 15000,
     });
     return response.data;
   },

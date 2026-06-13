@@ -1,8 +1,12 @@
 const CACHE_NAME = 'teledrive-sw-v1';
 const VIDEO_PREVIEW_PATH = '/preview-video/';
+const SPLIT_PREVIEW_PATH = '/preview-video/split/';
 
 // Buffer preload state for next chunk while current plays
 let preloadState = null;
+
+// Split file parts cache (keyed by splitGroupId)
+const splitPartsCache = new Map();
 
 // Install event handler
 self.addEventListener('install', (_event) => {
@@ -16,54 +20,93 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-// Cleanup on SW uninstall (Phase 3.5)
-self.addEventListener('install', () => {
-  console.log('[ServiceWorker] Installing - cleanup on uninstall');
-});
-
-self.addEventListener('activate', () => {
-  console.log('[ServiceWorker] Activating - cleanup scheduled');
-});
-
 // Cleanup when SW is being replaced
 self.addEventListener('message', (event) => {
   if (event.data?.type === 'CLEANUP') {
     console.log('[ServiceWorker] Cleanup message received');
     preloadState = null;
+    splitPartsCache.clear();
   }
 });
 
+/**
+ * Request split file metadata (total size + parts) from main app
+ */
+function requestSplitMetadata(splitGroupId) {
+  return new Promise((resolve, reject) => {
+    const channel = new MessageChannel();
+    const timeout = setTimeout(() => {
+      channel.port1.close();
+      reject(new Error('Split metadata request timeout'));
+    }, 15000);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timeout);
+      channel.port1.close();
+      if (event.data?.error) reject(new Error(event.data.error));
+      else if (event.data?.metadata) resolve(event.data.metadata);
+      else reject(new Error('Invalid split metadata response'));
+    };
+    self.clients.matchAll().then((clients) => {
+      for (const client of clients) {
+        client.postMessage({ type: 'GET_SPLIT_METADATA', splitGroupId }, [channel.port2]);
+      }
+      if (clients.length === 0) {
+        clearTimeout(timeout);
+        channel.port1.close();
+        reject(new Error('No clients available'));
+      }
+    });
+  });
+}
+
+/**
+ * Find which part a global offset belongs to and return the part-relative offset
+ */
+function findPartForOffset(parts, globalOffset) {
+  for (const part of parts) {
+    if (globalOffset >= part.startOffset && globalOffset < part.startOffset + part.size) {
+      return { part, partOffset: globalOffset - part.startOffset };
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse Range header: bytes=start-end
+ */
 function parseRangeHeader(rangeHeader, totalSize) {
   if (!rangeHeader) {
     return { offset: 0, limit: 0, valid: false, error: 416 };
   }
-  // Handle formats: "bytes=0-1023" (specific end) and "bytes=0-" (no end specified)
+
   const rangeRegex = /^bytes=(\d+)-(\d*)$/;
   const match = rangeHeader.match(rangeRegex);
+
   if (!match) {
     return { offset: 0, limit: 0, valid: false, error: 416 };
   }
+
   const start = parseInt(match[1], 10);
-  const endStr = match[2];
-  
+  const end = match[2] ? parseInt(match[2], 10) : null;
+
   if (start >= totalSize) {
     return { offset: 0, limit: 0, valid: false, error: 416 };
   }
-  
+
   let offset;
   let limit;
-  
-  if (endStr && endStr.length > 0) {
-    // Specific end specified: "bytes=0-1023"
-    const end = parseInt(endStr, 10);
+
+  if (end !== null) {
     offset = start;
     limit = end - start + 1;
-  } else {
-    // No end specified: "bytes=0-" - get everything from start to end of file
+  } else if (match[2] === '') {
     offset = start;
     limit = totalSize - start;
+  } else {
+    offset = totalSize - start;
+    limit = start;
   }
-  
+
   return { offset, limit, valid: true };
 }
 
@@ -78,160 +121,88 @@ function getRangeHeader(request) {
 function parseVideoUrl(pathname) {
   const parts = pathname.replace(VIDEO_PREVIEW_PATH, '').split('/');
   if (parts.length >= 2 && parts[0] && parts[1]) {
-    return {
-      fileId: parts[0],
-      messageId: parts[1],
-    };
+    return { fileId: parts[0], messageId: parts[1] };
   }
   return null;
 }
 
 /**
- * Request file chunk from main app via postMessage
- * Includes retry logic with exponential backoff (1s, 2s, 4s)
+ * Request file chunk from main app via postMessage (with retry)
  */
-async function requestChunkFromApp(fileId, messageId, offset, limit) {
-  const MAX_RETRIES = 3;
-  const RETRY_DELAYS = [1000, 2000, 4000]; // Exponential backoff: 1s, 2s, 4s
-  
-  // Helper: Send request to main app via MessageChannel
-  function sendChunkRequest() {
-    return new Promise((resolve, reject) => {
-      const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const channel = new MessageChannel();
-      const timeout = setTimeout(() => {
-        channel.port1.close();
-        reject(new Error(`Chunk request timeout: offset=${offset}, limit=${limit}`));
-      }, 30000);
-
-      channel.port1.onmessage = (event) => {
-        clearTimeout(timeout);
-        channel.port1.close();
-        if (event.data?.error) {
-          reject(new Error(event.data.error));
-        } else if (event.data?.chunk) {
-          resolve(event.data.chunk);
-        } else {
-          reject(new Error('Invalid response from main app'));
-        }
-      };
-
-      self.clients.matchAll().then((clients) => {
-        for (const client of clients) {
-          client.postMessage({
-            type: 'GET_FILE_CHUNK',
-            requestId,
-            fileId,
-            messageId: parseInt(messageId, 10),
-            offset,
-            limit,
-          }, [channel.port2]);
-        }
-        if (clients.length === 0) {
-          clearTimeout(timeout);
-          channel.port1.close();
-          reject(new Error('No clients available - main app may not be running'));
-        }
-      });
-    });
-  }
-
-  // Helper: Check if Telegram needs reconnection
-  async function checkTelegramConnection() {
-    return new Promise((resolve) => {
-      const channel = new MessageChannel();
-      const requestId = `check_${Date.now()}`;
-      const timeout = setTimeout(() => {
-        channel.port1.close();
-        resolve(false); // Assume disconnected on timeout
-      }, 5000);
-
-      channel.port1.onmessage = (event) => {
-        clearTimeout(timeout);
-        channel.port1.close();
-        if (event.data?.type === 'CONNECTION_STATUS') {
-          resolve(event.data.connected === true);
-        } else {
-          resolve(false);
-        }
-      };
-
-      self.clients.matchAll().then((clients) => {
-        for (const client of clients) {
-          client.postMessage({
-            type: 'CHECK_CONNECTION',
-            requestId,
-          }, [channel.port2]);
-        }
-        if (clients.length === 0) {
-          clearTimeout(timeout);
-          channel.port1.close();
-          resolve(false);
-        }
-      });
-    });
-  }
-
-  // Retry loop with exponential backoff
+async function requestChunkFromApp(fileId, messageId, offset, limit, fileSize, retries = 3, baseDelay = 1000) {
   let lastError = null;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      console.log('[ServiceWorker] Chunk request attempt', attempt + 1, '/', MAX_RETRIES + 1);
-      
-      // If this is a retry (not first attempt), check connection first
-      if (attempt > 0) {
-        console.log(`[ServiceWorker] Retry attempt ${attempt}/${MAX_RETRIES} for chunk offset=${offset}, waiting ${RETRY_DELAYS[attempt - 1]}ms...`);
-        
-        // Wait with exponential backoff
-        await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt - 1]));
-        
-        // Check if Telegram needs reconnection
-        const isConnected = await checkTelegramConnection();
-        if (!isConnected) {
-          console.log('[ServiceWorker] Telegram disconnected, triggering reconnect...');
-          // Send reconnect request to main app
-          await new Promise((resolve) => {
-            const channel = new MessageChannel();
-            self.clients.matchAll().then((clients) => {
-              for (const client of clients) {
-                client.postMessage({ type: 'RECONNECT_TELEGRAM' }, [channel.port2]);
-              }
-              // Wait briefly for reconnect to happen
-              setTimeout(resolve, 2000);
-            });
-          });
-        }
+      return await requestChunkOnce(fileId, messageId, offset, limit, fileSize);
+    } catch (err) {
+      lastError = err;
+      if (err?.message?.includes('No clients available') || err?.message?.includes('main app may not be running')) {
+        throw err;
       }
-      
-      // Attempt to get chunk
-      const chunk = await sendChunkRequest();
-      if (attempt > 0) {
-        console.log(`[ServiceWorker] Retry successful on attempt ${attempt} for chunk offset=${offset}`);
-      }
-      return chunk;
-      
-    } catch (error) {
-      lastError = error;
-      console.log(`[ServiceWorker] Chunk request failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${error.message}`);
-      
-      // If this was the last attempt, throw the error
-      if (attempt >= MAX_RETRIES) {
-        throw new Error(`Chunk request failed after ${MAX_RETRIES + 1} attempts: ${error.message}`);
+      if (attempt < retries - 1) {
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.log(`[ServiceWorker] Chunk request failed, retrying in ${delay}ms (attempt ${attempt + 1}/${retries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
   }
-  
-  // Should never reach here, but just in case
-  throw lastError || new Error('Unknown error in chunk request');
+  throw lastError || new Error('Chunk request failed after retries');
+}
+
+/**
+ * Single attempt to request chunk from main app
+ */
+function requestChunkOnce(fileId, messageId, offset, limit, fileSize) {
+  return new Promise((resolve, reject) => {
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const channel = new MessageChannel();
+
+    const timeout = setTimeout(() => {
+      channel.port1.close();
+      reject(new Error(`Chunk request timeout: offset=${offset}, limit=${limit}`));
+    }, 30000);
+
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timeout);
+      channel.port1.close();
+      if (event.data?.error) {
+        reject(new Error(event.data.error));
+      } else if (event.data?.chunk) {
+        resolve(event.data.chunk);
+      } else {
+        reject(new Error('Invalid response from main app'));
+      }
+    };
+
+    self.clients.matchAll().then((clients) => {
+      for (const client of clients) {
+        client.postMessage({
+          type: 'GET_FILE_CHUNK',
+          requestId,
+          fileId,
+          messageId: parseInt(messageId, 10),
+          offset,
+          limit,
+          fileSize,
+        }, [channel.port2]);
+      }
+      if (clients.length === 0) {
+        clearTimeout(timeout);
+        channel.port1.close();
+        reject(new Error('No clients available - main app may not be running'));
+      }
+    });
+  });
 }
 
 /**
  * Get file metadata (size and mimeType) from main app
  */
-async function requestFileMetadata(fileId, messageId) {
+function requestFileMetadata(fileId, messageId) {
   return new Promise((resolve, reject) => {
     const requestId = `meta_${Date.now()}`;
     const channel = new MessageChannel();
+
     const timeout = setTimeout(() => {
       channel.port1.close();
       reject(new Error('Metadata request timeout'));
@@ -267,40 +238,23 @@ async function requestFileMetadata(fileId, messageId) {
   });
 }
 
-/**
- * Preload next chunk while current plays (Phase 3.4)
- */
 function preloadNextChunk(fileId, messageId, currentOffset, limit, fileSize) {
   const nextOffset = currentOffset + limit;
-  if (nextOffset >= fileSize) {
-    console.log('[ServiceWorker] Skipping preload - at end of file');
+  if (nextOffset >= fileSize) return;
+
+  if (preloadState?.inProgress &&
+      preloadState.fileId === fileId &&
+      preloadState.messageId === messageId &&
+      preloadState.offset === nextOffset) {
     return;
   }
 
-  if (preloadState?.inProgress && 
-      preloadState.fileId === fileId && 
-      preloadState.messageId === messageId &&
-      preloadState.offset === nextOffset) {
-    console.log('[ServiceWorker] Already preloading next chunk');
-    return;
-  }
-  
-  console.log('[ServiceWorker] Preloading next chunk, offset:', nextOffset);
-  
-  preloadState = {
-    fileId,
-    messageId,
-    offset: currentOffset + limit,
-    limit,
-    data: null,
-    inProgress: true,
-  };
-  
-  requestChunkFromApp(fileId, messageId, currentOffset + limit, limit)
+  preloadState = { fileId, messageId, offset: nextOffset, limit, data: null, inProgress: true };
+
+  requestChunkFromApp(fileId, messageId, nextOffset, limit, fileSize)
     .then((data) => {
       preloadState.data = data;
       preloadState.inProgress = false;
-      console.log('[ServiceWorker] Preloaded next chunk, size:', data.byteLength);
     })
     .catch((err) => {
       console.error('[ServiceWorker] Preload failed:', err);
@@ -308,16 +262,12 @@ function preloadNextChunk(fileId, messageId, currentOffset, limit, fileSize) {
     });
 }
 
-/**
- * Check if we have preloaded data for the requested range
- */
-function getPreloadedChunk(fileId, messageId, offset, limit) {
-  if (preloadState && 
-      preloadState.fileId === fileId && 
+function getPreloadedChunk(fileId, messageId, offset) {
+  if (preloadState &&
+      preloadState.fileId === fileId &&
       preloadState.messageId === messageId &&
       preloadState.offset === offset &&
       preloadState.data) {
-    console.log('[ServiceWorker] Using preloaded chunk, size:', preloadState.data.byteLength);
     const data = preloadState.data;
     preloadState = null;
     return data;
@@ -328,136 +278,220 @@ function getPreloadedChunk(fileId, messageId, offset, limit) {
 // Fetch event handler - intercept requests
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  console.log('[ServiceWorker] Fetch intercepted:', url.pathname, 'range:', event.request.headers.get('Range'));
 
-  // Only handle /preview-video/* routes - let others pass through
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - passing through:', url.pathname);
     return;
   }
 
-  // Phase 3: Parse fileId and messageId from URL
-  const urlParams = parseVideoUrl(url.pathname);
-  if (!urlParams) {
-    console.log('[ServiceWorker] Invalid URL format - returning 400');
-    event.respondWith(
-      new Response(null, {
-        status: 400,
-        statusText: 'Bad Request - URL should be /preview-video/{fileId}/{messageId}',
-      })
-    );
-    return;
-  }
+  // ── Split file streaming ───────────────────────────────────────────────
+  if (url.pathname.startsWith(SPLIT_PREVIEW_PATH)) {
+    const splitGroupId = url.pathname.slice(SPLIT_PREVIEW_PATH.length);
+    const rangeHeader = getRangeHeader(event.request);
 
-  console.log('[ServiceWorker] Parsed URL - fileId:', urlParams.fileId, 'messageId:', urlParams.messageId);
-
-  const rangeHeader = getRangeHeader(event.request);
-  console.log('[ServiceWorker] Range header:', rangeHeader);
-
-  if (!rangeHeader) {
-    console.log('[ServiceWorker] No Range header - returning 416');
-    event.respondWith(
-      new Response(null, {
-        status: 416,
-        statusText: 'Range Not Satisfiable',
-        headers: { 'Content-Range': 'bytes */0' },
-      })
-    );
-    return;
-  }
-
-  // Phase 3.2: Get file metadata to know actual size, then process Range
-  event.respondWith(
-    (async () => {
+    event.respondWith((async () => {
       try {
-        console.log('[ServiceWorker] Requesting file metadata...');
-        const metadata = await requestFileMetadata(urlParams.fileId, urlParams.messageId);
-        console.log('[ServiceWorker] Got metadata - size:', metadata.size, 'mimeType:', metadata.mimeType);
+        let entry = splitPartsCache.get(splitGroupId);
+        if (!entry) {
+          entry = await requestSplitMetadata(splitGroupId);
+          splitPartsCache.set(splitGroupId, entry);
+        }
+        const { totalSize, mimeType, parts } = entry;
 
-        const rawRange = parseRangeHeader(rangeHeader, metadata.size);
-
-        if (!rawRange.valid) {
-          console.log('[ServiceWorker] Invalid Range - returning 416');
+        if (!rangeHeader) {
           return new Response(null, {
             status: 416,
-            statusText: 'Range Not Satisfiable',
-            headers: { 'Content-Range': `bytes */${metadata.size}` },
+            headers: { 'Content-Range': `bytes */${totalSize}`, 'Accept-Ranges': 'bytes' },
+          });
+        }
+
+        const rawRange = parseRangeHeader(rangeHeader, totalSize);
+        if (!rawRange.valid) {
+          return new Response(null, {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${totalSize}` },
           });
         }
 
         const ALIGN = 4096;
         const MAX_CHUNK = 512 * 1024;
-        const available = metadata.size - rawRange.offset;
-        const boundedLimit = Math.min(rawRange.limit, available);
-        const maxBytes = Math.floor(Math.min(boundedLimit, MAX_CHUNK) / ALIGN) * ALIGN;
-        const limit = Math.max(Math.min(boundedLimit, maxBytes), ALIGN);
 
-        console.log('[ServiceWorker] Raw Range - offset:', rawRange.offset, 'limit:', rawRange.limit);
-        console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB)');
-
-        // Check preloaded chunk first (Phase 3.4 - buffer preload)
-        const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, limit);
-
-        let chunkData;
-
-        if (preloaded) {
-          console.log('[ServiceWorker] Using preloaded chunk');
-          chunkData = preloaded;
-        } else {
-          console.log('[ServiceWorker] Requesting chunk from main app... offset:', rawRange.offset, 'limit:', limit);
-          chunkData = await requestChunkFromApp(
-            urlParams.fileId,
-            urlParams.messageId,
-            rawRange.offset,
-            limit
-          );
-          console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
+        const found = findPartForOffset(parts, rawRange.offset);
+        if (!found) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${totalSize}` } });
         }
+        const { part, partOffset } = found;
 
-        // Preload next chunk while current plays (Phase 3.4)
-        preloadNextChunk(
-          urlParams.fileId,
-          urlParams.messageId,
-          rawRange.offset,
-          limit,
-          metadata.size
+        // Align partOffset DOWN to 4KB boundary (GramJS MTProto requirement)
+        const alignedPartOffset = Math.floor(partOffset / ALIGN) * ALIGN;
+        const sliceStart = partOffset - alignedPartOffset;
+
+        const available = Math.min(rawRange.limit, totalSize - rawRange.offset);
+        const rawLimit = Math.min(available, MAX_CHUNK);
+        // Extend limit to cover sliceStart + rawLimit, rounded up to 4KB, capped at part size
+        const adjustedLimit = Math.min(
+          Math.ceil((sliceStart + rawLimit) / ALIGN) * ALIGN,
+          part.size - alignedPartOffset
+        );
+        const effectiveLimit = Math.max(adjustedLimit, ALIGN);
+
+        const chunkData = await requestChunkFromApp(
+          splitGroupId,
+          String(part.messageId),
+          alignedPartOffset,
+          effectiveLimit,
+          part.size
         );
 
-        // Return HTTP 206 Partial Content
-        const responseEndByte = Math.min(rawRange.offset + rawRange.limit, metadata.size) - 1;
-        
-        // Trim the chunk if it was larger due to 4KB alignment
-        // The API might return more bytes than needed (e.g., request 512KB but get 516KB aligned)
-        let responseData = chunkData;
-        let contentLength = chunkData.byteLength;
-        
-        if (chunkData.byteLength > actualBytesNeeded) {
-          console.log('[ServiceWorker] Trimming aligned chunk from', chunkData.byteLength, 'to', actualBytesNeeded);
-          responseData = chunkData.slice(0, actualBytesNeeded);
-          contentLength = actualBytesNeeded;
+        preloadNextChunk(splitGroupId, String(part.messageId), alignedPartOffset, effectiveLimit, part.size);
+
+        // Slice to exactly the bytes the browser requested (RFC 7233 + 4KB alignment fix)
+        const sliceAvailable = Math.max(0, chunkData.byteLength - sliceStart);
+        const bytesNeeded = Math.min(rawRange.limit, sliceAvailable);
+        const responseData = bytesNeeded > 0
+          ? chunkData.slice(sliceStart, sliceStart + bytesNeeded)
+          : new ArrayBuffer(0);
+
+        // If no data available (upload incomplete / beyond EOF), return 416 so browser
+        // does not receive an invalid Content-Range (start > end) which crashes FFmpegDemuxer
+        if (responseData.byteLength === 0) {
+          return new Response(null, {
+            status: 416,
+            statusText: 'Range Not Satisfiable',
+            headers: { 'Content-Range': `bytes */${totalSize}`, 'Accept-Ranges': 'bytes' },
+          });
         }
-        
+
+        const responseEndByte = rawRange.offset + responseData.byteLength - 1;
         return new Response(responseData, {
           status: 206,
           statusText: 'Partial Content',
           headers: {
-            'Content-Type': metadata.mimeType || 'video/mp4',
-            'Content-Range': `bytes ${rawRange.offset}-${responseEndByte}/${metadata.size}`,
+            'Content-Type': mimeType || 'video/mp4',
+            'Content-Range': `bytes ${rawRange.offset}-${responseEndByte}/${totalSize}`,
             'Accept-Ranges': 'bytes',
-            'Content-Length': contentLength,
-            'Cache-Control': 'no-cache',
+            'Content-Length': String(responseData.byteLength),
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
           },
         });
       } catch (err) {
-        // Phase 3.3: Handle download errors gracefully
-        console.error('[ServiceWorker] Error:', err?.message || err);
-        const errorMessage = err?.message || 'Unknown error';
-        return new Response(JSON.stringify({ error: errorMessage }), {
+        console.error('[ServiceWorker] Split chunk error:', err?.message);
+        return new Response(JSON.stringify({ error: err?.message || 'Unknown error' }), {
           status: 503,
-          statusText: 'Service Unavailable',
           headers: { 'Content-Type': 'application/json' },
         });
       }
-    })()
-  );
+    })());
+    return;
+  }
+  // ── End split file streaming ───────────────────────────────────────────
+
+  // Single file streaming
+  const urlParams = parseVideoUrl(url.pathname);
+  if (!urlParams) {
+    event.respondWith(new Response(null, { status: 400, statusText: 'Bad Request' }));
+    return;
+  }
+
+  const rangeHeader = getRangeHeader(event.request);
+  if (!rangeHeader) {
+    event.respondWith(new Response(null, {
+      status: 416,
+      statusText: 'Range Not Satisfiable',
+      headers: { 'Content-Range': 'bytes */0' },
+    }));
+    return;
+  }
+
+  event.respondWith((async () => {
+    try {
+      const metadata = await requestFileMetadata(urlParams.fileId, urlParams.messageId);
+      const rawRange = parseRangeHeader(rangeHeader, metadata.size);
+
+      if (!rawRange.valid) {
+        return new Response(null, {
+          status: 416,
+          statusText: 'Range Not Satisfiable',
+          headers: { 'Content-Range': `bytes */${metadata.size}` },
+        });
+      }
+
+      const ALIGN = 4096;
+      const MAX_CHUNK = 512 * 1024;
+
+      // Align offset DOWN to 4KB boundary (GramJS MTProto requirement)
+      const alignedOffset = Math.floor(rawRange.offset / ALIGN) * ALIGN;
+      const sliceStart = rawRange.offset - alignedOffset;
+
+      const available = Math.min(rawRange.limit, metadata.size - rawRange.offset);
+      const rawLimit = Math.min(available, MAX_CHUNK);
+      // Extend limit to cover sliceStart + rawLimit, rounded up to 4KB, capped at file size
+      const adjustedLimit = Math.min(
+        Math.ceil((sliceStart + rawLimit) / ALIGN) * ALIGN,
+        metadata.size - alignedOffset
+      );
+      const limit = Math.max(adjustedLimit, ALIGN);
+
+      const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, alignedOffset);
+      let chunkData;
+
+      if (preloaded) {
+        chunkData = preloaded;
+      } else {
+        chunkData = await requestChunkFromApp(
+          urlParams.fileId,
+          urlParams.messageId,
+          alignedOffset,
+          limit,
+          metadata.size
+        );
+      }
+
+      preloadNextChunk(urlParams.fileId, urlParams.messageId, alignedOffset, limit, metadata.size);
+
+      // Slice to exactly the bytes the browser requested (RFC 7233 + 4KB alignment fix)
+      const sliceAvailable = Math.max(0, chunkData.byteLength - sliceStart);
+      const bytesNeeded = Math.min(rawRange.limit, sliceAvailable);
+      const responseData = bytesNeeded > 0
+        ? chunkData.slice(sliceStart, sliceStart + bytesNeeded)
+        : new ArrayBuffer(0);
+
+      // If no data available (upload incomplete / beyond EOF), return 416
+      if (responseData.byteLength === 0) {
+        return new Response(null, {
+          status: 416,
+          statusText: 'Range Not Satisfiable',
+          headers: { 'Content-Range': `bytes */${metadata.size}`, 'Accept-Ranges': 'bytes' },
+        });
+      }
+
+      const responseEndByte = rawRange.offset + responseData.byteLength - 1;
+      return new Response(responseData, {
+        status: 206,
+        statusText: 'Partial Content',
+        headers: {
+          'Content-Type': metadata.mimeType || 'video/mp4',
+          'Content-Range': `bytes ${rawRange.offset}-${responseEndByte}/${metadata.size}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(responseData.byteLength),
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        },
+      });
+    } catch (err) {
+      console.error('[ServiceWorker] Error:', err?.message || err);
+      const errorMessage = err?.message || 'Unknown error';
+      let message = errorMessage;
+      if (errorMessage.includes('not connected') || errorMessage.includes('client not connected')) {
+        message = 'Telegram client disconnected. Please refresh the page and reconnect.';
+      } else if (errorMessage.includes('No clients available')) {
+        message = 'Main application not running. Please refresh the page.';
+      } else if (errorMessage.includes('timeout')) {
+        message = 'Request timed out. Please check your connection and refresh.';
+      }
+      return new Response(JSON.stringify({ error: message }), {
+        status: 503,
+        statusText: 'Service Unavailable',
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  })());
 });

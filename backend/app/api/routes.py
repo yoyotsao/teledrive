@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
+from pathlib import Path
 
 from app.models.schemas import FileListResponse, FileInfo, FileType
 from app.services import get_file_service, get_bot_service
@@ -14,6 +15,9 @@ import asyncio
 import subprocess
 import shutil
 import base64
+
+THUMBNAILS_DIR = Path("thumbnails")
+THUMBNAILS_DIR.mkdir(exist_ok=True)
 
 
 def find_ffmpeg() -> Optional[str]:
@@ -162,7 +166,7 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
 @router.get("/files", response_model=FileListResponse)
 async def list_files(
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=100),
+    page_size: int = Query(50, ge=1, le=10000),
     parent_id: Optional[str] = Query(None),
     split_group_id: Optional[str] = Query(None, description="Filter files by split group ID")
 ):
@@ -206,20 +210,36 @@ async def delete_file(file_id: str):
     try:
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id)
-        
+
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
-        
-        await file_service.delete_file(file_id)
-        
-        if file_info.telegram_message_id:
+
+        # For split files, collect all parts so we can delete their Telegram messages too.
+        # The UI only passes part_index=0's file_id, so we must look up siblings here.
+        all_parts = []
+        if file_info.is_split_file and file_info.split_group_id:
+            db = await file_service._get_db()
+            all_parts = await db.get_files_by_split_group(file_info.split_group_id)
+        else:
+            all_parts = [{"file_id": file_id, "telegram_message_id": file_info.telegram_message_id}]
+
+        # Delete all DB records
+        for part in all_parts:
+            await file_service.delete_file(part["file_id"])
+
+        # Delete Telegram messages (best-effort — don't fail the whole request on Telegram error)
+        message_ids = [p["telegram_message_id"] for p in all_parts if p.get("telegram_message_id")]
+        if message_ids:
             try:
                 bot_service = await get_bot_service()
-                await bot_service.delete_file(file_info.telegram_message_id)
-            except Exception:
-                pass
-        
-        return {"message": "File deleted", "file_id": file_id}
+                for mid in message_ids:
+                    await bot_service.delete_file(mid)
+            except Exception as e:
+                logger.warning(f"Telegram message delete failed (non-fatal): {e}")
+
+        deleted_count = len(all_parts)
+        logger.info(f"Deleted file {file_id} and {deleted_count} part(s)")
+        return {"message": "File deleted", "file_id": file_id, "parts_deleted": deleted_count}
     except HTTPException:
         raise
     except Exception as e:
@@ -297,44 +317,46 @@ async def get_download_info(file_id: str):
 @router.get("/files/{file_id}/thumbnail")
 async def get_file_thumbnail(file_id: str):
     """
-    Get thumbnail for image/video files from Telegram.
-    Returns base64 encoded thumbnail image.
-    
-    Priority: thumbnail_message_id > telegram_message_id (for backward compatibility)
+    Get thumbnail for image/video files.
+    Checks disk cache first; downloads from Telegram on cache miss.
     """
-    from loguru import logger
+    from fastapi.responses import FileResponse, Response
     try:
+        cache_path = THUMBNAILS_DIR / f"{file_id}.jpg"
+        if cache_path.exists():
+            return FileResponse(str(cache_path), media_type="image/jpeg")
+
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id)
-        
+
         if not file_info:
-            logger.error(f"Thumbnail: File not found: {file_id}")
             raise HTTPException(status_code=404, detail="File not found")
-        
-        message_id = file_info.thumbnail_message_id or file_info.telegram_message_id
-        if not message_id:
-            logger.error(f"Thumbnail: No message ID for: {file_id}")
-            raise HTTPException(status_code=400, detail="No Telegram message ID")
-        
-        mtproto_service = await get_bot_service()
-        
+
         mime_type = file_info.mime_type or ""
         if not (mime_type.startswith('image/') or mime_type.startswith('video/')):
-            logger.error(f"Thumbnail: Not image/video: {mime_type}")
             raise HTTPException(status_code=400, detail="Not an image or video file")
-        
-        logger.info(f"Getting thumbnail for message {message_id} (thumb_id={file_info.thumbnail_message_id}, file_id={file_info.telegram_message_id})")
-        thumbnail_data = await mtproto_service.get_thumbnail(message_id)
-        
-        if not thumbnail_data:
-            logger.error(f"Thumbnail: No data returned for message {message_id}")
+
+        # For videos: only use dedicated thumbnail_message_id — never fall back to
+        # telegram_message_id because that points to the video document itself (500MB+).
+        # For images: telegram_message_id IS the image, so fallback is safe.
+        is_video = mime_type.startswith('video/')
+        message_id = file_info.thumbnail_message_id
+        if not message_id and not is_video:
+            message_id = file_info.telegram_message_id
+        if not message_id:
             raise HTTPException(status_code=404, detail="No thumbnail available")
-        
-        logger.info(f"Thumbnail retrieved: {len(thumbnail_data)} chars")
-        return {
-            "thumbnail": thumbnail_data,
-            "mime_type": "image/jpeg"
-        }
+
+        mtproto_service = await get_bot_service()
+        logger.info(f"Thumbnail cache miss for {file_id}, fetching message {message_id}")
+        thumbnail_data = await mtproto_service.get_thumbnail(message_id)
+
+        if not thumbnail_data:
+            raise HTTPException(status_code=404, detail="No thumbnail available")
+
+        img_bytes = base64.b64decode(thumbnail_data)
+        cache_path.write_bytes(img_bytes)
+        logger.info(f"Thumbnail cached: {cache_path}")
+        return Response(content=img_bytes, media_type="image/jpeg")
     except HTTPException:
         raise
     except Exception as e:
@@ -557,6 +579,56 @@ async def delete_folder(folder_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.websocket("/ws-proxy")
+async def websocket_proxy(websocket: WebSocket, host: str, port: int = 80):
+    """
+    Proxy WebSocket connections to Telegram servers.
+    Required when the app is served over HTTPS — browsers block ws:// from https:// pages.
+    The browser connects here via wss:// (valid SSL via Cloudflare), we forward to Telegram
+    via plain ws://.
+    """
+    import websockets as ws_lib
+
+    # Echo back any requested subprotocol — required by WebSocket spec.
+    # GramJS sends a non-empty Sec-WebSocket-Protocol; without echoing it the browser drops the connection.
+    subprotocol_header = websocket.headers.get("sec-websocket-protocol")
+    chosen_subprotocol = subprotocol_header.split(",")[0].strip() if subprotocol_header else None
+    await websocket.accept(subprotocol=chosen_subprotocol)
+
+    telegram_url = f"ws://{host}:{port}/apiws"
+    logger.info(f"WS proxy: {websocket.client} → {telegram_url} (subprotocol={chosen_subprotocol})")
+
+    tg_subprotocols = [chosen_subprotocol] if chosen_subprotocol else None
+    try:
+        async with ws_lib.connect(telegram_url, max_size=2**24, subprotocols=tg_subprotocols) as tg:
+            async def browser_to_telegram():
+                try:
+                    while True:
+                        data = await websocket.receive_bytes()
+                        await tg.send(data)
+                except (WebSocketDisconnect, Exception):
+                    pass
+
+            async def telegram_to_browser():
+                try:
+                    async for message in tg:
+                        if isinstance(message, bytes):
+                            await websocket.send_bytes(message)
+                        else:
+                            await websocket.send_text(message)
+                except Exception:
+                    pass
+
+            await asyncio.gather(browser_to_telegram(), telegram_to_browser())
+    except Exception as e:
+        logger.warning(f"WS proxy closed: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @router.get("/files/by-split-group/{split_group_id}", response_model=FileListResponse)
 async def get_files_by_split_group(split_group_id: str):
     """
@@ -570,27 +642,9 @@ async def get_files_by_split_group(split_group_id: str):
         if not rows:
             raise HTTPException(status_code=404, detail="No files found for this split group")
         
-        # Convert to FileInfo objects
-        files = []
-        for row in rows:
-            file_info = FileInfo(
-                file_id=row['file_id'],
-                filename=row['filename'],
-                filesize=row['filesize'],
-                mime_type=row['mime_type'],
-                file_type=FileType(row['file_type']),
-                telegram_message_id=row['telegram_message_id'],
-                thumbnail_message_id=row['thumbnail_message_id'],
-                created_at=datetime.fromisoformat(row['created_at']) if isinstance(row['created_at'], str) else row['created_at'],
-                direct_url=row.get('direct_url'),
-                access_hash=row.get('access_hash'),
-                parent_id=row.get('parent_id'),
-                isDir=bool(row['isDir']) if row.get('isDir') is not None else False
-            )
-            files.append(file_info)
-        
-        # Sort by part_index
-        files.sort(key=lambda f: getattr(f, 'part_index', 0) or 0)
+        file_service = get_file_service()
+        files = [file_service._row_to_file_info(row) for row in rows]
+        files.sort(key=lambda f: f.part_index or 0)
         
         return FileListResponse(
             files=files,

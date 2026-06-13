@@ -5,18 +5,36 @@ declare const self: ServiceWorkerGlobalScope;
 // Cache name for future use (Phase 2+)
 const CACHE_NAME = 'teledrive-sw-v1';
 const VIDEO_PREVIEW_PATH = '/preview-video/';
+const SPLIT_PREVIEW_PATH = '/preview-video/split/';
 
-// Buffer preload state for next chunk while current plays
-interface PreloadState {
-  fileId: string;
-  messageId: string;
-  offset: number;
-  limit: number;
+// Rolling lookahead buffer — preloads PRELOAD_AHEAD chunks concurrently so the
+// video element never stalls waiting for the next chunk to download.
+const PRELOAD_AHEAD = 3; // 3 × 512 KB = 1.5 MB rolling buffer
+
+interface PreloadEntry {
   data: ArrayBuffer | null;
   inProgress: boolean;
 }
 
-let preloadState: PreloadState | null = null;
+// key = `${fileId}:${messageId}:${offset}`
+const preloadCache = new Map<string, PreloadEntry>();
+
+function preloadKey(fileId: string, messageId: string, offset: number): string {
+  return `${fileId}:${messageId}:${offset}`;
+}
+
+// Split file parts cache (keyed by splitGroupId)
+interface SplitPartInfo {
+  messageId: number;
+  size: number;
+  startOffset: number;
+}
+interface SplitCacheEntry {
+  totalSize: number;
+  mimeType: string;
+  parts: SplitPartInfo[];
+}
+const splitPartsCache = new Map<string, SplitCacheEntry>();
 
 // Install event handler
 self.addEventListener('install', (_event: ExtendableEvent) => {
@@ -43,10 +61,52 @@ self.addEventListener('activate', () => {
 self.addEventListener('message', (event) => {
   if (event.data?.type === 'CLEANUP') {
     console.log('[ServiceWorker] Cleanup message received');
-    // Clear preload state
-    preloadState = null;
+    preloadCache.clear();
+    splitPartsCache.clear();
   }
 });
+
+/**
+ * Request split file metadata (total size + parts) from main app
+ */
+function requestSplitMetadata(splitGroupId: string): Promise<SplitCacheEntry> {
+  return new Promise((resolve, reject) => {
+    const channel = new MessageChannel();
+    const timeout = setTimeout(() => {
+      channel.port1.close();
+      reject(new Error('Split metadata request timeout'));
+    }, 15000);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timeout);
+      channel.port1.close();
+      if (event.data?.error) reject(new Error(event.data.error));
+      else if (event.data?.metadata) resolve(event.data.metadata as SplitCacheEntry);
+      else reject(new Error('Invalid split metadata response'));
+    };
+    self.clients.matchAll().then((clients) => {
+      for (const client of clients) {
+        client.postMessage({ type: 'GET_SPLIT_METADATA', splitGroupId }, [channel.port2]);
+      }
+      if (clients.length === 0) {
+        clearTimeout(timeout);
+        channel.port1.close();
+        reject(new Error('No clients available'));
+      }
+    });
+  });
+}
+
+/**
+ * Find which part a global offset belongs to and return the part-relative offset
+ */
+function findPartForOffset(parts: SplitPartInfo[], globalOffset: number): { part: SplitPartInfo; partOffset: number } | null {
+  for (const part of parts) {
+    if (globalOffset >= part.startOffset && globalOffset < part.startOffset + part.size) {
+      return { part, partOffset: globalOffset - part.startOffset };
+    }
+  }
+  return null;
+}
 
 // Range header parsing result
 interface RangeResult {
@@ -269,63 +329,59 @@ async function requestFileMetadata(fileId: string, messageId: string): Promise<{
   });
 }
 
-function preloadNextChunk(
+/**
+ * Kick off parallel preloads for the next PRELOAD_AHEAD chunks after currentOffset.
+ * Already-cached or in-progress offsets are skipped.
+ * Evicts entries that are behind currentOffset or beyond the lookahead window.
+ */
+function preloadAhead(
   fileId: string,
   messageId: string,
   currentOffset: number,
-  limit: number,
+  chunkSize: number,
   fileSize: number
 ): void {
-  const nextOffset = currentOffset + limit;
-  if (nextOffset >= fileSize) {
-    console.log('[ServiceWorker] Skipping preload - at end of file');
-    return;
+  // Evict stale entries (behind current position or beyond window)
+  const maxAheadOffset = currentOffset + (PRELOAD_AHEAD + 1) * chunkSize;
+  for (const key of preloadCache.keys()) {
+    const parts = key.split(':');
+    const entryOffset = parseInt(parts[2], 10);
+    if (entryOffset < currentOffset || entryOffset > maxAheadOffset) {
+      preloadCache.delete(key);
+    }
   }
 
-  if (preloadState?.inProgress && 
-      preloadState.fileId === fileId && 
-      preloadState.messageId === messageId &&
-      preloadState.offset === nextOffset) {
-    console.log('[ServiceWorker] Already preloading next chunk');
-    return;
+  // Schedule PRELOAD_AHEAD chunks ahead
+  for (let i = 1; i <= PRELOAD_AHEAD; i++) {
+    const nextOffset = currentOffset + i * chunkSize;
+    if (nextOffset >= fileSize) break;
+
+    const key = preloadKey(fileId, messageId, nextOffset);
+    if (preloadCache.has(key)) continue;
+
+    const entry: PreloadEntry = { data: null, inProgress: true };
+    preloadCache.set(key, entry);
+
+    requestChunkFromApp(fileId, messageId, nextOffset, chunkSize, fileSize)
+      .then((data) => {
+        const e = preloadCache.get(key);
+        if (e) { e.data = data; e.inProgress = false; }
+      })
+      .catch(() => {
+        preloadCache.delete(key); // will be retried on next request
+      });
   }
-  
-  console.log('[ServiceWorker] Preloading next chunk, offset:', nextOffset);
-  
-  preloadState = {
-    fileId,
-    messageId,
-    offset: nextOffset,
-    limit,
-    data: null,
-    inProgress: true,
-  };
-  
-  requestChunkFromApp(fileId, messageId, nextOffset, limit, fileSize)
-    .then((data) => {
-      preloadState!.data = data;
-      preloadState!.inProgress = false;
-      console.log('[ServiceWorker] Preloaded next chunk, size:', data.byteLength);
-    })
-    .catch((err) => {
-      console.error('[ServiceWorker] Preload failed:', err);
-      preloadState!.inProgress = false;
-    });
 }
 
 /**
- * Check if we have preloaded data for the requested range
+ * Return and evict a preloaded chunk if ready, or null if still downloading.
  */
-function getPreloadedChunk(fileId: string, messageId: string, offset: number, _limit: number): ArrayBuffer | null {
-  if (preloadState && 
-      preloadState.fileId === fileId && 
-      preloadState.messageId === messageId &&
-      preloadState.offset === offset &&
-      preloadState.data) {
-    console.log('[ServiceWorker] Using preloaded chunk, size:', preloadState.data.byteLength);
-    const data = preloadState.data;
-    preloadState = null; // Clear after use
-    return data;
+function consumePreloadedChunk(fileId: string, messageId: string, offset: number): ArrayBuffer | null {
+  const key = preloadKey(fileId, messageId, offset);
+  const entry = preloadCache.get(key);
+  if (entry?.data) {
+    preloadCache.delete(key);
+    return entry.data;
   }
   return null;
 }
@@ -340,6 +396,89 @@ self.addEventListener('fetch', (event: FetchEvent) => {
     console.log('[ServiceWorker] Non-video route - passing through:', url.pathname);
     return;
   }
+
+  // ── Split file streaming ───────────────────────────────────────────────
+  if (url.pathname.startsWith(SPLIT_PREVIEW_PATH)) {
+    const splitGroupId = url.pathname.slice(SPLIT_PREVIEW_PATH.length);
+    const rangeHeader = getRangeHeader(event.request);
+
+    event.respondWith((async () => {
+      try {
+        // Get (or fetch) parts metadata
+        let entry = splitPartsCache.get(splitGroupId);
+        if (!entry) {
+          entry = await requestSplitMetadata(splitGroupId);
+          splitPartsCache.set(splitGroupId, entry);
+        }
+        const { totalSize, mimeType, parts } = entry;
+
+        if (!rangeHeader) {
+          return new Response(null, {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${totalSize}`, 'Accept-Ranges': 'bytes' },
+          });
+        }
+
+        const rawRange = parseRangeHeader(rangeHeader, totalSize);
+        if (!rawRange.valid) {
+          return new Response(null, {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${totalSize}` },
+          });
+        }
+
+        // Align limit to 4KB, cap at 512KB
+        const ALIGN = 4096;
+        const MAX_CHUNK = 512 * 1024;
+        const available = totalSize - rawRange.offset;
+        const boundedLimit = Math.min(rawRange.limit, available);
+        const limit = Math.max(Math.floor(Math.min(boundedLimit, MAX_CHUNK) / ALIGN) * ALIGN, ALIGN);
+
+        // Find which part owns this offset
+        const found = findPartForOffset(parts, rawRange.offset);
+        if (!found) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${totalSize}` } });
+        }
+        const { part, partOffset } = found;
+
+        // Clip limit to stay within the current part (browser will request next part separately)
+        const bytesLeftInPart = part.size - partOffset;
+        const effectiveLimit = Math.min(limit, bytesLeftInPart);
+
+        const chunkData = await requestChunkFromApp(
+          splitGroupId,
+          String(part.messageId),
+          partOffset,
+          effectiveLimit,
+          part.size
+        );
+
+        // Preload next PRELOAD_AHEAD chunks within the same part
+        preloadAhead(splitGroupId, String(part.messageId), partOffset, effectiveLimit, part.size);
+
+        const responseEndByte = rawRange.offset + chunkData.byteLength - 1;
+        return new Response(chunkData, {
+          status: 206,
+          statusText: 'Partial Content',
+          headers: {
+            'Content-Type': mimeType || 'video/mp4',
+            'Content-Range': `bytes ${rawRange.offset}-${responseEndByte}/${totalSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(chunkData.byteLength),
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
+          },
+        });
+      } catch (err: any) {
+        console.error('[ServiceWorker] Split chunk error:', err?.message);
+        return new Response(JSON.stringify({ error: err?.message || 'Unknown error' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    })());
+    return;
+  }
+  // ── End split file streaming ───────────────────────────────────────────
 
   // Phase 3: Parse fileId and messageId from URL
   const urlParams = parseVideoUrl(url.pathname);
@@ -410,11 +549,11 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         console.log('[ServiceWorker] File size:', metadata.size, 'Available:', available);
         console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB, capped at 512KB)');
 
-        // Check preloaded chunk first (Phase 3.4 - buffer preload)
-        const preloaded = getPreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset, limit);
-        
+        // Serve from lookahead buffer if already downloaded, else fetch now
+        const preloaded = consumePreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset);
+
         let chunkData: ArrayBuffer;
-        
+
         if (preloaded) {
           console.log('[ServiceWorker] Using preloaded chunk');
           chunkData = preloaded;
@@ -430,16 +569,10 @@ self.addEventListener('fetch', (event: FetchEvent) => {
           console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
         }
 
-        // Preload next chunk while current plays
-        preloadNextChunk(
-          urlParams.fileId,
-          urlParams.messageId,
-          rawRange.offset,
-          limit,
-          metadata.size
-        );
+        // Immediately kick off preloading the next PRELOAD_AHEAD chunks in parallel
+        preloadAhead(urlParams.fileId, urlParams.messageId, rawRange.offset, limit, metadata.size);
 
-        const responseEndByte = Math.min(rawRange.offset + limit, metadata.size) - 1;
+        const responseEndByte = rawRange.offset + chunkData.byteLength - 1;
         
         return new Response(chunkData, {
           status: 206,

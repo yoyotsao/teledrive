@@ -332,28 +332,10 @@ class TelegramMTProtoService:
                 
                 doc = getattr(media, 'document', None)
                 if doc:
-                    logger.info(f"Thumbnail: Found document, mime_type = {getattr(doc, 'mime_type', None)}")
-                    # First, try to get the document's thumbnail (for videos)
+                    doc_mime = getattr(doc, 'mime_type', '') or ''
+                    logger.info(f"Thumbnail: Found document, mime_type = {doc_mime}")
+                    # Try embedded thumbnail first (set on videos that have one)
                     thumb = getattr(doc, 'thumb', None)
-                    logger.info(f"Thumbnail: doc.thumb = {thumb}")
-                    if thumb:
-                        loc = getattr(thumb, 'location', None)
-                        if loc:
-                            result = await client(GetFileRequest(
-                                location=loc,
-                                offset=0,
-                                limit=256 * 1024
-                            ))
-                            if hasattr(result, 'bytes') and result.bytes:
-                                return base64.b64encode(bytes(result.bytes)).decode()
-                
-                # Check if it's a document (could be an image file or video with thumbnail)
-                doc = getattr(media, 'document', None)
-                if doc:
-                    logger.info(f"Thumbnail: Found document, mime_type = {getattr(doc, 'mime_type', None)}")
-                    # First, try to get the document's thumbnail (for videos)
-                    thumb = getattr(doc, 'thumb', None)
-                    logger.info(f"Thumbnail: doc.thumb = {thumb}")
                     if thumb:
                         loc = getattr(thumb, 'location', None)
                         if loc:
@@ -364,25 +346,20 @@ class TelegramMTProtoService:
                             ))
                             if hasattr(result, 'bytes') and result.bytes:
                                 return base64.b64encode(bytes(result.bytes)).decode()
-                    
-                    # If no thumbnail, try to download the document itself
-                    # This handles cases where the thumbnail was uploaded as a file (application/octet-stream)
-                    logger.info(f"Thumbnail: No thumb on document, trying to download full document")
-                    file_ref = getattr(doc, 'file_reference', b'') or b''
-                    input_loc = InputDocumentFileLocation(
-                        id=doc.id,
-                        access_hash=getattr(doc, 'access_hash', 0) or 0,
-                        file_reference=file_ref,
-                        thumb_size=''
-                    )
-                    result = await client(GetFileRequest(
-                        location=input_loc,
-                        offset=0,
-                        limit=256 * 1024
-                    ))
-                    if hasattr(result, 'bytes') and result.bytes:
-                        logger.info(f"Thumbnail: Got {len(result.bytes)} bytes from document")
-                        return base64.b64encode(bytes(result.bytes)).decode()
+
+                    # For image documents with no embedded thumbnail, download the full document.
+                    # Never download video documents — they can be hundreds of MB.
+                    if doc_mime.startswith('image/'):
+                        logger.info(f"Thumbnail: Downloading image document ({doc_mime})")
+                        import io
+                        buf = io.BytesIO()
+                        await client.download_media(message, file=buf)
+                        doc_bytes = buf.getvalue()
+                        if doc_bytes:
+                            logger.info(f"Thumbnail: Got {len(doc_bytes)} bytes from image document")
+                            return base64.b64encode(doc_bytes).decode()
+                    else:
+                        logger.warning(f"Thumbnail: Skipping download_media for non-image document ({doc_mime})")
             
             logger.warning(f"Thumbnail: No thumbnail data found for message {message_id}")
             return None

@@ -4,6 +4,8 @@ import { api, generateThumbnail } from '../api/client';
 import { getTelegramClient } from '../lib/gramjs';
 import { generateVideoThumbnail } from '../lib/videoThumbnail';
 import { FileInfo } from '../types';
+import { Semaphore } from '../lib/semaphore';
+import { MAX_UPLOAD_CONCURRENCY } from '../config';
 
 
 function formatFileSize(bytes: number): string {
@@ -35,113 +37,88 @@ export function ChonkyDrive() {
 
   const dragCounterRef = useRef(0);
   const isDraggingRef = useRef(false); // Track external file drag for upload
+  const pendingThumbsRef = useRef<Set<string>>(new Set());
+  const thumbnailAbortRef = useRef<AbortController | null>(null);
+
+  const PAGE_SIZE = 200;
+  const currentPageRef = useRef(1);
+  const hasMoreRef = useRef(false);
+  const isLoadingMoreRef = useRef(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const sentinelRef = useRef<HTMLDivElement>(null);
   const [uploadingFiles, setUploadingFiles] = useState<
     Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>
   >([]);
+  const [uploadTotals, setUploadTotals] = useState<{ total: number; done: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
-  const loadThumbnails = useCallback(async (files: FileInfo[]) => {
+  const loadThumbnails = useCallback(async (files: FileInfo[], signal?: AbortSignal) => {
     const imageOrVideoFiles = files.filter(
       (f) => f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/')
     );
-    
-    // Get Telegram client
-    let telegramClient: ReturnType<typeof getTelegramClient>;
-    try {
-      telegramClient = getTelegramClient();
-      if (!telegramClient.isConnected()) {
-        console.log('[Thumb] Telegram client not connected, skipping thumbnails');
-        return;
-      }
-    } catch (err) {
-      console.log('[Thumb] Telegram client not available:', err);
-      return;
-    }
-    
+
     for (const file of imageOrVideoFiles) {
-      if (!thumbnails[file.file_id]) {
-        // Try to load thumbnail from Telegram
-        try {
-          console.log(`[Thumb] Loading thumbnail for ${file.filename} (file_id=${file.file_id}, type=${file.file_type})...`);
-          
-          let thumbUrl: string | null = null;
-          
-          // For videos: use thumbnail_message_id if available
-          if (file.file_type === 'video') {
-            const thumbMsgId = (file as any).thumbnail_message_id;
-            if (thumbMsgId) {
-              const thumbBlob = await telegramClient.downloadThumbnail(thumbMsgId);
-              const arrayBuf = await thumbBlob.arrayBuffer();
-              const firstBytes = arrayBuf.byteLength > 0 ? Array.from(new Uint8Array(arrayBuf.slice(0, 16))).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'empty';
-              console.log(`[Thumb] Video thumb blob size=${thumbBlob.size}, type=${thumbBlob.type}, firstBytes=${firstBytes}`);
-              thumbUrl = URL.createObjectURL(thumbBlob);
-              console.log(`[Thumb] Downloaded video thumbnail for ${file.filename}:`, thumbUrl);
-            } else {
-              console.log(`[Thumb] No thumbnail_message_id for video ${file.filename}`);
-            }
-          } 
-          // For photos (images): use the original file as thumbnail
-          else if (file.file_type === 'photo' || file.mime_type?.startsWith('image/')) {
-            const msgId = (file as any).telegram_message_id;
-            if (msgId) {
-              const mimeType = file.mime_type || 'image/jpeg';
-              const thumbBlob = await telegramClient.downloadFile(msgId, mimeType);
-              const arrayBuf = await thumbBlob.arrayBuffer();
-              const firstBytes = arrayBuf.byteLength > 0 ? Array.from(new Uint8Array(arrayBuf.slice(0, 16))).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'empty';
-              console.log(`[Thumb] Image thumb blob size=${thumbBlob.size}, type=${thumbBlob.type}, firstBytes=${firstBytes}`);
-              thumbUrl = URL.createObjectURL(thumbBlob);
-              console.log(`[Thumb] Downloaded image thumbnail for ${file.filename}:`, thumbUrl);
-            }
-          }
-          
-          if (thumbUrl) {
-            console.log(`[Thumb] Setting thumbnail state for ${file.file_id}, total thumbnails: ${Object.keys(thumbnails).length + 1}`);
-            setThumbnails((prev) => {
-              const newState = { ...prev, [file.file_id]: thumbUrl };
-              console.log(`[Thumb] New thumbnails state keys: ${Object.keys(newState).join(',')}`);
-              return newState;
-            });
-          }
-        } catch (err: any) {
-          console.log(`[Thumb] Error for ${file.filename}:`, err?.response?.data || err.message);
+      if (signal?.aborted) break;
+      if (pendingThumbsRef.current.has(file.file_id)) continue;
+      pendingThumbsRef.current.add(file.file_id);
+
+      // Per-fetch AbortController combining parent signal + 15-second timeout
+      const fetchAbort = new AbortController();
+      const timer = setTimeout(() => fetchAbort.abort(), 15000);
+      const onParentAbort = () => fetchAbort.abort();
+      signal?.addEventListener('abort', onParentAbort);
+
+      try {
+        const resp = await fetch(`/api/v1/files/${file.file_id}/thumbnail`, {
+          signal: fetchAbort.signal,
+        });
+        if (!resp.ok) {
+          pendingThumbsRef.current.delete(file.file_id);
+          continue;
         }
+        const blob = await resp.blob();
+        const thumbUrl = URL.createObjectURL(blob);
+        setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
+      } catch (err: any) {
+        pendingThumbsRef.current.delete(file.file_id);
+        if (err?.name !== 'AbortError') {
+          console.log(`[Thumb] Error for ${file.filename}:`, err?.message);
+        }
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onParentAbort);
       }
     }
-  }, [thumbnails]);
+  }, []);
 
   const loadContents = useCallback(async () => {
+    // Cancel any in-progress thumbnail fetches from the previous load cycle
+    thumbnailAbortRef.current?.abort();
+    const thumbAbort = new AbortController();
+    thumbnailAbortRef.current = thumbAbort;
+
+    currentPageRef.current = 1;
+    hasMoreRef.current = false;
     setLoading(true);
     setError(null);
     try {
       const [filesResponse, foldersResponse] = await Promise.all([
-        api.listFiles(1, 50, currentFolderId ?? undefined),
+        api.listFiles(1, PAGE_SIZE, currentFolderId ?? undefined),
         api.listFolders(currentFolderId),
       ]);
 
+      hasMoreRef.current = filesResponse.total > PAGE_SIZE;
       const allOriginal: FileInfo[] = [...foldersResponse.files, ...filesResponse.files];
-      
-      // 去重：根據檔名去重，但 split file 需要保留所有 parts
-      // 使用 split_group_id + filename 來判斷是否為同一個分割檔案
-      const seenKeys = new Set<string>();
-      const uniqueFiles = allOriginal.reverse().filter((f) => {
-        // 如果是分割檔案，使用 split_group_id 作為 key
-        const isSplitFile = (f as any).is_split_file && (f as any).split_group_id;
-        const key = isSplitFile ? `split:${(f as any).split_group_id}` : `normal:${f.filename}`;
-        
-        if (seenKeys.has(key)) return false;
-        seenKeys.add(key);
-        return true;
-      }).reverse();
 
       const fileEntries: FileData[] = [
-        ...uniqueFiles.filter((f) => f.isDir).map((f): FileData => ({
+        ...allOriginal.filter((f) => f.isDir).map((f): FileData => ({
           id: f.file_id,
           name: f.filename,
           isDir: true,
           parentId: f.parent_id ?? undefined,
         })),
-        ...uniqueFiles.filter((f) => !f.isDir).map((f): FileData => ({
+        ...allOriginal.filter((f) => !f.isDir).map((f): FileData => ({
           id: f.file_id,
           name: f.filename,
           isDir: false,
@@ -151,11 +128,10 @@ export function ChonkyDrive() {
         })),
       ];
 
+      pendingThumbsRef.current.clear();
       setFiles(fileEntries);
-      setOriginalFiles(uniqueFiles);
-      
-      // Load thumbnails for images/videos
-      loadThumbnails(uniqueFiles);
+      setOriginalFiles(allOriginal);
+      loadThumbnails(allOriginal, thumbAbort.signal);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load files');
       setFiles([]);
@@ -165,43 +141,55 @@ export function ChonkyDrive() {
     }
   }, [currentFolderId, loadThumbnails]);
 
+  const loadMoreFiles = useCallback(async () => {
+    if (isLoadingMoreRef.current || !hasMoreRef.current) return;
+    isLoadingMoreRef.current = true;
+    setIsLoadingMore(true);
+    const nextPage = currentPageRef.current + 1;
+    try {
+      const filesResponse = await api.listFiles(nextPage, PAGE_SIZE, currentFolderId ?? undefined);
+      currentPageRef.current = nextPage;
+      hasMoreRef.current = nextPage * PAGE_SIZE < filesResponse.total;
+
+      const newOriginals = filesResponse.files;
+      setOriginalFiles((prev) => [...prev, ...newOriginals]);
+      setFiles((prev) => [
+        ...prev,
+        ...newOriginals.map((f): FileData => ({
+          id: f.file_id,
+          name: f.filename,
+          isDir: false,
+          size: f.filesize,
+          modDate: new Date(f.created_at),
+          thumbnailUrl: undefined,
+        })),
+      ]);
+      loadThumbnails(newOriginals);
+    } catch (err) {
+      console.error('Failed to load more files:', err);
+    } finally {
+      isLoadingMoreRef.current = false;
+      setIsLoadingMore(false);
+    }
+  }, [currentFolderId, loadThumbnails]);
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => { if (entries[0].isIntersecting) loadMoreFiles(); },
+      { rootMargin: '300px' }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [loadMoreFiles]);
+
   useEffect(() => {
     if (currentFolderId !== undefined) {
       loadContents();
     }
   }, [currentFolderId]);
 
-  useEffect(() => {
-    if (!originalFiles.length) return;
-    
-    const neededThumbCount = originalFiles.filter(
-      (f) => f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/')
-    ).length;
-    
-    if (neededThumbCount === 0) return;
-    const currentLoadedCount = Object.keys(thumbnails).length;
-    if (currentLoadedCount >= neededThumbCount) return;
-    
-    let retryTimeout: ReturnType<typeof setTimeout>;
-    
-    const tryLoadThumbnails = async () => {
-      try {
-        const telegramClient = getTelegramClient();
-        if (telegramClient.isConnected()) {
-          console.log('[Thumb] Telegram connected, retrying thumbnails...');
-          loadThumbnails(originalFiles);
-        } else {
-          retryTimeout = setTimeout(tryLoadThumbnails, 1000);
-        }
-      } catch {
-        retryTimeout = setTimeout(tryLoadThumbnails, 1000);
-      }
-    };
-    
-    tryLoadThumbnails();
-    
-    return () => clearTimeout(retryTimeout);
-  }, [originalFiles, thumbnails, loadThumbnails]);
 
   useEffect(() => {
     if (Object.keys(thumbnails).length > 0) {
@@ -297,72 +285,73 @@ export function ChonkyDrive() {
     event.preventDefault();
   }, []);
 
-  const uploadWithThumbnail = async (file: File): Promise<void> => {
+  const uploadWithThumbnail = async (file: File, onProgress?: (pct: number) => void): Promise<void> => {
     const isImage = file.type.startsWith('image/');
     const isVideo = file.type.startsWith('video/');
     const isImageOrVideo = isImage || isVideo;
-    
+
     const telegramClient = getTelegramClient();
+
+    // Start thumbnail capture NOW from the local file so it runs concurrently with the upload.
+    // Capturing a frame from a local file takes < 1 second regardless of file size,
+    // so the blob will be ready long before a large upload finishes.
+    let thumbPromise: Promise<Blob | null> | null = null;
+    if (isImageOrVideo) {
+      const THUMB_TIMEOUT_MS = 60000;
+      const capturePromise = isVideo ? generateVideoThumbnail(file) : generateThumbnail(file, 200);
+      thumbPromise = Promise.race([
+        capturePromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Thumbnail timeout')), THUMB_TIMEOUT_MS)
+        ),
+      ]).then(
+        (blob) => { console.log('[Thumb] Local capture done, blob size:', (blob as Blob).size); return blob as Blob; },
+        (err) => { console.error('[Thumb] Local capture failed:', err?.message || err); return null; }
+      );
+    }
+
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
-    const uploadResult = await telegramClient.uploadFileSplit(file);
+    const uploadResult = await telegramClient.uploadFileSplit(file, onProgress);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
-    
+
     // Generate split_group_id for this file
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    
-    // Register all parts and generate/upload thumbnail in parallel
-    await Promise.all([
-      // Register all parts in parallel
-      Promise.all(uploadResult.parts.map((part, i) =>
-        api.registerFile({
-          filename: file.name,
-          filesize: part.size,
-          mimeType: file.type || undefined,
-          messageId: part.message_id,
-          fileId: part.file_id,
-          accessHash: part.access_hash,
-          parentId: currentFolderId ?? undefined,
-          isSplitFile: true,
-          splitGroupId: splitGroupId,
-          partIndex: i,
-          totalParts: uploadResult.parts.length,
-          originalName: file.name,
-        })
-      )),
-      // Generate and upload thumbnail (if image/video)
-      (async () => {
-        if (!isImageOrVideo) return;
-        if (isVideo) {
-          console.log('[Thumb] Generating video thumbnail via FFmpeg WASM for:', file.name);
-          try {
-            const thumbBlob = await generateVideoThumbnail(file);
-            console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
-            const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-            console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
-            await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-            console.log('[Thumb] Updated file with video thumbnail metadata');
-          } catch (err: any) {
-            console.error('[Thumb] Video thumbnail generation failed:', err?.response?.data || err.message);
-          }
-        } else {
-          const thumbBlob = await generateThumbnail(file, 200);
-          if (thumbBlob) {
-            console.log('[Thumb] Generated thumbnail, size:', thumbBlob.size);
-            try {
-              const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-              console.log('[Thumb] Uploaded to Telegram via GramJS, message_id:', thumbResult.message_id);
-              await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-              console.log('[Thumb] Updated file with thumbnail_message_id');
-            } catch (err: any) {
-              console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
-            }
-          } else {
-            console.log('[Thumb] generateThumbnail returned null for:', file.name);
-          }
-        }
-      })(),
-    ]);
+
+    // Register all parts first so the file appears immediately in the UI
+    await Promise.all(uploadResult.parts.map((part, i) =>
+      api.registerFile({
+        filename: file.name,
+        filesize: part.size,
+        mimeType: file.type || undefined,
+        messageId: part.message_id,
+        fileId: part.file_id,
+        accessHash: part.access_hash,
+        parentId: currentFolderId ?? undefined,
+        isSplitFile: true,
+        splitGroupId: splitGroupId,
+        partIndex: i,
+        totalParts: uploadResult.parts.length,
+        originalName: file.name,
+      })
+    ));
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
+
+    // Upload the already-captured thumbnail blob to Telegram and save its message_id
+    if (thumbPromise) {
+      (async () => {
+        try {
+          const thumbBlob = await thumbPromise;
+          if (!thumbBlob) return;
+          console.log('[Thumb] Uploading thumbnail to Telegram...');
+          const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+          await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
+          console.log('[Thumb] Saved thumbnail_message_id:', thumbResult.message_id);
+          loadContents();
+        } catch (err: any) {
+          console.error('[Thumb] Thumbnail upload failed (non-fatal):', err?.message || err);
+        }
+      })();
+    }
   };
 
   const handleDrop = useCallback(async (event: React.DragEvent) => {
@@ -409,7 +398,10 @@ export function ChonkyDrive() {
     }));
 
     const uploadPromises = droppedFiles.map((file, i) =>
-      uploadWithThumbnail(file).then(() => {
+      uploadWithThumbnail(file, (pct) => {
+        results[i] = { ...results[i], progress: pct };
+        setUploadingFiles([...results]);
+      }).then(() => {
         results[i] = { name: file.name, progress: 100, status: 'complete' };
       }).catch((err: any) => {
         results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
@@ -436,7 +428,10 @@ export function ChonkyDrive() {
     const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
 
     const uploadPromises = selectedFiles.map((file, i) =>
-      uploadWithThumbnail(file).then(() => {
+      uploadWithThumbnail(file, (pct) => {
+        results[i] = { ...results[i], progress: pct };
+        setUploadingFiles([...results]);
+      }).then(() => {
         results[i] = { name: file.name, progress: 100, status: 'complete' };
       }).catch((err: any) => {
         results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
@@ -459,136 +454,159 @@ export function ChonkyDrive() {
   };
 
   const uploadFolder = async (items: DataTransferItemList, parentFolderId: string | null): Promise<void> => {
-    const allFiles: { file: File; path: string }[] = [];
-    const folderPaths = new Set<string>();
+    // Lazy folder creation: each unique path is created at most once.
+    // Returns the folder's file_id (or parent fallback on error).
+    const folderCache = new Map<string, Promise<string | null>>();
+    folderCache.set('', Promise.resolve(parentFolderId));
 
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const entry = item.webkitGetAsEntry?.();
-      if (!entry) continue;
-
-      const processEntry = async (entry: any, basePath: string = '') => {
-        if (entry.isFile) {
-          return new Promise<void>((resolve) => {
-            entry.file((file: File) => {
-              allFiles.push({ file, path: basePath + file.name });
-              resolve();
-            });
-          });
-        } else if (entry.isDirectory) {
-          folderPaths.add(basePath + entry.name);
-          const reader = entry.createReader();
-          const readEntries = (): Promise<any[]> => {
-            return new Promise((resolve) => {
-              reader.readEntries((results: any[]) => resolve(results));
-            });
-          };
-          let entries = await readEntries();
-          while (entries.length === 100) {
-            const moreEntries = await readEntries();
-            entries = [...entries, ...moreEntries];
-          }
-          for (const subEntry of entries) {
-            await processEntry(subEntry, basePath + entry.name + '/');
-          }
+    const ensureFolder = (path: string): Promise<string | null> => {
+      if (folderCache.has(path)) return folderCache.get(path)!;
+      const p = (async () => {
+        const parts = path.split('/');
+        const name = parts.pop()!;
+        const parentId = await ensureFolder(parts.join('/'));
+        try {
+          const result = await api.createFolder(name, parentId);
+          return result.file_id as string | null;
+        } catch {
+          return parentId;
         }
-      };
-      await processEntry(entry);
-    }
+      })();
+      folderCache.set(path, p);
+      return p;
+    };
 
-    const sortedFolders = Array.from(folderPaths).sort((a, b) => {
-      const depthA = a.split('/').filter(Boolean).length;
-      const depthB = b.split('/').filter(Boolean).length;
-      return depthB - depthA;
-    });
+    let discovered = 0;
+    let completed = 0;
+    let failed = 0;
 
-    const folderIdMap: Record<string, string | null> = { '': parentFolderId };
+    // Rolling window: show last 100 files so the list stays bounded.
+    const VISIBLE_MAX = 100;
+    type FileEntry = { name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string };
+    const visibleFiles: FileEntry[] = [];
 
-    for (const folderPath of sortedFolders) {
-      const folderName = folderPath.split('/').pop() || 'Folder';
-      const parentPath = folderPath.substring(0, folderPath.length - folderName.length - 1);
-      const parentId = folderIdMap[parentPath] ?? parentFolderId;
-      try {
-        const result = await api.createFolder(folderName, parentId);
-        folderIdMap[folderPath] = result.file_id;
-      } catch (err) {
-        folderIdMap[folderPath] = parentId;
+    const addVisible = (entry: FileEntry) => {
+      visibleFiles.push(entry);
+      if (visibleFiles.length > VISIBLE_MAX) visibleFiles.shift();
+    };
+    const updateVisible = (name: string, patch: Partial<FileEntry>) => {
+      for (let i = visibleFiles.length - 1; i >= 0; i--) {
+        if (visibleFiles[i].name === name) { Object.assign(visibleFiles[i], patch); break; }
       }
-    }
+    };
 
-    const initialFiles = allFiles.map((f) => ({
-      name: f.path,
-      progress: 0,
-      status: 'uploading' as const,
-    }));
-    setUploadingFiles(initialFiles);
+    const updateUI = () => {
+      setUploadTotals({ total: discovered, done: completed + failed });
+      setUploadingFiles([...visibleFiles]);
+    };
 
-    const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
-
-    const uploadPromises = allFiles.map(({ file, path }, i) => {
-      const pathParts = path.split('/');
-      pathParts.pop();
-      const fileDir = pathParts.join('/');
-      const targetFolderId = folderIdMap[fileDir] ?? parentFolderId;
-
-      const isImage = file.type.startsWith('image/');
-      const isVideo = file.type.startsWith('video/');
-      const isImageOrVideo = isImage || isVideo;
-
-      return (async () => {
-        const telegramClient = getTelegramClient();
-        const uploadResult = await telegramClient.uploadFileSplit(file);
-        const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-        await Promise.all([
-          Promise.all(uploadResult.parts.map((part, j) =>
-            api.registerFile({
-              filename: file.name,
-              filesize: part.size,
-              mimeType: file.type || undefined,
-              messageId: part.message_id,
-              fileId: part.file_id,
-              accessHash: part.access_hash,
-              parentId: targetFolderId ?? undefined,
-              isSplitFile: true,
-              splitGroupId: splitGroupId,
-              partIndex: j,
-              totalParts: uploadResult.parts.length,
-              originalName: file.name,
-            })
-          )),
-          (async () => {
-            if (!isImageOrVideo) return;
+    // Upload one file after its parent folder is ready.
+    const uploadFileEntry = async (file: File, folderPath: string): Promise<void> => {
+      const telegramClient = getTelegramClient();
+      const folderId = await ensureFolder(folderPath);
+      const uploadResult = await telegramClient.uploadFileSplit(file);
+      const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      await Promise.all(uploadResult.parts.map((part, j) =>
+        api.registerFile({
+          filename: file.name,
+          filesize: part.size,
+          mimeType: file.type || undefined,
+          messageId: part.message_id,
+          fileId: part.file_id,
+          accessHash: part.access_hash,
+          parentId: folderId ?? undefined,
+          isSplitFile: true,
+          splitGroupId: splitGroupId,
+          partIndex: j,
+          totalParts: uploadResult.parts.length,
+          originalName: file.name,
+        })
+      ));
+      // Thumbnail — fire-and-forget
+      const isImageOrVideo = file.type.startsWith('image/') || file.type.startsWith('video/');
+      if (isImageOrVideo) {
+        (async () => {
+          try {
+            const isVideo = file.type.startsWith('video/');
+            let thumbBlob: Blob | null = null;
             if (isVideo) {
-              try {
-                const thumbBlob = await generateVideoThumbnail(file);
-                const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-                await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-              } catch (err: any) {
-                console.error('[Thumb] Video thumbnail failed:', err?.response?.data || err.message);
-              }
+              thumbBlob = await Promise.race([
+                generateVideoThumbnail(file),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000)),
+              ]);
             } else {
-              const thumbBlob = await generateThumbnail(file, 200);
-              if (thumbBlob) {
-                try {
-                  const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-                  await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-                } catch (err: any) {
-                  console.error('[Thumb] Upload failed:', err?.response?.data || err.message);
-                }
-              }
+              thumbBlob = await generateThumbnail(file, 200);
             }
-          })(),
-        ]);
-      })().then(() => {
-        results[i] = { name: path, progress: 100, status: 'complete' };
-      }).catch((err: any) => {
-        results[i] = { name: path, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
-      }).finally(() => {
-        setUploadingFiles([...results]);
+            if (!thumbBlob) return;
+            const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
+            await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
+          } catch { /* non-fatal */ }
+        })();
+      }
+    };
+
+    // Limit concurrent file uploads — too many simultaneous sendFile() calls
+    // cause GramJS to resolve "me" to entity ID 0 and crash.
+    const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
+
+    // All upload promises collected so we can await them.
+    const uploadPromises: Promise<void>[] = [];
+
+    // Read all entries from a DirectoryReader (may require multiple calls).
+    const readAllEntries = (reader: any): Promise<any[]> =>
+      new Promise<any[]>((resolve, reject) => {
+        const all: any[] = [];
+        const next = () =>
+          reader.readEntries((batch: any[]) => {
+            if (batch.length === 0) { resolve(all); return; }
+            all.push(...batch);
+            next();
+          }, reject);
+        next();
       });
-    });
+
+    // Traverse directory tree in parallel; enqueue upload as each file is found.
+    const processEntry = async (entry: any, basePath: string): Promise<void> => {
+      if (entry.isFile) {
+        await new Promise<void>((resolve) => {
+          entry.file((file: File) => {
+            discovered++;
+            addVisible({ name: file.name, progress: 0, status: 'uploading' });
+            updateUI();
+            const p = fileSemaphore.withSlot(() =>
+              uploadFileEntry(file, basePath.replace(/\/$/, ''))
+            ).then(() => {
+              completed++;
+              updateVisible(file.name, { progress: 100, status: 'complete' });
+              updateUI();
+            }).catch(() => {
+              failed++;
+              updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+              updateUI();
+            });
+            uploadPromises.push(p);
+            resolve();
+          });
+        });
+      } else if (entry.isDirectory) {
+        const fullPath = `${basePath}${entry.name}`;
+        ensureFolder(fullPath); // pre-warm cache without awaiting
+        const entries = await readAllEntries(entry.createReader());
+        await Promise.all(entries.map((e: any) => processEntry(e, `${fullPath}/`)));
+      }
+    };
+
+    setUploadTotals({ total: 0, done: 0 });
+    setUploadingFiles([{ name: '掃描資料夾中...', progress: 0, status: 'uploading' }]);
+
+    const rootEntries = Array.from({ length: items.length }, (_, i) => items[i].webkitGetAsEntry?.()).filter(Boolean);
+    await Promise.all(rootEntries.map((e) => processEntry(e, '')));
+
+    // Wait for every upload that was enqueued during traversal.
     await Promise.allSettled(uploadPromises);
+
+    updateUI();
+    loadContents();
   };
 
   const handleFolderSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -737,14 +755,25 @@ export function ChonkyDrive() {
        const original = originalFiles.find((f) => f.file_id === file.id);
        if (original) {
          setPreviewFile(original);
-         
+         setPreviewUrl(null);
+
          const mimeType = original.mime_type || 'application/octet-stream';
-         
-         if (mimeType.startsWith('video/')) {
-           console.log('[Preview] Video file - using streaming player via Service Worker');
-           setPreviewUrl(null);
-         } else {
-           setPreviewUrl(null);
+
+         if (!mimeType.startsWith('video/')) {
+           try {
+             const telegramClient = getTelegramClient();
+             let blob: Blob;
+             if ((original as any).is_split_file && (original as any).split_group_id) {
+               blob = await telegramClient.downloadFileMerge((original as any).split_group_id, mimeType);
+             } else if (original.telegram_message_id) {
+               blob = await telegramClient.downloadFile(original.telegram_message_id, mimeType);
+             } else {
+               return;
+             }
+             setPreviewUrl(URL.createObjectURL(blob));
+           } catch (err) {
+             console.error('[Preview] Failed to download file:', err);
+           }
          }
        }
      }
@@ -752,6 +781,8 @@ export function ChonkyDrive() {
 
   const closePreview = useCallback(async () => {
     if (previewFile?.mime_type?.startsWith('video/')) {
+      // Signal main.tsx to stop accepting preload chunk requests immediately
+      window.dispatchEvent(new CustomEvent('teledrive:stop-streaming'));
       try {
         const registrations = await navigator.serviceWorker.getRegistrations();
         for (const registration of registrations) {
@@ -771,44 +802,55 @@ export function ChonkyDrive() {
 
   return (
     <div
-      style={{ height: '100%', overflow: 'auto', padding: '16px', position: 'relative' }}
+      style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: '16px', boxSizing: 'border-box', position: 'relative' }}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
 
-      {uploadingFiles.length > 0 && (
-        <div
-          style={{
-            position: 'absolute',
-            bottom: '16px',
-            right: '16px',
-            background: 'white',
-            border: '1px solid #e5e7eb',
-            borderRadius: '8px',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-            padding: '12px 16px',
-            minWidth: '240px',
-            maxWidth: '320px',
-            zIndex: 50,
-          }}
-        >
-          {uploadingFiles.map((f, i) => (
-            <div key={`${f.name}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: i < uploadingFiles.length - 1 ? '6px' : 0 }}>
-              {f.status === 'complete' && <span style={{ color: '#16a34a', fontSize: '14px' }}>✓</span>}
-              {f.status === 'error' && <span style={{ color: '#dc2626', fontSize: '14px' }}>✗</span>}
-              {f.status === 'uploading' && <span style={{ color: '#3b82f6', fontSize: '14px' }}>↑</span>}
-              <span style={{ fontSize: '13px', color: '#374151', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {f.name}
+      {uploadingFiles.length > 0 && (() => {
+        const totalCount = uploadTotals ? uploadTotals.total : uploadingFiles.length;
+        const doneCount = uploadTotals ? uploadTotals.done : uploadingFiles.filter(f => f.status !== 'uploading').length;
+        return (
+          <div style={{
+            position: 'fixed', bottom: '16px', right: '16px',
+            background: 'white', border: '1px solid #e5e7eb', borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.1)', minWidth: '280px', maxWidth: '360px',
+            zIndex: 9999, display: 'flex', flexDirection: 'column',
+          }}>
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #e5e7eb' }}>
+              <span style={{ fontSize: '13px', fontWeight: 600, color: '#374151' }}>
+                上傳中 {doneCount.toLocaleString()} / {totalCount.toLocaleString()} 個檔案
               </span>
-              {f.status === 'uploading' && <span style={{ fontSize: '11px', color: '#6b7280' }}>Uploading...</span>}
-              {f.status === 'complete' && <span style={{ fontSize: '11px', color: '#16a34a' }}>Uploaded</span>}
-              {f.status === 'error' && <span style={{ fontSize: '11px', color: '#dc2626' }}>{f.error}</span>}
+              <button
+                onClick={() => { setUploadingFiles([]); setUploadTotals(null); }}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#6b7280', fontSize: '16px', lineHeight: 1, padding: '2px 4px' }}
+              >✕</button>
             </div>
-          ))}
-        </div>
-      )}
+            {/* File list */}
+            <div style={{ maxHeight: '280px', overflowY: 'auto', padding: '8px 14px' }}>
+              {uploadingFiles.map((f, i) => (
+                <div key={`${f.name}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: i < uploadingFiles.length - 1 ? '5px' : 0 }}>
+                  {f.status === 'complete' && <span style={{ color: '#16a34a', fontSize: '13px', flexShrink: 0 }}>✓</span>}
+                  {f.status === 'error'    && <span style={{ color: '#dc2626', fontSize: '13px', flexShrink: 0 }}>✗</span>}
+                  {f.status === 'uploading'&& <span style={{ color: '#3b82f6', fontSize: '13px', flexShrink: 0 }}>↑</span>}
+                  <span style={{ fontSize: '12px', color: '#374151', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {f.name}
+                  </span>
+                  {(f.status === 'uploading' || f.status === 'complete') && (
+                    <span style={{ fontSize: '11px', color: f.status === 'complete' ? '#16a34a' : '#6b7280', flexShrink: 0 }}>
+                      {f.status === 'complete' ? '100%' : `${f.progress}%`}
+                    </span>
+                  )}
+                  {f.status === 'error' && <span style={{ fontSize: '11px', color: '#dc2626', flexShrink: 0 }}>{f.error}</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
       <div
         style={{
           display: 'flex',
@@ -972,6 +1014,7 @@ export function ChonkyDrive() {
         />
       </div>
 
+      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
       {error && (
         <div
           style={{
@@ -1138,6 +1181,13 @@ export function ChonkyDrive() {
         </div>
       )}
 
+      {/* Infinite scroll sentinel */}
+      <div ref={sentinelRef} style={{ height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#6b7280', fontSize: '13px' }}>
+        {isLoadingMore && 'Loading more...'}
+      </div>
+
+      </div>
+
       {/* Preview Modal */}
       {previewFile && (
         <div
@@ -1279,7 +1329,11 @@ export function ChonkyDrive() {
                 />
               ) : previewFile.mime_type?.startsWith('video/') ? (
                 <video
-                  src={`/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}`}
+                  src={
+                    (previewFile as any).is_split_file && (previewFile as any).split_group_id
+                      ? `/preview-video/split/${(previewFile as any).split_group_id}`
+                      : `/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}`
+                  }
                   controls
                   autoPlay
                   style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}

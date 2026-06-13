@@ -20,9 +20,15 @@ export default defineConfig(({ mode }) => {
     server: {
       host: '0.0.0.0',
       port: 3000,
+      allowedHosts: true,
       proxy: {
+        '/api/v1/ws-proxy': {
+          target: process.env.BACKEND_URL || env.BACKEND_URL || 'http://127.0.0.1:8000',
+          changeOrigin: true,
+          ws: true,
+        },
         '/api/v1': {
-          target: 'http://127.0.0.1:8000',
+          target: process.env.BACKEND_URL || env.BACKEND_URL || 'http://127.0.0.1:8000',
           changeOrigin: true,
         },
       },

@@ -49,7 +49,10 @@ class FileService:
             direct_url=row.get('direct_url'),
             access_hash=row.get('access_hash'),
             parent_id=row.get('parent_id'),
-            isDir=bool(row['isDir']) if row.get('isDir') is not None else False
+            isDir=bool(row['isDir']) if row.get('isDir') is not None else False,
+            is_split_file=bool(row.get('is_split_file', 0)),
+            split_group_id=row.get('split_group_id'),
+            part_index=row.get('part_index')
         )
     
     def _detect_file_type(self, mime_type: Optional[str], filename: str) -> FileType:
@@ -230,7 +233,14 @@ class FileService:
         db = await self._get_db()
         file_type = self._detect_file_type(mime_type, filename)
         created_at = datetime.utcnow()
-        
+
+        # Replace existing file with same name+parent (non-split only; split parts are each unique)
+        if not is_split_file:
+            existing = await db.find_file_by_name_and_parent(filename, parent_id)
+            if existing:
+                logger.info(f"Replacing existing file: {filename}, old file_id: {existing['file_id']}")
+                await db.delete_file(existing['file_id'])
+
         file_info = FileInfo(
             file_id=file_id,
             filename=filename,
@@ -245,7 +255,7 @@ class FileService:
             parent_id=parent_id,
             isDir=False
         )
-        
+
         session = UploadSession(
             file_id=file_id,
             filename=filename,
@@ -387,10 +397,15 @@ class FileService:
         return folders
 
     async def create_folder(self, name: str, parent_id: Optional[str] = None) -> FileInfo:
-        """Create a folder entry in the database. No Telegram ops in MVP."""
+        """Create a folder entry in the database, reusing existing record if same name+parent already exists."""
         logger.info(f"create_folder called: name={name}, parent_id={parent_id}")
         db = await self._get_db()
         logger.info(f"Got database: {db.db_path}")
+
+        existing = await db.find_folder_by_name_and_parent(name, parent_id)
+        if existing:
+            logger.info(f"Folder already exists, reusing: {existing['file_id']}")
+            return self._row_to_file_info(existing)
         file_id = self._generate_file_id(name, 0)
         created_at = datetime.utcnow()
         

@@ -168,11 +168,45 @@ class Database:
             return dict(row)
         return None
     
+    async def find_file_by_name_and_parent(self, filename: str, parent_id: Optional[str]) -> Optional[dict]:
+        """Find a non-directory file by filename and parent_id (for replace-on-duplicate logic)."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if parent_id is None:
+            cursor = await self._conn.execute(
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 LIMIT 1",
+                (filename,)
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 LIMIT 1",
+                (filename, parent_id)
+            )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def find_folder_by_name_and_parent(self, name: str, parent_id: Optional[str]) -> Optional[dict]:
+        """Find a folder by name and parent_id (for reuse-on-duplicate logic)."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if parent_id is None:
+            cursor = await self._conn.execute(
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 LIMIT 1",
+                (name,)
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 LIMIT 1",
+                (name, parent_id)
+            )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def get_all_files(self) -> List[dict]:
         """Get all files."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
+
         cursor = await self._conn.execute("SELECT * FROM files")
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -202,7 +236,10 @@ class Database:
         if split_group_id is not None:
             where_clauses.append("split_group_id = ?")
             params.append(split_group_id)
-        
+        else:
+            # Only show the primary part (part_index=0 or non-split) so multi-part files appear once
+            where_clauses.append("(is_split_file = 0 OR part_index = 0 OR part_index IS NULL)")
+
         where_sql = " AND ".join(where_clauses)
         
         # Get total count

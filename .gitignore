@@ -82,3 +82,18 @@ test-files/
 
 # Playwright report
 playwright-report/
+
+# Telegram session string (sensitive credential — never commit)
+.session_string.txt
+
+# Thumbnail cache (generated at runtime by backend)
+backend/thumbnails/
+
+# Test/debug upload binaries
+*.bin
+
+# Test screenshots captured during development/debugging
+direct-telegram-wss.png
+test-01-landing.png
+test-02-video.png
+ws-proxy-fixed.png

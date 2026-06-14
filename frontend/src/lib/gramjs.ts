@@ -875,7 +875,10 @@ export class TelegramClientManager {
       { apiId, apiHash },
       {
         qrCode: async (qr: { token: Buffer; expires: number }) => {
-          const tokenBase64 = btoa(String.fromCharCode(...new Uint8Array(qr.token)));
+          // URL-safe base64: mobile Telegram URL-decodes query params, so
+          // standard base64's '+' becomes space and corrupts the token bytes.
+          const tokenBase64 = btoa(String.fromCharCode(...new Uint8Array(qr.token)))
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
           onQRCode(`tg://login?token=${tokenBase64}`, qr.expires);
         },
         password: onPasswordRequired,

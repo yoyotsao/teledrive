@@ -845,6 +845,86 @@ export class TelegramClientManager {
   }
 
   /**
+   * Start QR code login. Calls onQRCode with a fresh tg://login URL whenever
+   * Telegram issues a new token (every ~30 s). Resolves with session string
+   * when the user scans and the handshake completes.
+   */
+  async startQRLogin(
+    apiId: number,
+    apiHash: string,
+    onQRCode: (url: string, expiresAt: number) => void,
+    onPasswordRequired: (hint: string) => Promise<string>,
+  ): Promise<string> {
+    if (window.location.protocol === 'https:') {
+      installTelegramWsProxy();
+    }
+    this.session = new StringSession('');
+    this.client = new TelegramClient(this.session, apiId, apiHash, {
+      connectionRetries: 5,
+      useWSS: false,
+      deviceModel: 'TeleDrive Browser',
+      appVersion: '1.0.0',
+    });
+
+    await (this.client as any).start({
+      qrCode: async (qr: { token: Buffer; expires: number }) => {
+        const tokenBase64 = btoa(String.fromCharCode(...new Uint8Array(qr.token)));
+        onQRCode(`tg://login?token=${tokenBase64}`, qr.expires);
+      },
+      password: onPasswordRequired,
+      onError: (err: Error) => { console.error('[QRLogin]', err); },
+    });
+
+    return this.session.save();
+  }
+
+  /**
+   * Start phone number login. Returns `waitForLogin` (resolves with session
+   * string on success) plus `submitCode` / `submitPassword` callbacks that the
+   * UI calls to push values into `client.start()`'s promise bridges.
+   */
+  startPhoneLogin(
+    apiId: number,
+    apiHash: string,
+    phone: string,
+    onCodeRequired: () => void,
+    onPasswordRequired: (hint: string) => void,
+  ): { waitForLogin: Promise<string>; submitCode: (code: string) => void; submitPassword: (pwd: string) => void } {
+    if (window.location.protocol === 'https:') {
+      installTelegramWsProxy();
+    }
+    this.session = new StringSession('');
+    this.client = new TelegramClient(this.session, apiId, apiHash, {
+      connectionRetries: 5,
+      useWSS: false,
+      deviceModel: 'TeleDrive Browser',
+      appVersion: '1.0.0',
+    });
+
+    let resolveCode: ((code: string) => void) | null = null;
+    let resolvePassword: ((pwd: string) => void) | null = null;
+
+    const waitForLogin = (this.client as any).start({
+      phoneNumber: phone,
+      phoneCode: async () => {
+        onCodeRequired();
+        return new Promise<string>((resolve) => { resolveCode = resolve; });
+      },
+      password: async (hint?: string) => {
+        onPasswordRequired(hint ?? '');
+        return new Promise<string>((resolve) => { resolvePassword = resolve; });
+      },
+      onError: (err: Error) => { console.error('[PhoneLogin]', err); },
+    }).then(() => this.session!.save());
+
+    return {
+      waitForLogin,
+      submitCode: (code: string) => { resolveCode?.(code); },
+      submitPassword: (pwd: string) => { resolvePassword?.(pwd); },
+    };
+  }
+
+  /**
    * Disconnect and cleanup the Telegram client.
    */
   async disconnect(): Promise<void> {
@@ -925,4 +1005,21 @@ export function resetTelegramClient(): void {
     clientInstance.disconnect();
     clientInstance = null;
   }
+}
+
+export function saveCredentialsToStorage(sessionString: string, jwt: string): void {
+  localStorage.setItem('tg_session', sessionString);
+  localStorage.setItem('tg_jwt', jwt);
+}
+
+export function loadCredentialsFromStorage(): { sessionString: string | null; jwt: string | null } {
+  return {
+    sessionString: localStorage.getItem('tg_session'),
+    jwt: localStorage.getItem('tg_jwt'),
+  };
+}
+
+export function clearCredentialsFromStorage(): void {
+  localStorage.removeItem('tg_session');
+  localStorage.removeItem('tg_jwt');
 }

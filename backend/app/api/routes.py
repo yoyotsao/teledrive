@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect, Depends
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
@@ -8,6 +8,8 @@ from app.models.schemas import FileListResponse, FileInfo, FileType
 from app.services import get_file_service, get_bot_service
 from app.services import get_telethon_service
 from app.services.database import get_database
+from app.auth import get_current_user, create_jwt
+from app.services.user_sessions import store_user_session, get_user_client
 from loguru import logger
 import os
 import tempfile
@@ -65,7 +67,86 @@ async def extract_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> None:
 
     await asyncio.to_thread(run_ffmpeg)
 
+async def _download_thumbnail_base64(client, message_id: int) -> Optional[str]:
+    """Download thumbnail from user's Telegram account using their Telethon client."""
+    try:
+        from telethon.tl.functions.upload import GetFileRequest
+        from telethon.tl.types import InputPhotoFileLocation
+
+        message = await client.get_messages('me', ids=message_id)
+        if not message:
+            logger.error(f"Thumbnail: Message {message_id} not found")
+            return None
+
+        photo = getattr(message, 'photo', None)
+        if photo:
+            sizes = getattr(photo, 'sizes', [])
+            if sizes:
+                largest = next((s for s in sizes if getattr(s, 'type', '').lower() == 'y'), sizes[-1])
+                thumb_size = getattr(largest, 'type', '')
+                input_loc = InputPhotoFileLocation(
+                    id=photo.id,
+                    access_hash=getattr(photo, 'access_hash', 0) or 0,
+                    file_reference=getattr(photo, 'file_reference', b'') or b'',
+                    thumb_size=thumb_size,
+                )
+                result = await client(GetFileRequest(location=input_loc, offset=0, limit=256 * 1024))
+                if hasattr(result, 'bytes') and result.bytes:
+                    return base64.b64encode(bytes(result.bytes)).decode()
+
+        media = getattr(message, 'media', None)
+        if media:
+            if hasattr(media, 'photo') and media.photo:
+                photo = media.photo
+                sizes = getattr(photo, 'sizes', [])
+                if sizes:
+                    largest = sizes[-1]
+                    input_loc = InputPhotoFileLocation(
+                        id=photo.id,
+                        access_hash=getattr(photo, 'access_hash', 0) or 0,
+                        file_reference=getattr(photo, 'file_reference', b'') or b'',
+                        thumb_size=getattr(largest, 'type', ''),
+                    )
+                    result = await client(GetFileRequest(location=input_loc, offset=0, limit=256 * 1024))
+                    if hasattr(result, 'bytes') and result.bytes:
+                        return base64.b64encode(bytes(result.bytes)).decode()
+
+            doc = getattr(media, 'document', None)
+            if doc:
+                doc_mime = getattr(doc, 'mime_type', '') or ''
+                thumb = getattr(doc, 'thumb', None)
+                if thumb:
+                    loc = getattr(thumb, 'location', None)
+                    if loc:
+                        result = await client(GetFileRequest(location=loc, offset=0, limit=256 * 1024))
+                        if hasattr(result, 'bytes') and result.bytes:
+                            return base64.b64encode(bytes(result.bytes)).decode()
+                if doc_mime.startswith('image/'):
+                    import io
+                    buf = io.BytesIO()
+                    await client.download_media(message, file=buf)
+                    doc_bytes = buf.getvalue()
+                    if doc_bytes:
+                        return base64.b64encode(doc_bytes).decode()
+
+        return None
+    except Exception as e:
+        logger.error(f"_download_thumbnail_base64 failed: {e}")
+        return None
+
+
 router = APIRouter(prefix="/api/v1", tags=["files"])
+
+
+class LoginRequest(BaseModel):
+    session_string: str
+
+
+class LoginResponse(BaseModel):
+    token: str
+    user_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
 
 
 class RegisterFileRequest(BaseModel):
@@ -98,8 +179,49 @@ class VideoThumbnailRequest(BaseModel):
     message_id: int
 
 
+@router.post("/auth/login", response_model=LoginResponse)
+async def login(request: LoginRequest):
+    """Verify GramJS session via Telethon, store per-user client, return JWT."""
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from app.services.config import get_settings
+
+    settings = get_settings()
+    try:
+        client = TelegramClient(
+            StringSession(request.session_string),
+            settings.telegram_api_id,
+            settings.telegram_api_hash,
+        )
+        await client.connect()
+        me = await client.get_me()
+        if not me:
+            raise HTTPException(status_code=401, detail="Invalid session")
+
+        telegram_user_id = me.id
+        await store_user_session(telegram_user_id, request.session_string)
+        await client.disconnect()
+
+        token = create_jwt(telegram_user_id)
+        logger.info(f"User {telegram_user_id} ({me.username}) logged in")
+        return LoginResponse(
+            token=token,
+            user_id=telegram_user_id,
+            username=me.username,
+            first_name=me.first_name,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login failed: {e}")
+        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+
+
 @router.post("/files/register", response_model=FileInfo)
-async def register_file(request: RegisterFileRequest):
+async def register_file(
+    request: RegisterFileRequest,
+    current_user: int = Depends(get_current_user),
+):
     """
     Register a file uploaded directly via MTProto.
     Frontend uploads to Telegram, then registers metadata here.
@@ -119,7 +241,8 @@ async def register_file(request: RegisterFileRequest):
             original_name=request.original_name,
             part_index=request.part_index,
             total_parts=request.total_parts,
-            split_group_id=request.split_group_id
+            split_group_id=request.split_group_id,
+            telegram_user_id=current_user,
         )
         return file_info
     except Exception as e:
@@ -168,7 +291,8 @@ async def list_files(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=10000),
     parent_id: Optional[str] = Query(None),
-    split_group_id: Optional[str] = Query(None, description="Filter files by split group ID")
+    split_group_id: Optional[str] = Query(None, description="Filter files by split group ID"),
+    current_user: int = Depends(get_current_user),
 ):
     # Convert string "null" to Python None
     if parent_id == "null":
@@ -176,10 +300,11 @@ async def list_files(
     try:
         file_service = get_file_service()
         files, total = await file_service.list_files(
-            page, 
-            page_size, 
+            page,
+            page_size,
             parent_id=parent_id,
-            split_group_id=split_group_id
+            split_group_id=split_group_id,
+            telegram_user_id=current_user,
         )
         return FileListResponse(
             files=files,
@@ -192,10 +317,10 @@ async def list_files(
 
 
 @router.get("/files/{file_id}", response_model=FileInfo)
-async def get_file_info(file_id: str):
+async def get_file_info(file_id: str, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id)
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
         return file_info
@@ -206,10 +331,10 @@ async def get_file_info(file_id: str):
 
 
 @router.delete("/files/{file_id}")
-async def delete_file(file_id: str):
+async def delete_file(file_id: str, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id)
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
 
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
@@ -219,7 +344,7 @@ async def delete_file(file_id: str):
         all_parts = []
         if file_info.is_split_file and file_info.split_group_id:
             db = await file_service._get_db()
-            all_parts = await db.get_files_by_split_group(file_info.split_group_id)
+            all_parts = await db.get_files_by_split_group(file_info.split_group_id, telegram_user_id=current_user)
         else:
             all_parts = [{"file_id": file_id, "telegram_message_id": file_info.telegram_message_id}]
 
@@ -247,25 +372,25 @@ async def delete_file(file_id: str):
 
 
 @router.delete("/files")
-async def delete_all_files():
-    """Delete all files and folders."""
+async def delete_all_files(current_user: int = Depends(get_current_user)):
+    """Delete all files and folders belonging to the authenticated user."""
     try:
         file_service = get_file_service()
-        count = await file_service.delete_all()
+        count = await file_service.delete_all(telegram_user_id=current_user)
         return {"message": "All files deleted", "count": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.patch("/files/{file_id}")
-async def update_file(file_id: str, request: UpdateFileRequest):
+async def update_file(file_id: str, request: UpdateFileRequest, current_user: int = Depends(get_current_user)):
     """
     Update file metadata (e.g., thumbnail_message_id, parent_id for move).
     """
     try:
         logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, parent_id={request.parent_id}")
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id)
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
         
         if not file_info:
             logger.error(f"File not found: {file_id}")
@@ -288,14 +413,14 @@ async def update_file(file_id: str, request: UpdateFileRequest):
 
 
 @router.get("/files/{file_id}/download")
-async def get_download_info(file_id: str):
+async def get_download_info(file_id: str, current_user: int = Depends(get_current_user)):
     """
     Get file metadata for download.
     Frontend downloads directly via MTProto using these details.
     """
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id)
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
         
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
@@ -315,10 +440,10 @@ async def get_download_info(file_id: str):
 
 
 @router.get("/files/{file_id}/thumbnail")
-async def get_file_thumbnail(file_id: str):
+async def get_file_thumbnail(file_id: str, current_user: int = Depends(get_current_user)):
     """
     Get thumbnail for image/video files.
-    Checks disk cache first; downloads from Telegram on cache miss.
+    Checks disk cache first; downloads from Telegram on cache miss using user's session.
     """
     from fastapi.responses import FileResponse, Response
     try:
@@ -327,7 +452,7 @@ async def get_file_thumbnail(file_id: str):
             return FileResponse(str(cache_path), media_type="image/jpeg")
 
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id)
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
 
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
@@ -346,9 +471,12 @@ async def get_file_thumbnail(file_id: str):
         if not message_id:
             raise HTTPException(status_code=404, detail="No thumbnail available")
 
-        mtproto_service = await get_bot_service()
+        user_client = get_user_client(current_user)
+        if not user_client:
+            raise HTTPException(status_code=401, detail="User session not found, please re-login")
+
         logger.info(f"Thumbnail cache miss for {file_id}, fetching message {message_id}")
-        thumbnail_data = await mtproto_service.get_thumbnail(message_id)
+        thumbnail_data = await _download_thumbnail_base64(user_client, message_id)
 
         if not thumbnail_data:
             raise HTTPException(status_code=404, detail="No thumbnail available")
@@ -365,7 +493,7 @@ async def get_file_thumbnail(file_id: str):
 
 
 @router.get("/files/{file_id}/stream")
-async def stream_file(file_id: str, request: Request):
+async def stream_file(file_id: str, request: Request, current_user: int = Depends(get_current_user)):
     """
     Stream file content from Telegram with Range header support.
     Returns file bytes with proper content-type for display/playback.
@@ -421,11 +549,11 @@ async def stream_file(file_id: str, request: Request):
     
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id)
-        
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
-        
+
         message_id = file_info.telegram_message_id
         
         if not message_id:
@@ -531,10 +659,10 @@ async def stream_file(file_id: str, request: Request):
 
 
 @router.post("/folders", response_model=FileInfo)
-async def create_folder(request: CreateFolderRequest):
+async def create_folder(request: CreateFolderRequest, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        folder = await file_service.create_folder(request.name, request.parent_id)
+        folder = await file_service.create_folder(request.name, request.parent_id, telegram_user_id=current_user)
         return folder
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -542,13 +670,14 @@ async def create_folder(request: CreateFolderRequest):
 
 @router.get("/folders", response_model=FileListResponse)
 async def list_folders(
-    parent_id: Optional[str] = Query(None)
+    parent_id: Optional[str] = Query(None),
+    current_user: int = Depends(get_current_user),
 ):
     if parent_id == "null":
         parent_id = None
     try:
         file_service = get_file_service()
-        folders = await file_service.list_folders(parent_id=parent_id)
+        folders = await file_service.list_folders(parent_id=parent_id, telegram_user_id=current_user)
         return FileListResponse(
             files=folders,
             total=len(folders),
@@ -560,10 +689,10 @@ async def list_folders(
 
 
 @router.get("/folders/{folder_id}")
-async def delete_folder(folder_id: str):
+async def delete_folder(folder_id: str, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(folder_id)
+        file_info = await file_service.get_file_info(folder_id, telegram_user_id=current_user)
         
         if not file_info:
             raise HTTPException(status_code=404, detail="Folder not found")
@@ -630,15 +759,15 @@ async def websocket_proxy(websocket: WebSocket, host: str, port: int = 80):
 
 
 @router.get("/files/by-split-group/{split_group_id}", response_model=FileListResponse)
-async def get_files_by_split_group(split_group_id: str):
+async def get_files_by_split_group(split_group_id: str, current_user: int = Depends(get_current_user)):
     """
     Get all file parts belonging to a split group.
     Returns files sorted by part_index for proper reassembly.
     """
     try:
         db = await get_database()
-        rows = await db.get_files_by_split_group(split_group_id)
-        
+        rows = await db.get_files_by_split_group(split_group_id, telegram_user_id=current_user)
+
         if not rows:
             raise HTTPException(status_code=404, detail="No files found for this split group")
         

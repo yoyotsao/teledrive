@@ -6,7 +6,26 @@ const client = axios.create({
   timeout: 300000, // 5 min for large uploads
 });
 
+client.interceptors.request.use((config) => {
+  const token = localStorage.getItem('tg_jwt');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+export interface LoginResponse {
+  token: string;
+  user_id: number;
+  username?: string;
+  first_name?: string;
+}
+
 export const api = {
+  loginToBackend: async (sessionString: string): Promise<LoginResponse> => {
+    const response = await client.post<LoginResponse>('/auth/login', { session_string: sessionString });
+    return response.data;
+  },
   listFiles: async (page: number = 1, pageSize: number = 50, parentId?: string): Promise<FileListResponse> => {
     const response = await client.get<FileListResponse>('/files', {
       params: { page, page_size: pageSize, parent_id: parentId },

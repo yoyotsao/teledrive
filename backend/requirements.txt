@@ -28,3 +28,6 @@ aiosqlite>=0.20.0
 
 # WebSocket proxy (for HTTPS — browsers block ws:// from https:// pages)
 websockets>=12.0
+
+# JWT authentication
+python-jose[cryptography]>=3.3.0

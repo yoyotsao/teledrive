@@ -129,6 +129,10 @@ BACKEND_HOST=0.0.0.0      # default
 BACKEND_PORT=8000         # default
 ```
 
+## Development Rules
+
+- **完成修正後必須打開網頁確認成果** — 每次完成功能修改或 bug fix，必須實際在瀏覽器中開啟 `https://teledrive.yoyotsaoteledrive.dpdns.org` 驗證畫面正常、功能符合預期，不得僅憑程式碼審查宣告完成。
+
 ## Critical Constraints
 
 - **Binary data must never pass through the Python backend** — this is the core architectural invariant. Upload/download is always browser ↔ Telegram CDN via GramJS.

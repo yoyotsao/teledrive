@@ -86,7 +86,12 @@ class Database:
             await self._conn.execute("ALTER TABLE files ADD COLUMN split_group_id TEXT")
         except aiosqlite.OperationalError:
             pass
-        
+
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN telegram_user_id INTEGER NOT NULL DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass
+
         # Upload sessions table
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS upload_sessions (
@@ -133,71 +138,80 @@ class Database:
         original_name: Optional[str] = None,
         part_index: Optional[int] = None,
         total_parts: Optional[int] = None,
-        split_group_id: Optional[str] = None
+        split_group_id: Optional[str] = None,
+        telegram_user_id: int = 0
     ) -> None:
         """Insert a new file record."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
+
         await self._conn.execute("""
             INSERT OR REPLACE INTO files (
                 file_id, filename, filesize, mime_type, file_type,
                 telegram_message_id, thumbnail_message_id,
                 created_at, direct_url, access_hash, parent_id, isDir,
-                is_split_file, original_name, part_index, total_parts, split_group_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_split_file, original_name, part_index, total_parts, split_group_id,
+                telegram_user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_id, filename, filesize, mime_type, file_type,
             telegram_message_id, thumbnail_message_id,
             created_at, direct_url, access_hash, parent_id, 1 if is_dir else 0,
-            1 if is_split_file else 0, original_name, part_index, total_parts, split_group_id
+            1 if is_split_file else 0, original_name, part_index, total_parts, split_group_id,
+            telegram_user_id
         ))
         await self._conn.commit()
     
-    async def get_file(self, file_id: str) -> Optional[dict]:
-        """Get a file by ID."""
+    async def get_file(self, file_id: str, telegram_user_id: Optional[int] = None) -> Optional[dict]:
+        """Get a file by ID, optionally filtered by telegram_user_id."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
-        cursor = await self._conn.execute(
-            "SELECT * FROM files WHERE file_id = ?", (file_id,)
-        )
+
+        if telegram_user_id is not None:
+            cursor = await self._conn.execute(
+                "SELECT * FROM files WHERE file_id = ? AND telegram_user_id = ?",
+                (file_id, telegram_user_id)
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT * FROM files WHERE file_id = ?", (file_id,)
+            )
         row = await cursor.fetchone()
-        
+
         if row:
             return dict(row)
         return None
     
-    async def find_file_by_name_and_parent(self, filename: str, parent_id: Optional[str]) -> Optional[dict]:
+    async def find_file_by_name_and_parent(self, filename: str, parent_id: Optional[str], telegram_user_id: int = 0) -> Optional[dict]:
         """Find a non-directory file by filename and parent_id (for replace-on-duplicate logic)."""
         if not self._conn:
             raise RuntimeError("Database not connected")
         if parent_id is None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 LIMIT 1",
-                (filename,)
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 AND telegram_user_id = ? LIMIT 1",
+                (filename, telegram_user_id)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 LIMIT 1",
-                (filename, parent_id)
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 AND telegram_user_id = ? LIMIT 1",
+                (filename, parent_id, telegram_user_id)
             )
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def find_folder_by_name_and_parent(self, name: str, parent_id: Optional[str]) -> Optional[dict]:
+    async def find_folder_by_name_and_parent(self, name: str, parent_id: Optional[str], telegram_user_id: int = 0) -> Optional[dict]:
         """Find a folder by name and parent_id (for reuse-on-duplicate logic)."""
         if not self._conn:
             raise RuntimeError("Database not connected")
         if parent_id is None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 LIMIT 1",
-                (name,)
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 AND telegram_user_id = ? LIMIT 1",
+                (name, telegram_user_id)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 LIMIT 1",
-                (name, parent_id)
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 AND telegram_user_id = ? LIMIT 1",
+                (name, parent_id, telegram_user_id)
             )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -217,22 +231,23 @@ class Database:
         page_size: int = 50,
         parent_id: Optional[str] = None,
         is_dir: bool = False,
-        split_group_id: Optional[str] = None
+        split_group_id: Optional[str] = None,
+        telegram_user_id: int = 0
     ) -> Tuple[List[dict], int]:
-        """Get files with pagination, filtered by parent_id, isDir, and split_group_id."""
+        """Get files with pagination, filtered by parent_id, isDir, split_group_id, and telegram_user_id."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
+
         # Build query
-        where_clauses = ["isDir = ?"]
-        params = [1 if is_dir else 0]
-        
+        where_clauses = ["isDir = ?", "telegram_user_id = ?"]
+        params: list = [1 if is_dir else 0, telegram_user_id]
+
         if parent_id is None:
             where_clauses.append("parent_id IS NULL")
         else:
             where_clauses.append("parent_id = ?")
             params.append(parent_id)
-        
+
         if split_group_id is not None:
             where_clauses.append("split_group_id = ?")
             params.append(split_group_id)
@@ -309,12 +324,25 @@ class Database:
         """Delete all files."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
+
         cursor = await self._conn.execute("SELECT COUNT(*) FROM files")
         row = await cursor.fetchone()
         count = row[0] if row else 0
-        
+
         await self._conn.execute("DELETE FROM files")
+        await self._conn.commit()
+        return count
+
+    async def delete_user_files(self, telegram_user_id: int) -> int:
+        """Delete all files belonging to a specific user."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM files WHERE telegram_user_id = ?", (telegram_user_id,)
+        )
+        row = await cursor.fetchone()
+        count = row[0] if row else 0
+        await self._conn.execute("DELETE FROM files WHERE telegram_user_id = ?", (telegram_user_id,))
         await self._conn.commit()
         return count
     
@@ -373,14 +401,14 @@ class Database:
         await self._conn.commit()
         return cursor.rowcount > 0
     
-    async def get_files_by_split_group(self, split_group_id: str) -> List[dict]:
+    async def get_files_by_split_group(self, split_group_id: str, telegram_user_id: int = 0) -> List[dict]:
         """Get all files belonging to a split group, sorted by part_index."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
+
         cursor = await self._conn.execute(
-            "SELECT * FROM files WHERE split_group_id = ? ORDER BY part_index ASC",
-            (split_group_id,)
+            "SELECT * FROM files WHERE split_group_id = ? AND telegram_user_id = ? ORDER BY part_index ASC",
+            (split_group_id, telegram_user_id)
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]

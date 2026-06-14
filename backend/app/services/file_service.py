@@ -223,6 +223,7 @@ class FileService:
         part_index: Optional[int] = None,
         total_parts: Optional[int] = None,
         split_group_id: Optional[str] = None,
+        telegram_user_id: int = 0,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -236,7 +237,7 @@ class FileService:
 
         # Replace existing file with same name+parent (non-split only; split parts are each unique)
         if not is_split_file:
-            existing = await db.find_file_by_name_and_parent(filename, parent_id)
+            existing = await db.find_file_by_name_and_parent(filename, parent_id, telegram_user_id=telegram_user_id)
             if existing:
                 logger.info(f"Replacing existing file: {filename}, old file_id: {existing['file_id']}")
                 await db.delete_file(existing['file_id'])
@@ -288,7 +289,8 @@ class FileService:
             original_name=original_name,
             part_index=part_index,
             total_parts=total_parts,
-            split_group_id=split_group_id
+            split_group_id=split_group_id,
+            telegram_user_id=telegram_user_id,
         )
         
         logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, thumbnail: {thumbnail_message_id}")
@@ -351,10 +353,10 @@ class FileService:
         
         return file_info
     
-    async def get_file_info(self, file_id: str) -> Optional[FileInfo]:
-        """Get file metadata."""
+    async def get_file_info(self, file_id: str, telegram_user_id: Optional[int] = None) -> Optional[FileInfo]:
+        """Get file metadata, optionally scoped to a specific user."""
         db = await self._get_db()
-        row = await db.get_file(file_id)
+        row = await db.get_file(file_id, telegram_user_id=telegram_user_id)
         if row:
             return self._row_to_file_info(row)
         return None
@@ -364,7 +366,8 @@ class FileService:
         page: int = 1,
         page_size: int = 50,
         parent_id: Optional[str] = None,
-        split_group_id: Optional[str] = None
+        split_group_id: Optional[str] = None,
+        telegram_user_id: int = 0,
     ) -> tuple[List[FileInfo], int]:
         """List all stored files (excluding folders). Optionally filter by split_group_id."""
         db = await self._get_db()
@@ -373,7 +376,8 @@ class FileService:
             page_size=page_size,
             parent_id=parent_id,
             is_dir=False,
-            split_group_id=split_group_id
+            split_group_id=split_group_id,
+            telegram_user_id=telegram_user_id,
         )
         files = [self._row_to_file_info(row) for row in rows]
         # Sort by part_index if filtering by split_group_id
@@ -383,26 +387,28 @@ class FileService:
 
     async def list_folders(
         self,
-        parent_id: Optional[str] = None
+        parent_id: Optional[str] = None,
+        telegram_user_id: int = 0,
     ) -> List[FileInfo]:
         """List all stored folders (isDir == True). Filter by parent_id."""
         db = await self._get_db()
         rows, _ = await db.get_files_paginated(
             page=1,
-            page_size=10000,  # Get all folders
+            page_size=10000,
             parent_id=parent_id,
-            is_dir=True
+            is_dir=True,
+            telegram_user_id=telegram_user_id,
         )
         folders = [self._row_to_file_info(row) for row in rows]
         return folders
 
-    async def create_folder(self, name: str, parent_id: Optional[str] = None) -> FileInfo:
+    async def create_folder(self, name: str, parent_id: Optional[str] = None, telegram_user_id: int = 0) -> FileInfo:
         """Create a folder entry in the database, reusing existing record if same name+parent already exists."""
         logger.info(f"create_folder called: name={name}, parent_id={parent_id}")
         db = await self._get_db()
         logger.info(f"Got database: {db.db_path}")
 
-        existing = await db.find_folder_by_name_and_parent(name, parent_id)
+        existing = await db.find_folder_by_name_and_parent(name, parent_id, telegram_user_id=telegram_user_id)
         if existing:
             logger.info(f"Folder already exists, reusing: {existing['file_id']}")
             return self._row_to_file_info(existing)
@@ -437,7 +443,8 @@ class FileService:
             direct_url=folder_info.direct_url,
             access_hash=folder_info.access_hash,
             parent_id=folder_info.parent_id,
-            is_dir=folder_info.isDir
+            is_dir=folder_info.isDir,
+            telegram_user_id=telegram_user_id,
         )
         logger.info(f"Folder inserted: {name}, id: {file_id}")
         
@@ -463,10 +470,13 @@ class FileService:
             return result
         return False
 
-    async def delete_all(self) -> int:
-        """Delete all files and folders from metadata."""
+    async def delete_all(self, telegram_user_id: int = 0) -> int:
+        """Delete all files and folders for the given user (or all if 0)."""
         db = await self._get_db()
-        count = await db.delete_all_files()
+        if telegram_user_id:
+            count = await db.delete_user_files(telegram_user_id)
+        else:
+            count = await db.delete_all_files()
         logger.info(f"All files deleted: {count} items")
         return count
 

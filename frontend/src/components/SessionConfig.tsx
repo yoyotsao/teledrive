@@ -1,183 +1,78 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { getTelegramClient } from '../lib/gramjs';
 
-interface SessionConfigProps {
-  onConfigured?: () => void;
-}
-
-export default function SessionConfig({ onConfigured }: SessionConfigProps) {
-  const [status, setStatus] = useState<'idle' | 'checking' | 'connected' | 'error'>('idle');
+export default function SessionConfig() {
+  const [status, setStatus] = useState<'checking' | 'connected' | 'error'>('checking');
   const [errorMessage, setErrorMessage] = useState('');
-  const [serverStatus, setServerStatus] = useState<string | null>(null);
-  const [telegramStatus, setTelegramStatus] = useState<'idle' | 'connected' | 'error'>('idle');
 
-  // Check backend health on mount
-  useEffect(() => {
-    checkBackend();
-    checkTelegram();
-  }, []);
-
-  const checkTelegram = async () => {
-    const apiId = import.meta.env.VITE_TELEGRAM_API_ID;
-    const apiHash = import.meta.env.VITE_TELEGRAM_API_HASH;
-    const sessionString = import.meta.env.VITE_TELEGRAM_SESSION;
-
-    if (apiId && apiHash && sessionString) {
-      try {
-        const client = getTelegramClient();
-        await client.initialize(parseInt(apiId), apiHash, sessionString);
-        setTelegramStatus('connected');
-        console.log('[Session] Telegram client initialized successfully');
-      } catch (err: any) {
-        console.error('[Session] Telegram init failed:', err);
-        setTelegramStatus('error');
-      }
-    } else {
-      console.log('[Session] Missing Telegram credentials - apiId:', !!apiId, 'apiHash:', !!apiHash, 'session:', !!sessionString);
-    }
-  };
+  useEffect(() => { checkBackend(); }, []);
 
   const checkBackend = async () => {
     setStatus('checking');
     setErrorMessage('');
     try {
-      // Try to hit the files endpoint - if it works, backend is configured
-      const response = await axios.get('/api/v1/files', {
+      const token = localStorage.getItem('tg_jwt');
+      await axios.get('/api/v1/files', {
         params: { page: 1, page_size: 1 },
         timeout: 10000,
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (response.status === 200) {
-        setStatus('connected');
-        setServerStatus('Backend connected');
-        onConfigured?.();
-      }
+      setStatus('connected');
     } catch (err: any) {
-      // If 401/403 from auth, or 500 from missing config, backend might still work
-      if (err.response?.status === 401 || err.response?.status === 403) {
+      if (err.response?.status === 401) {
         setStatus('connected');
-        setServerStatus('Backend connected (auth required)');
-        onConfigured?.();
       } else if (err.code === 'ERR_NETWORK' || err.code === 'ECONNREFUSED') {
         setStatus('error');
-        setErrorMessage('Backend not reachable at http://localhost:8000');
+        setErrorMessage('無法連線到後端伺服器');
       } else {
-        // Other errors might just mean no files yet - backend is running
         setStatus('connected');
-        setServerStatus('Backend connected');
-        onConfigured?.();
       }
     }
   };
 
   if (status === 'connected') {
-    const telegramReady = telegramStatus === 'connected';
     return (
       <div style={{
-        padding: '12px 16px',
-        background: telegramReady ? '#dcfce7' : '#fef3c7',
-        borderBottom: '1px solid',
-        borderBottomColor: telegramReady ? '#86efac' : '#fcd34d',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between'
+        padding: '8px 16px',
+        background: '#dcfce7',
+        borderBottom: '1px solid #86efac',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ color: telegramReady ? '#166534' : '#92400e' }}>
-            {telegramReady ? '✓' : '⚠'}
-          </span>
-          <span style={{ color: telegramReady ? '#166534' : '#92400e', fontWeight: 500 }}>
-            TeleDrive {telegramReady ? 'Ready' : 'Incomplete'}
-          </span>
-          {serverStatus && (
-            <span style={{ color: telegramReady ? '#166534' : '#92400e', fontSize: '12px' }}>
-              — {serverStatus}
-            </span>
-          )}
-          {telegramStatus === 'error' && (
-            <span style={{ color: '#dc2626', fontSize: '12px' }}>— Telegram failed</span>
-          )}
-          {telegramStatus === 'idle' && (
-            <span style={{ color: '#92400e', fontSize: '12px' }}>— No Telegram config</span>
-          )}
-        </div>
-        <div style={{ display: 'flex', gap: '8px' }}>
-          {telegramStatus !== 'connected' && (
-            <button
-              onClick={checkTelegram}
-              style={{
-                padding: '4px 12px',
-                background: '#d97706',
-                color: 'white',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: 'pointer',
-                fontSize: '12px',
-              }}
-            >
-              Retry Telegram
-            </button>
-          )}
-          <button
-            onClick={checkBackend}
-            style={{
-              padding: '4px 12px',
-              background: telegramReady ? '#22c55e' : '#d97706',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              fontSize: '12px',
-            }}
-          >
-            Recheck
-          </button>
-        </div>
+        <span style={{ color: '#166534', fontWeight: 500, fontSize: 13 }}>
+          ✓ 後端已連線
+        </span>
+        <button onClick={checkBackend} style={{
+          padding: '3px 10px', background: '#22c55e', color: '#fff',
+          border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12,
+        }}>
+          重新確認
+        </button>
+      </div>
+    );
+  }
+
+  if (status === 'error') {
+    return (
+      <div style={{
+        padding: '8px 16px',
+        background: '#fee2e2',
+        borderBottom: '1px solid #fca5a5',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <span style={{ color: '#dc2626', fontSize: 13 }}>✗ {errorMessage}</span>
+        <button onClick={checkBackend} style={{
+          padding: '3px 10px', background: '#ef4444', color: '#fff',
+          border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12,
+        }}>
+          重試
+        </button>
       </div>
     );
   }
 
   return (
-    <div style={{
-      padding: '16px',
-      background: '#fef3c7',
-      borderBottom: '1px solid #fcd34d'
-    }}>
-      <h3 style={{ margin: '0 0 12px 0', fontSize: '14px', fontWeight: 600, color: '#92400e' }}>
-        Backend Connection
-      </h3>
-      <p style={{ margin: '0 0 12px 0', fontSize: '12px', color: '#a16207' }}>
-        Make sure the backend is running. Configure credentials in <code>backend/.env</code>
-      </p>
-      
-      {status === 'checking' && (
-        <p style={{ margin: 0, fontSize: '13px', color: '#a16207' }}>
-          Checking backend connection...
-        </p>
-      )}
-
-      {status === 'error' && (
-        <div>
-          <p style={{ margin: '0 0 8px 0', fontSize: '13px', color: '#dc2626' }}>
-            ✗ {errorMessage}
-          </p>
-          <button
-            onClick={checkBackend}
-            style={{
-              padding: '8px 16px',
-              background: '#d97706',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              fontWeight: 500,
-              fontSize: '13px',
-            }}
-          >
-            Retry
-          </button>
-        </div>
-      )}
+    <div style={{ padding: '8px 16px', background: '#f3f4f6', borderBottom: '1px solid #e5e7eb', fontSize: 13, color: '#6b7280' }}>
+      正在連線...
     </div>
   );
 }

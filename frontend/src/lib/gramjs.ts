@@ -92,7 +92,7 @@ export class TelegramClientManager {
 
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: false,
+      useWSS: window.location.protocol === 'https:',
       deviceModel: "TeleDrive Browser",
       appVersion: "1.0.0",
     });
@@ -861,19 +861,27 @@ export class TelegramClientManager {
     this.session = new StringSession('');
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: false,
+      useWSS: window.location.protocol === 'https:',
       deviceModel: 'TeleDrive Browser',
       appVersion: '1.0.0',
     });
 
-    await (this.client as any).start({
-      qrCode: async (qr: { token: Buffer; expires: number }) => {
-        const tokenBase64 = btoa(String.fromCharCode(...new Uint8Array(qr.token)));
-        onQRCode(`tg://login?token=${tokenBase64}`, qr.expires);
+    // Connect first, then use signInUserWithQrCode directly.
+    // GramJS 2.26.x start() _authFlow only routes to signInUser or signInBot —
+    // qrCode callback in start() params is not dispatched.
+    await this.client.connect();
+
+    await (this.client as any).signInUserWithQrCode(
+      { apiId, apiHash },
+      {
+        qrCode: async (qr: { token: Buffer; expires: number }) => {
+          const tokenBase64 = btoa(String.fromCharCode(...new Uint8Array(qr.token)));
+          onQRCode(`tg://login?token=${tokenBase64}`, qr.expires);
+        },
+        password: onPasswordRequired,
+        onError: (err: Error) => { console.error('[QRLogin]', err); },
       },
-      password: onPasswordRequired,
-      onError: (err: Error) => { console.error('[QRLogin]', err); },
-    });
+    );
 
     return this.session.save();
   }
@@ -896,7 +904,7 @@ export class TelegramClientManager {
     this.session = new StringSession('');
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: false,
+      useWSS: window.location.protocol === 'https:',
       deviceModel: 'TeleDrive Browser',
       appVersion: '1.0.0',
     });

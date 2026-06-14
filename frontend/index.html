@@ -37,10 +37,10 @@
         if (typeof url === 'string' && url.indexOf('/apiws') !== -1) {
           try {
             var p = new URL(url);
-            var domain = getTelegramDomain(p.hostname);
-            if (domain) {
-              url = 'wss://' + domain + '/apiws';
-            }
+            // If it's a raw DC IP, map to named domain. Otherwise keep the hostname.
+            // Always upgrade to wss:// — *.web.telegram.org supports WSS directly.
+            var domain = getTelegramDomain(p.hostname) || p.hostname;
+            url = 'wss://' + domain + '/apiws';
           } catch (e) {}
         }
         if (protocols !== undefined) {

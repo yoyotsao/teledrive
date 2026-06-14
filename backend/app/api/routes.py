@@ -138,6 +138,20 @@ async def _download_thumbnail_base64(client, message_id: int) -> Optional[str]:
 router = APIRouter(prefix="/api/v1", tags=["files"])
 
 
+_GRAMJS_DOMAIN_TO_IP = {
+    'pluto.web.telegram.org': '149.154.175.53',
+    'venus.web.telegram.org': '149.154.167.51',
+    'aurora.web.telegram.org': '149.154.175.100',
+    'vesta.web.telegram.org': '149.154.167.91',
+    'flora.web.telegram.org': '91.108.56.130',
+    'pluto-1.web.telegram.org': '149.154.175.53',
+    'venus-1.web.telegram.org': '149.154.167.51',
+    'aurora-1.web.telegram.org': '149.154.175.100',
+    'vesta-1.web.telegram.org': '149.154.167.91',
+    'flora-1.web.telegram.org': '91.108.56.130',
+}
+
+
 def _parse_gramjs_session(gramjs: str):
     """Convert a GramJS StringSession string to a Telethon MemorySession.
 
@@ -145,7 +159,6 @@ def _parse_gramjs_session(gramjs: str):
     Telethon MemorySession is populated directly from these components.
     """
     import struct
-    import socket
     import ipaddress
     from telethon.sessions import MemorySession
     from telethon.crypto import AuthKey
@@ -164,7 +177,7 @@ def _parse_gramjs_session(gramjs: str):
         ipaddress.ip_address(addr)
         resolved = addr
     except ValueError:
-        resolved = socket.gethostbyname(addr)
+        resolved = _GRAMJS_DOMAIN_TO_IP.get(addr) or addr
     session = MemorySession()
     session.set_dc(dc_id, resolved, port)
     session.auth_key = AuthKey(auth_key_bytes)

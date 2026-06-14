@@ -521,6 +521,10 @@ async def get_file_thumbnail(file_id: str, current_user: int = Depends(get_curre
         if not user_client:
             raise HTTPException(status_code=401, detail="User session not found, please re-login")
 
+        if not user_client.is_connected():
+            logger.info(f"Telethon client for user {current_user} disconnected, reconnecting...")
+            await user_client.connect()
+
         logger.info(f"Thumbnail cache miss for {file_id}, fetching message {message_id}")
         thumbnail_data = await _download_thumbnail_base64(user_client, message_id)
 

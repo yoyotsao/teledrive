@@ -70,8 +70,10 @@ export function ChonkyDrive() {
       signal?.addEventListener('abort', onParentAbort);
 
       try {
+        const jwt = localStorage.getItem('tg_jwt');
         const resp = await fetch(`/api/v1/files/${file.file_id}/thumbnail`, {
           signal: fetchAbort.signal,
+          headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
         });
         if (!resp.ok) {
           pendingThumbsRef.current.delete(file.file_id);

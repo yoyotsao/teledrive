@@ -3,7 +3,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { getTelegramClient } from '../lib/gramjs';
 
 type Props = {
-  onLogin: (sessionString: string) => void;
+  onLogin: (sessionString: string) => Promise<void>;
 };
 
 type Tab = 'qr' | 'phone';
@@ -51,7 +51,7 @@ export default function LoginScreen({ onLogin }: Props) {
   );
 }
 
-function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => void; apiId: number; apiHash: string }) {
+function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<void>; apiId: number; apiHash: string }) {
   const [qrUrl, setQrUrl] = useState<string>('');
   const [status, setStatus] = useState<string>('正在生成 QR Code...');
   const [passwordHint, setPasswordHint] = useState('');
@@ -78,9 +78,10 @@ function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => void; apiI
           setResolvePassword(() => resolve);
         });
       },
-    ).then((sessionString) => {
+    ).then(async (sessionString) => {
+      setStatus('後端驗證中...');
+      await onLogin(sessionString);
       setStatus('登入成功！');
-      onLogin(sessionString);
     }).catch((err) => {
       setError('QR 登入失敗：' + (err?.message ?? err));
       setStatus('');
@@ -131,7 +132,7 @@ function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => void; apiI
   );
 }
 
-function PhoneTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => void; apiId: number; apiHash: string }) {
+function PhoneTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<void>; apiId: number; apiHash: string }) {
   const [step, setStep] = useState<PhoneStep>('phone');
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');

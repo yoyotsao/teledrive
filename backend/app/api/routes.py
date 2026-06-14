@@ -138,6 +138,39 @@ async def _download_thumbnail_base64(client, message_id: int) -> Optional[str]:
 router = APIRouter(prefix="/api/v1", tags=["files"])
 
 
+def _parse_gramjs_session(gramjs: str):
+    """Convert a GramJS StringSession string to a Telethon MemorySession.
+
+    GramJS format: '1' + base64(dc_id[1] + addr_len[2BE] + addr[N] + port[2BE] + auth_key[256])
+    Telethon MemorySession is populated directly from these components.
+    """
+    import struct
+    import socket
+    import ipaddress
+    from telethon.sessions import MemorySession
+    from telethon.crypto import AuthKey
+
+    if not gramjs or gramjs[0] != '1':
+        raise ValueError("Invalid GramJS session (expected version '1')")
+    b64 = gramjs[1:]
+    b64 += '=' * ((4 - len(b64) % 4) % 4)
+    raw = base64.b64decode(b64)
+    dc_id = raw[0]
+    addr_len = struct.unpack('>H', raw[1:3])[0]
+    addr = raw[3:3 + addr_len].decode('utf-8')
+    port = struct.unpack('>H', raw[3 + addr_len:5 + addr_len])[0]
+    auth_key_bytes = raw[5 + addr_len:5 + addr_len + 256]
+    try:
+        ipaddress.ip_address(addr)
+        resolved = addr
+    except ValueError:
+        resolved = socket.gethostbyname(addr)
+    session = MemorySession()
+    session.set_dc(dc_id, resolved, port)
+    session.auth_key = AuthKey(auth_key_bytes)
+    return session
+
+
 class LoginRequest(BaseModel):
     session_string: str
 
@@ -183,24 +216,20 @@ class VideoThumbnailRequest(BaseModel):
 async def login(request: LoginRequest):
     """Verify GramJS session via Telethon, store per-user client, return JWT."""
     from telethon import TelegramClient
-    from telethon.sessions import StringSession
     from app.services.config import get_settings
 
     settings = get_settings()
+    client = None
     try:
-        client = TelegramClient(
-            StringSession(request.session_string),
-            settings.telegram_api_id,
-            settings.telegram_api_hash,
-        )
+        session = _parse_gramjs_session(request.session_string)
+        client = TelegramClient(session, settings.telegram_api_id, settings.telegram_api_hash)
         await client.connect()
         me = await client.get_me()
         if not me:
             raise HTTPException(status_code=401, detail="Invalid session")
 
         telegram_user_id = me.id
-        await store_user_session(telegram_user_id, request.session_string)
-        await client.disconnect()
+        await store_user_session(telegram_user_id, client)
 
         token = create_jwt(telegram_user_id)
         logger.info(f"User {telegram_user_id} ({me.username}) logged in")
@@ -211,8 +240,12 @@ async def login(request: LoginRequest):
             first_name=me.first_name,
         )
     except HTTPException:
+        if client:
+            await client.disconnect()
         raise
     except Exception as e:
+        if client:
+            await client.disconnect()
         logger.error(f"Login failed: {e}")
         raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
 

@@ -30,15 +30,10 @@ function App() {
   }, []);
 
   const handleLogin = async (sessionString: string) => {
-    try {
-      const loginResp = await api.loginToBackend(sessionString);
-      saveCredentialsToStorage(sessionString, loginResp.token);
-      setUserName(loginResp.first_name || loginResp.username || String(loginResp.user_id));
-      setAuthState('authenticated');
-    } catch (err) {
-      console.error('[App] Backend login failed:', err);
-      clearCredentialsFromStorage();
-    }
+    const loginResp = await api.loginToBackend(sessionString);
+    saveCredentialsToStorage(sessionString, loginResp.token);
+    setUserName(loginResp.first_name || loginResp.username || String(loginResp.user_id));
+    setAuthState('authenticated');
   };
 
   const handleLogout = () => {

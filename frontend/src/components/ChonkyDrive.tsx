@@ -3,6 +3,7 @@ import { FileData } from '@aperturerobotics/chonky';
 import { api, generateThumbnail } from '../api/client';
 import { getTelegramClient } from '../lib/gramjs';
 import { generateVideoThumbnail } from '../lib/videoThumbnail';
+import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { MAX_UPLOAD_CONCURRENCY } from '../config';
@@ -54,42 +55,37 @@ export function ChonkyDrive() {
   const folderInputRef = useRef<HTMLInputElement>(null);
 
   const loadThumbnails = useCallback(async (files: FileInfo[], signal?: AbortSignal) => {
-    const imageOrVideoFiles = files.filter(
-      (f) => f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/')
+    const thumbFiles = files.filter(
+      (f) => (f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/'))
+             && f.thumbnail_message_id
     );
 
-    for (const file of imageOrVideoFiles) {
+    for (const file of thumbFiles) {
       if (signal?.aborted) break;
       if (pendingThumbsRef.current.has(file.file_id)) continue;
       pendingThumbsRef.current.add(file.file_id);
 
-      // Per-fetch AbortController combining parent signal + 15-second timeout
-      const fetchAbort = new AbortController();
-      const timer = setTimeout(() => fetchAbort.abort(), 15000);
-      const onParentAbort = () => fetchAbort.abort();
-      signal?.addEventListener('abort', onParentAbort);
-
       try {
-        const jwt = localStorage.getItem('tg_jwt');
-        const resp = await fetch(`/api/v1/files/${file.file_id}/thumbnail`, {
-          signal: fetchAbort.signal,
-          headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
-        });
-        if (!resp.ok) {
-          pendingThumbsRef.current.delete(file.file_id);
+        // 1. IndexedDB cache hit → instant display
+        const cached = await getCachedThumbnail(file.file_id);
+        if (cached) {
+          setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(cached) }));
           continue;
         }
-        const blob = await resp.blob();
-        const thumbUrl = URL.createObjectURL(blob);
-        setThumbnails((prev) => ({ ...prev, [file.file_id]: thumbUrl }));
+
+        if (signal?.aborted) break;
+
+        // 2. Cache miss → download via GramJS directly from Telegram
+        const blob = await getTelegramClient().downloadThumbnail(file.thumbnail_message_id!);
+
+        // 3. Persist in IndexedDB for next load
+        await setCachedThumbnail(file.file_id, blob);
+        setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
       } catch (err: any) {
         pendingThumbsRef.current.delete(file.file_id);
         if (err?.name !== 'AbortError') {
-          console.log(`[Thumb] Error for ${file.filename}:`, err?.message);
+          console.warn(`[Thumb] Error for ${file.filename}:`, err?.message);
         }
-      } finally {
-        clearTimeout(timer);
-        signal?.removeEventListener('abort', onParentAbort);
       }
     }
   }, []);

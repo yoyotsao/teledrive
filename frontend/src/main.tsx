@@ -311,7 +311,10 @@ async function handleGetSplitMetadata(event: MessageEvent) {
   const { splitGroupId } = event.data;
   const port = event.ports[0];
   try {
-    const response = await fetch(`/api/v1/files?split_group_id=${encodeURIComponent(splitGroupId)}&page_size=100`);
+    const token = localStorage.getItem('tg_jwt');
+    const response = await fetch(`/api/v1/files?split_group_id=${encodeURIComponent(splitGroupId)}&page_size=100`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
     if (!response.ok) throw new Error(`Failed to fetch split parts: ${response.status}`);
     const data = await response.json();
 

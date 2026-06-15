@@ -18,7 +18,10 @@
     (function () {
       var _nativeAlert = window.alert;
       window.alert = function (msg) {
-        if (typeof msg === 'string' && msg.indexOf('Missing MTProto Entity') !== -1) {
+        if (typeof msg === 'string' && (
+          msg.indexOf('Missing MTProto Entity') !== -1 ||
+          msg.indexOf('Could not find a matching Constructor ID') !== -1
+        )) {
           console.warn('[GramJS unknown TL] ' + msg);
           return;
         }

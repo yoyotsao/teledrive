@@ -92,6 +92,11 @@ class Database:
         except aiosqlite.OperationalError:
             pass
 
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
+        except aiosqlite.OperationalError:
+            pass
+
         # Upload sessions table
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS upload_sessions (
@@ -139,7 +144,8 @@ class Database:
         part_index: Optional[int] = None,
         total_parts: Optional[int] = None,
         split_group_id: Optional[str] = None,
-        telegram_user_id: int = 0
+        telegram_user_id: int = 0,
+        file_hash: Optional[str] = None,
     ) -> None:
         """Insert a new file record."""
         if not self._conn:
@@ -151,16 +157,27 @@ class Database:
                 telegram_message_id, thumbnail_message_id,
                 created_at, direct_url, access_hash, parent_id, isDir,
                 is_split_file, original_name, part_index, total_parts, split_group_id,
-                telegram_user_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                telegram_user_id, file_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_id, filename, filesize, mime_type, file_type,
             telegram_message_id, thumbnail_message_id,
             created_at, direct_url, access_hash, parent_id, 1 if is_dir else 0,
             1 if is_split_file else 0, original_name, part_index, total_parts, split_group_id,
-            telegram_user_id
+            telegram_user_id, file_hash,
         ))
         await self._conn.commit()
+
+    async def find_by_hash(self, file_hash: str, telegram_user_id: int) -> List[dict]:
+        """Find all file records with the given SHA-256 hash for this user."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "SELECT * FROM files WHERE file_hash = ? AND telegram_user_id = ? AND isDir = 0 ORDER BY part_index ASC",
+            (file_hash, telegram_user_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
     
     async def get_file(self, file_id: str, telegram_user_id: Optional[int] = None) -> Optional[dict]:
         """Get a file by ID, optionally filtered by telegram_user_id."""
@@ -242,11 +259,12 @@ class Database:
         where_clauses = ["isDir = ?", "telegram_user_id = ?"]
         params: list = [1 if is_dir else 0, telegram_user_id]
 
-        if parent_id is None:
-            where_clauses.append("parent_id IS NULL")
-        else:
-            where_clauses.append("parent_id = ?")
-            params.append(parent_id)
+        if split_group_id is None:
+            if parent_id is None:
+                where_clauses.append("parent_id IS NULL")
+            else:
+                where_clauses.append("parent_id = ?")
+                params.append(parent_id)
 
         if split_group_id is not None:
             where_clauses.append("split_group_id = ?")
@@ -279,20 +297,21 @@ class Database:
         self,
         file_id: str,
         thumbnail_message_id: Optional[int] = None,
-        parent_id: Optional[str] = None
+        parent_id: Optional[str] = None,
+        set_parent_id: bool = False
     ) -> Optional[dict]:
         """Update file metadata."""
         if not self._conn:
             raise RuntimeError("Database not connected")
-        
+
         updates = []
         params = []
-        
+
         if thumbnail_message_id is not None:
             updates.append("thumbnail_message_id = ?")
             params.append(thumbnail_message_id)
-        
-        if parent_id is not None:
+
+        if set_parent_id:
             updates.append("parent_id = ?")
             params.append(parent_id)
         

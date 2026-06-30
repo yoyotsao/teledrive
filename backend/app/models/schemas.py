@@ -55,6 +55,7 @@ class FileInfo(BaseModel):
     is_split_file: bool = Field(False, description="Whether this file is part of a split upload")
     split_group_id: Optional[str] = Field(None, description="Group ID shared by all parts of a split file")
     part_index: Optional[int] = Field(None, description="Zero-based index of this part within the split group")
+    file_hash: Optional[str] = Field(None, description="SHA-256 hash of the original file for deduplication")
 
 
 class UploadInitResponse(BaseModel):

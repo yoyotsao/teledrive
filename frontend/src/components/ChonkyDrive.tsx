@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { FileData } from '@aperturerobotics/chonky';
 import { api, generateThumbnail } from '../api/client';
+import { sha256File } from '../lib/hashFile';
 import { getTelegramClient } from '../lib/gramjs';
 import { generateVideoThumbnail } from '../lib/videoThumbnail';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
@@ -34,6 +35,7 @@ export function ChonkyDrive() {
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const lastSelectedRef = useRef<string | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
+  const [dragOverBreadcrumbId, setDragOverBreadcrumbId] = useState<string | null>(null);
   const [isDraggingInternal, setIsDraggingInternal] = useState(false);
 
   const dragCounterRef = useRef(0);
@@ -53,6 +55,13 @@ export function ChonkyDrive() {
   const [uploadTotals, setUploadTotals] = useState<{ total: number; done: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+
+  // Box select state
+  const boxSelectStartRef = useRef<{ x: number; y: number } | null>(null);
+  const boxSelectActivatedRef = useRef(false);
+  const [boxSelectRect, setBoxSelectRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const fileCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   const loadThumbnails = useCallback(async (files: FileInfo[], signal?: AbortSignal) => {
     const thumbFiles = files.filter(
@@ -195,6 +204,61 @@ export function ChonkyDrive() {
     }
   }, [thumbnails]);
 
+  // Box select: track mouse during drag, update selection rect + selected files
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!boxSelectStartRef.current) return;
+      const { x: startX, y: startY } = boxSelectStartRef.current;
+      const width = Math.abs(e.clientX - startX);
+      const height = Math.abs(e.clientY - startY);
+
+      // 8px 拖曳閾值：低於此視為點擊，不啟動框選
+      if (width < 8 && height < 8) return;
+
+      if (!boxSelectActivatedRef.current) {
+        boxSelectActivatedRef.current = true;
+        // 首次超過閾值才清除選取（無修飾鍵時）
+        setSelectedFiles(new Set());
+        lastSelectedRef.current = null;
+      }
+
+      const left = Math.min(startX, e.clientX);
+      const top = Math.min(startY, e.clientY);
+      setBoxSelectRect({ left, top, width, height });
+
+      const newSelected = new Set<string>();
+      fileCardRefs.current.forEach((el, fileId) => {
+        const cardRect = el.getBoundingClientRect();
+        if (
+          cardRect.right > left && cardRect.left < left + width &&
+          cardRect.bottom > top && cardRect.top < top + height
+        ) {
+          newSelected.add(fileId);
+        }
+      });
+      setSelectedFiles(newSelected);
+    };
+
+    const handleMouseUp = () => {
+      // 短點擊空白處（未超過拖曳閾值）→ 取消所有選取
+      if (boxSelectStartRef.current && !boxSelectActivatedRef.current) {
+        setSelectedFiles(new Set());
+        lastSelectedRef.current = null;
+      }
+      boxSelectStartRef.current = null;
+      setBoxSelectRect(null);
+      // boxSelectActivatedRef 留給 onClick 消費後自行清除
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Handle keyboard delete
   useEffect(() => {
     const handleKeyDown = async (event: KeyboardEvent) => {
@@ -226,8 +290,7 @@ export function ChonkyDrive() {
       setCurrentFolderId(null);
       setBreadcrumb([]);
     } else {
-      // Navigate to the folder at this index
-      const targetFolder = breadcrumb[index];
+      const targetFolder = breadcrumb[index - 1];
       setCurrentFolderId(targetFolder.id);
       setBreadcrumb((prev) => prev.slice(0, index));
     }
@@ -308,12 +371,39 @@ export function ChonkyDrive() {
       );
     }
 
+    // Hash-based deduplication: compute SHA-256 and check if file already uploaded
+    const fileHash = await sha256File(file);
+    const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] }));
+
+    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+    if (hashCheck.found && hashCheck.files.length > 0) {
+      console.log('[Upload] Duplicate detected by hash, skipping Telegram upload for:', file.name);
+      onProgress?.(100);
+      await Promise.all(hashCheck.files.map((existing, i) =>
+        api.registerFile({
+          filename: file.name,
+          filesize: existing.filesize,
+          mimeType: existing.mime_type ?? undefined,
+          messageId: existing.telegram_message_id!,
+          fileId: `${splitGroupId}-${i}`,
+          accessHash: existing.access_hash ?? undefined,
+          parentId: currentFolderId ?? undefined,
+          isSplitFile: true,
+          splitGroupId,
+          partIndex: existing.part_index ?? i,
+          totalParts: hashCheck.files.length,
+          originalName: file.name,
+          fileHash,
+        })
+      ));
+      console.log('[Upload] Dedup: registered', hashCheck.files.length, 'parts from existing upload');
+      return;
+    }
+
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
     const uploadResult = await telegramClient.uploadFileSplit(file, onProgress);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
-
-    // Generate split_group_id for this file
-    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
     // Register all parts first so the file appears immediately in the UI
     await Promise.all(uploadResult.parts.map((part, i) =>
@@ -330,6 +420,7 @@ export function ChonkyDrive() {
         partIndex: i,
         totalParts: uploadResult.parts.length,
         originalName: file.name,
+        fileHash,
       })
     ));
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
@@ -502,8 +593,34 @@ export function ChonkyDrive() {
     const uploadFileEntry = async (file: File, folderPath: string): Promise<void> => {
       const telegramClient = getTelegramClient();
       const folderId = await ensureFolder(folderPath);
-      const uploadResult = await telegramClient.uploadFileSplit(file);
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+      const fileHash = await sha256File(file);
+      const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] }));
+
+      if (hashCheck.found && hashCheck.files.length > 0) {
+        console.log('[Upload] Duplicate detected by hash (folder upload):', file.name);
+        await Promise.all(hashCheck.files.map((existing, j) =>
+          api.registerFile({
+            filename: file.name,
+            filesize: existing.filesize,
+            mimeType: existing.mime_type ?? undefined,
+            messageId: existing.telegram_message_id!,
+            fileId: `${splitGroupId}-${j}`,
+            accessHash: existing.access_hash ?? undefined,
+            parentId: folderId ?? undefined,
+            isSplitFile: true,
+            splitGroupId,
+            partIndex: existing.part_index ?? j,
+            totalParts: hashCheck.files.length,
+            originalName: file.name,
+            fileHash,
+          })
+        ));
+        return;
+      }
+
+      const uploadResult = await telegramClient.uploadFileSplit(file);
       await Promise.all(uploadResult.parts.map((part, j) =>
         api.registerFile({
           filename: file.name,
@@ -518,6 +635,7 @@ export function ChonkyDrive() {
           partIndex: j,
           totalParts: uploadResult.parts.length,
           originalName: file.name,
+          fileHash,
         })
       ));
       // Thumbnail — fire-and-forget
@@ -621,8 +739,14 @@ export function ChonkyDrive() {
 
   // Selection handlers
   const handleFileClick = useCallback((file: FileData, event: React.MouseEvent) => {
+    // 若框選拖曳剛結束，此次 click 是拖曳結束而非點擊，跳過
+    if (boxSelectActivatedRef.current) {
+      boxSelectActivatedRef.current = false;
+      return;
+    }
+
     const fileId = file.id;
-    
+
     if (event.ctrlKey || event.metaKey) {
       // Ctrl+Click: toggle multi-select
       setSelectedFiles((prev) => {
@@ -659,23 +783,25 @@ export function ChonkyDrive() {
     }
   }, [files, selectedFiles]);
 
+  // Box select: start on mousedown on empty space (not on a file card)
+  const handleGridMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    // 點擊在 file card 上 → 讓 HTML5 drag / onClick 處理，不啟動框選
+    if (target.closest('[data-file-card]')) return;
+    e.preventDefault();
+    boxSelectActivatedRef.current = false;
+    boxSelectStartRef.current = { x: e.clientX, y: e.clientY };
+  }, []);
+
   // Drag handlers for file items
   const handleFileDragStart = useCallback((file: FileData, event: React.DragEvent) => {
-    console.log('[DragStart] Starting drag for file:', file.id, file.name, 'isDir:', file.isDir);
-    
-    // Only allow dragging files (not folders)
-    if (file.isDir) {
-      event.preventDefault();
-      return;
-    }
-    
-    // Set drag data with custom type to distinguish from external file drops
     event.dataTransfer.effectAllowed = 'move';
     event.dataTransfer.dropEffect = 'move';
-    event.dataTransfer.setData('application/x-teledrive-file-id', file.id);
+    event.dataTransfer.setData('application/x-teledrive-item-id', file.id);
     setIsDraggingInternal(true);
-    
-    // If file is not selected, select just this file
+
+    // 若此項目未被選取，改為只選取它
     if (!selectedFiles.has(file.id)) {
       setSelectedFiles(new Set([file.id]));
     }
@@ -702,10 +828,11 @@ export function ChonkyDrive() {
     event.dataTransfer.dropEffect = 'move';
   }, []);
 
-  const handleFolderDrop = useCallback(async (folderId: string, event: React.DragEvent) => {
+  const handleFolderDrop = useCallback(async (folderId: string | null, event: React.DragEvent) => {
     event.preventDefault();
     event.stopPropagation();
     setDragOverFolderId(null);
+    setDragOverBreadcrumbId(null);
     console.log('[Drop] handleFolderDrop called, folderId:', folderId);
 
     // Get selected file IDs (from selection or from drag data)
@@ -713,13 +840,12 @@ export function ChonkyDrive() {
     console.log('[Drop] selectedIds from state:', selectedIds);
     
     if (selectedIds.length === 0) {
-      // Check for internal file drag
-      const dragData = event.dataTransfer.getData('application/x-teledrive-file-id');
-      console.log('[Drop] dragData from dataTransfer:', dragData);
-      if (dragData) {
-        selectedIds.push(dragData);
-      }
+      const dragData = event.dataTransfer.getData('application/x-teledrive-item-id');
+      if (dragData) selectedIds.push(dragData);
     }
+
+    // 防止把資料夾拖進自己裡面
+    if (selectedIds.includes(folderId)) return;
 
     if (selectedIds.length === 0) {
       console.log('[Drop] No files to move, returning');
@@ -890,33 +1016,43 @@ export function ChonkyDrive() {
           {/* Root segment - always visible */}
           <button
             onClick={() => handleNavigateToBreadcrumb(0)}
+            onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverBreadcrumbId('__root__'); }}
+            onDragLeave={() => setDragOverBreadcrumbId(null)}
+            onDrop={(e) => handleFolderDrop(null, e)}
             style={{
-              background: 'none',
-              border: 'none',
+              background: dragOverBreadcrumbId === '__root__' ? '#dbeafe' : 'none',
+              border: dragOverBreadcrumbId === '__root__' ? '2px dashed #3b82f6' : '2px solid transparent',
               cursor: 'pointer',
               color: '#3b82f6',
               fontSize: '16px',
-              padding: '0',
+              padding: '2px 6px',
+              borderRadius: '4px',
               fontWeight: 600,
+              transition: 'background 0.1s',
             }}
           >
             Root
           </button>
-          
+
           {/* Breadcrumb segments */}
           {breadcrumb.map((folder, index) => (
             <span key={folder.id} style={{ display: 'flex', alignItems: 'center' }}>
               <span style={{ color: '#9ca3af', margin: '0 8px' }}>/</span>
               <button
                 onClick={() => handleNavigateToBreadcrumb(index + 1)}
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverBreadcrumbId(folder.id); }}
+                onDragLeave={() => setDragOverBreadcrumbId(null)}
+                onDrop={(e) => handleFolderDrop(folder.id, e)}
                 style={{
-                  background: 'none',
-                  border: 'none',
+                  background: dragOverBreadcrumbId === folder.id ? '#dbeafe' : 'none',
+                  border: dragOverBreadcrumbId === folder.id ? '2px dashed #3b82f6' : '2px solid transparent',
                   cursor: 'pointer',
                   color: index === breadcrumb.length - 1 ? '#374151' : '#3b82f6',
                   fontSize: '16px',
-                  padding: '0',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
                   fontWeight: index === breadcrumb.length - 1 ? 600 : 400,
+                  transition: 'background 0.1s',
                 }}
               >
                 {folder.name}
@@ -1012,7 +1148,11 @@ export function ChonkyDrive() {
         />
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+      <div
+        ref={scrollContainerRef}
+        onMouseDown={viewMode === 'grid' ? handleGridMouseDown : undefined}
+        style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}
+      >
       {error && (
         <div
           style={{
@@ -1050,12 +1190,15 @@ export function ChonkyDrive() {
       )}
 
       {files.length > 0 && (
-        <div style={{
-          display: viewMode === 'grid' ? 'grid' : 'flex',
-          gridTemplateColumns: viewMode === 'grid' ? 'repeat(auto-fill, minmax(225px, 1fr))' : undefined,
-          flexDirection: viewMode === 'grid' ? undefined : 'column',
-          gap: '12px',
-        }}>
+        <div
+          style={{
+            display: viewMode === 'grid' ? 'grid' : 'flex',
+            gridTemplateColumns: viewMode === 'grid' ? 'repeat(auto-fill, minmax(225px, 1fr))' : undefined,
+            flexDirection: viewMode === 'grid' ? undefined : 'column',
+            gap: '12px',
+            userSelect: 'none',
+          }}
+        >
           {files.map((file) => {
             const original = originalFiles.find((f) => f.file_id === file.id);
             const isImage = original?.mime_type?.startsWith('image/');
@@ -1067,7 +1210,12 @@ export function ChonkyDrive() {
             return (
               <div
                 key={file.id}
-                draggable={!file.isDir}
+                data-file-card="true"
+                ref={(el) => {
+                  if (el) fileCardRefs.current.set(file.id, el);
+                  else fileCardRefs.current.delete(file.id);
+                }}
+                draggable={true}
                 onDragStart={(e) => handleFileDragStart(file, e)}
                 onDragEnd={handleFileDragEnd}
                 style={{
@@ -1156,14 +1304,26 @@ export function ChonkyDrive() {
                       <span style={{ fontSize: viewMode === 'grid' ? '60px' : '20px' }}>📄</span>
                     )}
                   </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ 
-                      fontSize: '14px', 
-                      color: '#374151',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}>
+                  <div style={{ flex: 1, minWidth: 0, width: viewMode === 'grid' ? '100%' : undefined }}>
+                    <div
+                      title={file.name}
+                      style={{
+                        fontSize: '14px',
+                        color: '#374151',
+                        ...(viewMode === 'grid'
+                          ? isSelected
+                            ? { wordBreak: 'break-word', overflowWrap: 'break-word' }
+                            : {
+                                display: '-webkit-box',
+                                WebkitLineClamp: 2,
+                                WebkitBoxOrient: 'vertical' as const,
+                                overflow: 'hidden',
+                                wordBreak: 'break-word',
+                                overflowWrap: 'break-word',
+                              }
+                          : { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }),
+                      }}
+                    >
                       {file.name}
                     </div>
                     {!file.isDir && file.size && viewMode !== 'grid' && (
@@ -1185,6 +1345,24 @@ export function ChonkyDrive() {
       </div>
 
       </div>
+
+      {/* Box Select Overlay */}
+      {boxSelectRect && boxSelectRect.width > 4 && boxSelectRect.height > 4 && (
+        <div
+          style={{
+            position: 'fixed',
+            left: boxSelectRect.left,
+            top: boxSelectRect.top,
+            width: boxSelectRect.width,
+            height: boxSelectRect.height,
+            background: 'rgba(59, 130, 246, 0.1)',
+            border: '1.5px solid #3b82f6',
+            borderRadius: '2px',
+            pointerEvents: 'none',
+            zIndex: 9999,
+          }}
+        />
+      )}
 
       {/* Preview Modal */}
       {previewFile && (

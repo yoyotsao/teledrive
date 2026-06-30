@@ -209,6 +209,7 @@ class RegisterFileRequest(BaseModel):
     part_index: Optional[int] = None
     total_parts: Optional[int] = None
     split_group_id: Optional[str] = None
+    file_hash: Optional[str] = None
 
 
 class CreateFolderRequest(BaseModel):
@@ -263,6 +264,19 @@ async def login(request: LoginRequest):
         raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
 
 
+@router.get("/files/check-hash")
+async def check_file_hash(
+    hash: str = Query(..., description="SHA-256 hex digest of the file"),
+    current_user: int = Depends(get_current_user),
+):
+    """Check if a file with this SHA-256 hash already exists for the current user."""
+    file_service = get_file_service()
+    files = await file_service.find_by_hash(hash, current_user)
+    if not files:
+        return {"found": False, "files": []}
+    return {"found": True, "files": [f.model_dump() for f in files]}
+
+
 @router.post("/files/register", response_model=FileInfo)
 async def register_file(
     request: RegisterFileRequest,
@@ -289,6 +303,7 @@ async def register_file(
             total_parts=request.total_parts,
             split_group_id=request.split_group_id,
             telegram_user_id=current_user,
+            file_hash=request.file_hash,
         )
         return file_info
     except Exception as e:
@@ -443,12 +458,13 @@ async def update_file(file_id: str, request: UpdateFileRequest, current_user: in
             raise HTTPException(status_code=404, detail="File not found")
         
         updated_info = await file_service.update_file(
-            file_id, 
+            file_id,
             thumbnail_message_id=request.thumbnail_message_id,
-            parent_id=request.parent_id
+            parent_id=request.parent_id,
+            set_parent_id='parent_id' in request.model_fields_set
         )
-        
-        logger.info(f"File updated successfully: {file_id}, parent_id set={request.parent_id is not None}")
+
+        logger.info(f"File updated successfully: {file_id}, parent_id set={'parent_id' in request.model_fields_set}, parent_id={request.parent_id}")
         return updated_info
     except HTTPException:
         raise

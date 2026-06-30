@@ -129,6 +129,7 @@ export const api = {
     partIndex?: number;
     totalParts?: number;
     originalName?: string;
+    fileHash?: string;
   }): Promise<FileInfo> => {
     const response = await client.post<FileInfo>('/files/register', {
       filename: params.filename,
@@ -144,6 +145,7 @@ export const api = {
       part_index: params.partIndex,
       total_parts: params.totalParts,
       original_name: params.originalName,
+      file_hash: params.fileHash,
     });
     return response.data;
   },
@@ -155,6 +157,13 @@ export const api = {
   getSplitGroupFiles: async (splitGroupId: string): Promise<FileListResponse> => {
     const response = await client.get<FileListResponse>('/files', {
       params: { split_group_id: splitGroupId, page_size: 10000 },
+    });
+    return response.data;
+  },
+
+  checkFileHash: async (hash: string): Promise<{ found: boolean; files: FileInfo[] }> => {
+    const response = await client.get<{ found: boolean; files: FileInfo[] }>('/files/check-hash', {
+      params: { hash },
     });
     return response.data;
   },

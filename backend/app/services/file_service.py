@@ -52,7 +52,8 @@ class FileService:
             isDir=bool(row['isDir']) if row.get('isDir') is not None else False,
             is_split_file=bool(row.get('is_split_file', 0)),
             split_group_id=row.get('split_group_id'),
-            part_index=row.get('part_index')
+            part_index=row.get('part_index'),
+            file_hash=row.get('file_hash'),
         )
     
     def _detect_file_type(self, mime_type: Optional[str], filename: str) -> FileType:
@@ -224,6 +225,7 @@ class FileService:
         total_parts: Optional[int] = None,
         split_group_id: Optional[str] = None,
         telegram_user_id: int = 0,
+        file_hash: Optional[str] = None,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -291,8 +293,9 @@ class FileService:
             total_parts=total_parts,
             split_group_id=split_group_id,
             telegram_user_id=telegram_user_id,
+            file_hash=file_hash,
         )
-        
+
         logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, thumbnail: {thumbnail_message_id}")
         
         return file_info
@@ -384,6 +387,12 @@ class FileService:
         if split_group_id is not None:
             files.sort(key=lambda f: getattr(f, 'part_index', 0) or 0)
         return files, total
+
+    async def find_by_hash(self, file_hash: str, telegram_user_id: int) -> List[FileInfo]:
+        """Return all file records matching this SHA-256 hash for the given user."""
+        db = await self._get_db()
+        rows = await db.find_by_hash(file_hash, telegram_user_id)
+        return [self._row_to_file_info(r) for r in rows]
 
     async def list_folders(
         self,
@@ -480,15 +489,16 @@ class FileService:
         logger.info(f"All files deleted: {count} items")
         return count
 
-    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, parent_id: Optional[str] = None) -> Optional[FileInfo]:
+    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, parent_id: Optional[str] = None, set_parent_id: bool = False) -> Optional[FileInfo]:
         """Update file metadata."""
         db = await self._get_db()
-        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, parent_id={parent_id}")
-        
+        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, parent_id={parent_id}, set_parent_id={set_parent_id}")
+
         updated_row = await db.update_file(
             file_id,
             thumbnail_message_id=thumbnail_message_id,
-            parent_id=parent_id
+            parent_id=parent_id,
+            set_parent_id=set_parent_id
         )
         
         if not updated_row:

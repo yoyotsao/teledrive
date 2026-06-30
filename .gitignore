@@ -78,6 +78,9 @@ logs/
 # Playwright Test Results
 test-results/
 
+# Playwright auth state (contains credentials — never commit)
+frontend/tests/storageState.json
+
 # Test files (test data for E2E tests)
 test-files/
 

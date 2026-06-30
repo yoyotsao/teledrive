@@ -443,6 +443,41 @@ export function ChonkyDrive() {
     }
   };
 
+  const uploadAlbumBatch = async (
+    batch: File[],
+    baseIndex: number,
+    results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>,
+    setResults: () => void,
+  ): Promise<void> => {
+    const telegramClient = getTelegramClient();
+    const albumResults = await telegramClient.uploadAlbum(batch, (fileIdx, pct) => {
+      results[baseIndex + fileIdx] = { ...results[baseIndex + fileIdx], progress: pct };
+      setResults();
+    });
+
+    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    await Promise.all(
+      albumResults.map((part, j) => {
+        const file = batch[j];
+        if (!part.message_id) return Promise.resolve();
+        return api.registerFile({
+          filename: file.name,
+          filesize: file.size,
+          mimeType: file.type || undefined,
+          messageId: part.message_id,
+          fileId: part.file_id || `${splitGroupId}-${j}`,
+          accessHash: part.access_hash,
+          parentId: currentFolderId ?? undefined,
+          isSplitFile: false,
+          splitGroupId: undefined,
+          partIndex: undefined,
+          totalParts: undefined,
+          originalName: file.name,
+        });
+      })
+    );
+  };
+
   const handleDrop = useCallback(async (event: React.DragEvent) => {
     event.preventDefault();
     dragCounterRef.current = 0;
@@ -486,29 +521,58 @@ export function ChonkyDrive() {
       status: 'uploading' as const,
     }));
 
+    const ALBUM_BATCH = 10;
+    const batches: File[][] = [];
+    for (let i = 0; i < droppedFiles.length; i += ALBUM_BATCH) {
+      batches.push(droppedFiles.slice(i, i + ALBUM_BATCH));
+    }
+
     const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
-    const uploadPromises = droppedFiles.map((file, i) =>
-      fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
-        results[i] = { ...results[i], progress: pct };
-        setUploadingFiles([...results]);
-      })).then(() => {
-        results[i] = { name: file.name, progress: 100, status: 'complete' };
+    let batchBaseIndex = 0;
+    const uploadPromises = batches.map((batch) => {
+      const baseIndex = batchBaseIndex;
+      batchBaseIndex += batch.length;
+
+      if (batch.length === 1) {
+        const file = batch[0];
+        const i = baseIndex;
+        return fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
+          results[i] = { ...results[i], progress: pct };
+          setUploadingFiles([...results]);
+        })).then(() => {
+          results[i] = { name: file.name, progress: 100, status: 'complete' };
+        }).catch((err: any) => {
+          results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+        }).finally(() => {
+          setUploadingFiles([...results]);
+        });
+      }
+
+      return fileSemaphore.withSlot(() =>
+        uploadAlbumBatch(batch, baseIndex, results, () => setUploadingFiles([...results]))
+      ).then(() => {
+        for (let j = 0; j < batch.length; j++) {
+          results[baseIndex + j] = { name: batch[j].name, progress: 100, status: 'complete' };
+        }
       }).catch((err: any) => {
-        results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+        for (let j = 0; j < batch.length; j++) {
+          results[baseIndex + j] = { name: batch[j].name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+        }
       }).finally(() => {
         setUploadingFiles([...results]);
-      })
-    );
+      });
+    });
+
     await Promise.allSettled(uploadPromises);
 
     loadContents();
   }, [currentFolderId, loadContents, uploadWithThumbnail, isDraggingInternal]);
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = Array.from(event.target.files || []);
-    if (selectedFiles.length === 0) return;
+    const pickedFiles = Array.from(event.target.files || []);
+    if (pickedFiles.length === 0) return;
 
-    const initialFiles = selectedFiles.map((f) => ({
+    const initialFiles = pickedFiles.map((f) => ({
       name: f.name,
       progress: 0,
       status: 'uploading' as const,
@@ -517,19 +581,48 @@ export function ChonkyDrive() {
 
     const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
 
+    const ALBUM_BATCH = 10;
+    const batches: File[][] = [];
+    for (let i = 0; i < pickedFiles.length; i += ALBUM_BATCH) {
+      batches.push(pickedFiles.slice(i, i + ALBUM_BATCH));
+    }
+
     const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
-    const uploadPromises = selectedFiles.map((file, i) =>
-      fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
-        results[i] = { ...results[i], progress: pct };
-        setUploadingFiles([...results]);
-      })).then(() => {
-        results[i] = { name: file.name, progress: 100, status: 'complete' };
+    let batchBaseIndex = 0;
+    const uploadPromises = batches.map((batch) => {
+      const baseIndex = batchBaseIndex;
+      batchBaseIndex += batch.length;
+
+      if (batch.length === 1) {
+        const file = batch[0];
+        const i = baseIndex;
+        return fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
+          results[i] = { ...results[i], progress: pct };
+          setUploadingFiles([...results]);
+        })).then(() => {
+          results[i] = { name: file.name, progress: 100, status: 'complete' };
+        }).catch((err: any) => {
+          results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+        }).finally(() => {
+          setUploadingFiles([...results]);
+        });
+      }
+
+      return fileSemaphore.withSlot(() =>
+        uploadAlbumBatch(batch, baseIndex, results, () => setUploadingFiles([...results]))
+      ).then(() => {
+        for (let j = 0; j < batch.length; j++) {
+          results[baseIndex + j] = { name: batch[j].name, progress: 100, status: 'complete' };
+        }
       }).catch((err: any) => {
-        results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+        for (let j = 0; j < batch.length; j++) {
+          results[baseIndex + j] = { name: batch[j].name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
+        }
       }).finally(() => {
         setUploadingFiles([...results]);
-      })
-    );
+      });
+    });
+
     await Promise.allSettled(uploadPromises);
 
     loadContents();

@@ -95,6 +95,7 @@ export class TelegramClientManager {
       useWSS: window.location.protocol === 'https:',
       deviceModel: "TeleDrive Browser",
       appVersion: "1.0.0",
+      floodSleepThreshold: 300,
     });
 
     // Connect to Telegram
@@ -410,6 +411,67 @@ export class TelegramClientManager {
       originalName: file.name,
       totalParts: uploadedParts.reduce((sum, p) => sum + Math.ceil(p.size / PART_SIZE), 0),
     };
+  }
+
+  async uploadAlbum(
+    files: File[],
+    onProgress?: (fileIdx: number, pct: number) => void,
+  ): Promise<Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>> {
+    if (!this.client) {
+      throw new Error("Client not initialized. Call initialize() first.");
+    }
+
+    const inputFiles = await Promise.all(
+      files.map(async (file, idx) => {
+        const arrayBuffer = await file.arrayBuffer();
+        const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+        const customFile = new CustomFile(file.name, file.size, "", buf);
+        const inputFile = await (this.client as any).uploadFile({
+          file: customFile,
+          workers: 1,
+          onProgress: (pct: number) => onProgress?.(idx, Math.round(pct * 100)),
+        });
+        return { inputFile, file };
+      })
+    );
+
+    const multiMedia = inputFiles.map(({ inputFile, file }) =>
+      new Api.InputSingleMedia({
+        media: new Api.InputMediaUploadedDocument({
+          file: inputFile,
+          mimeType: file.type || 'application/octet-stream',
+          attributes: [new Api.DocumentAttributeFilename({ fileName: file.name })],
+        }),
+        message: '',
+        randomId: generateRandomBigInt(),
+      })
+    );
+
+    const peer = await this.client.getInputEntity('me');
+    const updates = await this.client.invoke(
+      new Api.messages.SendMultiMedia({ peer, multiMedia })
+    ) as any;
+
+    const messages: Api.Message[] = (updates.updates ?? [])
+      .filter((u: any) => u.className === 'UpdateNewMessage' || u.className === 'UpdateNewChannelMessage')
+      .map((u: any) => u.message as Api.Message)
+      .filter((m: any) => m && m.media);
+
+    return files.map((file, idx) => {
+      const msg = messages[idx];
+      if (!msg) return { message_id: 0, file_id: '', access_hash: undefined, size: file.size };
+      const media = msg.media as any;
+      let fileId = '';
+      let accessHash: string | undefined;
+      if (media?.className === 'MessageMediaDocument') {
+        fileId = String(media.document.id);
+        accessHash = media.document.accessHash ? String(media.document.accessHash) : undefined;
+      } else if (media?.className === 'MessageMediaPhoto') {
+        fileId = String(media.photo.id);
+        accessHash = media.photo.accessHash ? String(media.photo.accessHash) : undefined;
+      }
+      return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size };
+    });
   }
 
   /**

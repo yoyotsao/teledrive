@@ -486,11 +486,12 @@ export function ChonkyDrive() {
       status: 'uploading' as const,
     }));
 
+    const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
     const uploadPromises = droppedFiles.map((file, i) =>
-      uploadWithThumbnail(file, (pct) => {
+      fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
         results[i] = { ...results[i], progress: pct };
         setUploadingFiles([...results]);
-      }).then(() => {
+      })).then(() => {
         results[i] = { name: file.name, progress: 100, status: 'complete' };
       }).catch((err: any) => {
         results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
@@ -516,11 +517,12 @@ export function ChonkyDrive() {
 
     const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
 
+    const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
     const uploadPromises = selectedFiles.map((file, i) =>
-      uploadWithThumbnail(file, (pct) => {
+      fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
         results[i] = { ...results[i], progress: pct };
         setUploadingFiles([...results]);
-      }).then(() => {
+      })).then(() => {
         results[i] = { name: file.name, progress: 100, status: 'complete' };
       }).catch((err: any) => {
         results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
@@ -926,6 +928,7 @@ export function ChonkyDrive() {
 
   return (
     <div
+      data-testid="drive-drop-zone"
       style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: '16px', boxSizing: 'border-box', position: 'relative' }}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}

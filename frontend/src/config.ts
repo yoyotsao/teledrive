@@ -4,14 +4,21 @@
  */
 
 /**
- * Maximum number of concurrent upload operations allowed.
- * This limit applies to both chunk uploads and file uploads in the shared pool.
+ * Maximum number of files uploading at once (each file then splits into its own chunks).
  *
- * Safe range: 1-10 (recommended: 3-7)
- * - Too low: Slow upload speeds
- * - Too high: May trigger rate limits or memory issues
+ * Safe range: 1-6 (recommended: 3)
  */
-export const MAX_UPLOAD_CONCURRENCY = 5;
+export const MAX_CONCURRENT_FILES = 3;
+
+/**
+ * Maximum number of 512KB chunk uploads in flight at once, across all files combined.
+ * This is the real throughput knob for large-file upload speed — a single big file can
+ * use up to this many concurrent chunk uploads.
+ *
+ * Safe range: 4-20 (recommended: 12). Telegram's floodSleepThreshold absorbs bursts that
+ * go too high, but going too high also risks FLOOD_WAIT on constrained accounts.
+ */
+export const MAX_CONCURRENT_CHUNKS = 12;
 
 /**
  * Number of retry attempts for failed chunk uploads.

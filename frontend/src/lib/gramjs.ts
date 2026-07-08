@@ -4,7 +4,7 @@ import { CustomFile } from "telegram/client/uploads";
 import { Api } from "telegram/tl";
 import bigInt from "big-integer";
 import { api } from "../api/client";
-import { MAX_UPLOAD_CONCURRENCY, CHUNK_RETRY_COUNT } from "../config";
+import { MAX_CONCURRENT_CHUNKS, CHUNK_RETRY_COUNT } from "../config";
 import { Semaphore } from "./semaphore";
 
 /**
@@ -44,7 +44,7 @@ const MAX_PARTS = 1000;
 const PART_SIZE = 512 * 1024; // 512KB
 
 // Module-level semaphore shared across all file uploads
-const uploadSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
+const uploadSemaphore = new Semaphore(MAX_CONCURRENT_CHUNKS);
 
 /**
  * Generate a random BigInteger for fileId in SaveBigFilePart operations.
@@ -73,6 +73,37 @@ export class TelegramClientManager {
   private session: StringSession | null = null;
   // Limit concurrent sendFile calls — parallel sendFile before "me" entity is cached causes ID 0 errors
   private readonly sendFileSemaphore = new Semaphore(2);
+  // Tracks the in-flight/most recent initialize() call so operations issued while
+  // the UI has already mounted (App no longer blocks on the MTProto handshake) can wait for it.
+  private initPromise: Promise<void> | null = null;
+  // Caches the resolved document location per message so SW chunk streaming doesn't
+  // pay a getMessages round trip on every single chunk request.
+  private fileLocationCache = new Map<number, { docId: bigint; accessHash: bigint; fileReference?: Uint8Array }>();
+
+  /**
+   * Resolve (and cache) the document location for a message. Pass forceRefresh=true
+   * after a FILE_REFERENCE_EXPIRED error to re-fetch a fresh file reference.
+   */
+  private async getFileLocation(
+    messageId: number,
+    forceRefresh = false
+  ): Promise<{ docId: bigint; accessHash: bigint; fileReference?: Uint8Array }> {
+    if (!forceRefresh) {
+      const cached = this.fileLocationCache.get(messageId);
+      if (cached) return cached;
+    }
+    const messages = await this.client!.getMessages("me", { ids: [messageId] });
+    const message = messages[0] as Api.Message;
+    if (!message?.media) throw new Error("Message has no media");
+    const media = message.media as any;
+    if (media.className !== 'MessageMediaDocument') {
+      throw new Error('Unsupported media type: ' + media?.className);
+    }
+    const doc = media.document;
+    const location = { docId: doc.id as bigint, accessHash: doc.accessHash as bigint, fileReference: doc.fileReference as Uint8Array | undefined };
+    this.fileLocationCache.set(messageId, location);
+    return location;
+  }
 
   /**
    * Initialize the Telegram client with API credentials and session.
@@ -81,6 +112,19 @@ export class TelegramClientManager {
    * @param sessionString - Saved session string for authentication
    */
   async initialize(apiId: number, apiHash: string, sessionString: string): Promise<void> {
+    const promise = this.doInitialize(apiId, apiHash, sessionString);
+    this.initPromise = promise;
+    return promise;
+  }
+
+  /** Resolves once the most recent initialize() call has connected; rejects if it failed. */
+  async waitUntilReady(): Promise<void> {
+    if (this.initPromise) {
+      await this.initPromise;
+    }
+  }
+
+  private async doInitialize(apiId: number, apiHash: string, sessionString: string): Promise<void> {
     // On HTTPS, browsers block plain ws:// connections (mixed content).
     // Monkey-patch WebSocket so GramJS's Telegram connections are routed through
     // our backend proxy (/api/v1/ws-proxy), which forwards to Telegram via plain ws://.
@@ -144,6 +188,7 @@ export class TelegramClientManager {
     file_id: string;
     access_hash?: string;
   }> {
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
@@ -205,6 +250,7 @@ export class TelegramClientManager {
     message_id: number;
     file_id: string;
   }> {
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
@@ -259,6 +305,7 @@ export class TelegramClientManager {
     originalName: string;
     totalParts: number;
   }> {
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
@@ -354,6 +401,9 @@ export class TelegramClientManager {
                 if (retry === CHUNK_RETRY_COUNT - 1) {
                   throw err;
                 }
+                // Exponential backoff (1s/2s/4s...) — GramJS's own floodSleepThreshold
+                // already handles FLOOD_WAIT errors, this covers other transient failures.
+                await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
               }
             }
           })
@@ -417,6 +467,7 @@ export class TelegramClientManager {
     files: File[],
     onProgress?: (fileIdx: number, pct: number) => void,
   ): Promise<Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>> {
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
@@ -480,6 +531,7 @@ export class TelegramClientManager {
    * @returns Promise with Blob of the thumbnail image
    */
   async downloadThumbnail(messageId: number): Promise<Blob> {
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
@@ -504,6 +556,45 @@ export class TelegramClientManager {
   }
 
   /**
+   * Download many thumbnails at once — one getMessages round trip for all
+   * message ids, then bounded-parallel downloadMedia per thumbnail. Used when
+   * opening a folder so N thumbnails don't cost N sequential getMessages calls.
+   * @param messageIds - Telegram message IDs of the thumbnails
+   * @returns Map of messageId -> Blob (entries with no media or a failed download are omitted)
+   */
+  async downloadThumbnails(messageIds: number[]): Promise<Map<number, Blob>> {
+    await this.waitUntilReady();
+    if (!this.client) {
+      throw new Error("Client not initialized. Call initialize() first.");
+    }
+
+    const result = new Map<number, Blob>();
+    if (messageIds.length === 0) return result;
+
+    const messages = await this.client.getMessages("me", { ids: messageIds });
+    const downloadSemaphore = new Semaphore(6);
+
+    await Promise.all(
+      messages.map((message) =>
+        downloadSemaphore.withSlot(async () => {
+          const msg = message as Api.Message | undefined;
+          if (!msg || !msg.media) return;
+          try {
+            const buffer = await this.client!.downloadMedia(msg.media);
+            if (buffer) {
+              result.set(msg.id, new Blob([buffer], { type: 'image/jpeg' }));
+            }
+          } catch (err) {
+            console.warn('[Thumb] Batch download failed for message', msg.id, err);
+          }
+        })
+      )
+    );
+
+    return result;
+  }
+
+  /**
    * Download file metadata (size and mime type) from Telegram by message_id.
    * @param messageId - The Telegram message ID of the file
    * @returns Promise with { size: number; mimeType: string }
@@ -511,6 +602,7 @@ export class TelegramClientManager {
   async downloadFileMetadata(messageId: number): Promise<{ size: number; mimeType: string }> {
     console.log('[FileMetadata] Getting metadata for message:', messageId);
     
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
@@ -559,6 +651,7 @@ export class TelegramClientManager {
   async downloadFile(messageId: number, mimeType: string = 'application/octet-stream'): Promise<Blob> {
     console.log('[Download] downloadFile called, messageId:', messageId, 'mimeType:', mimeType);
     
+    await this.waitUntilReady();
     if (!this.client) {
       console.error('[Download] Client not initialized');
       throw new Error("Client not initialized. Call initialize() first.");
@@ -659,94 +752,104 @@ export class TelegramClientManager {
       throw new Error('Unsupported media type: ' + media?.className);
     }
 
-    const CHUNK_SIZE = 32 * 1024;
+    const CHUNK_SIZE = 512 * 1024;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
     console.log('[Streaming] Total size:', fileSize, 'chunks:', totalChunks);
 
-    // Store downloaded chunks
-    const downloadedChunks: Uint8Array[] = [];
+    // Chunks land in fixed slots (parallel downloads can finish out of order);
+    // `readyPrefix` tracks how many LEADING slots are contiguously filled, since only a
+    // contiguous prefix from byte 0 is a valid playable blob.
+    const chunkSlots: (Uint8Array | undefined)[] = new Array(totalChunks);
+    let readyPrefix = 0;
     let isDownloadComplete = false;
+    let downloadError: Error | null = null;
+    let onProgress: (() => void) | null = null;
 
-    // Start downloading in background immediately
-    const downloadInBackground = async () => {
-      let offset = 0;
-      let chunkIndex = 0;
-      
-      while (offset < fileSize) {
-        const limit = Math.min(CHUNK_SIZE, fileSize - offset);
-        
-        const chunkLocation = new Api.InputDocumentFileLocation({
-          id: docId as any,
-          accessHash: accessHash as any,
-          fileReference: fileReference,
-          thumbSize: "",
-        });
-        
-        const client = this.client;
-        try {
-          const fileResult = await client!.invoke(
-            new Api.upload.GetFile({
-              location: chunkLocation!,
-              offset: BigInt(offset) as any,
-              limit: limit,
-              precise: false,
-              cdnSupported: true,
-            })
-          ) as any;
-          
-          if (fileResult?.bytes) {
-            downloadedChunks.push(new Uint8Array(fileResult.bytes));
-            console.log(`[Streaming] Chunk ${chunkIndex + 1}/${totalChunks} ready`);
-          }
-        } catch (err: any) {
-          console.error('[Streaming] GetFile error:', err.message);
-          throw err;
-        }
-        
-        offset += limit;
-        chunkIndex++;
-      }
-      
-      isDownloadComplete = true;
-      console.log('[Streaming] All chunks downloaded!');
-    };
-
-    // Start background download (don't await - run in parallel)
-    downloadInBackground().catch(err => console.error('[Streaming] Background download failed:', err));
-
-    // Wait for enough chunks (at least 10MB) for playback to start reliably - video needs keyframes
-    const waitForEnoughChunks = (minSize: number = 10 * 1024 * 1024): Promise<Blob> => new Promise((resolve) => {
-      const startTime = Date.now();
-      const checkInterval = setInterval(() => {
-        const currentSize = downloadedChunks.reduce((sum, c) => sum + c.length, 0);
-        if (currentSize >= minSize) {
-          clearInterval(checkInterval);
-          const blobs = downloadedChunks.map(c => new Uint8Array(c).buffer);
-          const blob = new Blob(blobs as ArrayBuffer[], { type: mimeType });
-          console.log('[Streaming] Enough chunks ready, size:', blob.size);
-          resolve(blob);
-        }
-        if (isDownloadComplete && downloadedChunks.length > 0) {
-          clearInterval(checkInterval);
-          const blobs = downloadedChunks.map(c => new Uint8Array(c).buffer);
-          const blob = new Blob(blobs as ArrayBuffer[], { type: mimeType });
-          console.log('[Streaming] Download complete, final size:', blob.size);
-          resolve(blob);
-        }
-        if (Date.now() - startTime > 60000) {
-          clearInterval(checkInterval);
-          const blobs = downloadedChunks.map(c => new Uint8Array(c).buffer);
-          const blob = new Blob(blobs as ArrayBuffer[], { type: mimeType });
-          console.log('[Streaming] Timeout, returning blob with size:', blob.size);
-          resolve(blob);
-        }
-      }, 100);
+    const location = new Api.InputDocumentFileLocation({
+      id: docId as any,
+      accessHash: accessHash as any,
+      fileReference: fileReference,
+      thumbSize: "",
     });
 
-    return await waitForEnoughChunks();
+    const chunkSemaphore = new Semaphore(4);
+    const client = this.client;
+
+    const downloadChunk = async (chunkIndex: number) => {
+      const offset = chunkIndex * CHUNK_SIZE;
+      const limit = Math.min(CHUNK_SIZE, fileSize - offset);
+      const fileResult = await client!.invoke(
+        new Api.upload.GetFile({
+          location,
+          offset: BigInt(offset) as any,
+          limit,
+          precise: false,
+          cdnSupported: true,
+        })
+      ) as any;
+
+      if (fileResult?.bytes) {
+        chunkSlots[chunkIndex] = new Uint8Array(fileResult.bytes);
+        while (chunkSlots[readyPrefix] !== undefined) readyPrefix++;
+        console.log(`[Streaming] Chunk ${chunkIndex + 1}/${totalChunks} ready (contiguous: ${readyPrefix}/${totalChunks})`);
+      }
+      onProgress?.();
+    };
+
+    // Start downloading in background immediately, 4 chunks in flight at a time
+    const downloadInBackground = async () => {
+      try {
+        await Promise.all(
+          Array.from({ length: totalChunks }, (_, i) => chunkSemaphore.withSlot(() => downloadChunk(i)))
+        );
+        isDownloadComplete = true;
+        console.log('[Streaming] All chunks downloaded!');
+      } catch (err: any) {
+        console.error('[Streaming] GetFile error:', err.message);
+        downloadError = err;
+        isDownloadComplete = true;
+      }
+      onProgress?.();
+    };
+    downloadInBackground();
+
+    const buildBlob = () => new Blob(chunkSlots.slice(0, readyPrefix) as BlobPart[], { type: mimeType });
+
+    // Wait for enough contiguous bytes (10MB) for playback to start reliably (video needs keyframes),
+    // or full completion, or a 60s safety timeout — whichever comes first. Event-driven, no polling.
+    const MIN_READY_BYTES = 10 * 1024 * 1024;
+    return new Promise<Blob>((resolve, reject) => {
+      let settled = false;
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.log('[Streaming] Timeout, returning blob with size:', readyPrefix * CHUNK_SIZE);
+        resolve(buildBlob());
+      }, 60000);
+
+      const check = () => {
+        if (settled) return;
+        if (downloadError && readyPrefix === 0) {
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(downloadError);
+          return;
+        }
+        const readyBytes = Math.min(readyPrefix * CHUNK_SIZE, fileSize);
+        if (readyBytes >= MIN_READY_BYTES || (isDownloadComplete && readyPrefix > 0)) {
+          settled = true;
+          clearTimeout(timeoutId);
+          console.log('[Streaming] Ready, size:', readyBytes, 'complete:', isDownloadComplete);
+          resolve(buildBlob());
+        }
+      };
+      onProgress = check;
+      check();
+    });
   }
 
   async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number, fileSize?: number): Promise<Blob> {
+    await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized");
     }
@@ -780,39 +883,36 @@ export class TelegramClientManager {
       }
     }
 
-    const messages = await this.client.getMessages("me", { ids: [messageId] });
-    const message = messages[0] as Api.Message;
-    if (!message?.media) throw new Error("Message has no media");
+    const toLocation = (loc: { docId: bigint; accessHash: bigint; fileReference?: Uint8Array }) =>
+      new Api.InputDocumentFileLocation({
+        id: loc.docId as any,
+        accessHash: loc.accessHash as any,
+        fileReference: loc.fileReference,
+        thumbSize: "",
+      });
 
-    const media = message.media as any;
-    let docId: bigint, accessHash: bigint, fileReference: Uint8Array | undefined;
-    if (media?.className === 'MessageMediaDocument') {
-      const doc = media.document;
-      docId = doc.id;
-      accessHash = doc.accessHash;
-      fileReference = doc.fileReference;
-    } else {
-      throw new Error('Unsupported media type: ' + media?.className);
-    }
-
-    const chunkLocation = new Api.InputDocumentFileLocation({
-      id: docId as any,
-      accessHash: accessHash as any,
-      fileReference: fileReference,
-      thumbSize: "",
-    });
+    // Cached after the first chunk of a given message — subsequent chunks skip getMessages entirely.
+    const invokeGetFile = async (off: number, lim: number): Promise<any> => {
+      const loc = await this.getFileLocation(messageId);
+      try {
+        return await this.client!.invoke(
+          new Api.upload.GetFile({ location: toLocation(loc), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+        );
+      } catch (err: any) {
+        if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {
+          console.warn('[ChunkByOffset] File reference expired, refreshing for message', messageId);
+          const fresh = await this.getFileLocation(messageId, true);
+          return await this.client!.invoke(
+            new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+          );
+        }
+        throw err;
+      }
+    };
 
     let fileResult: any;
     try {
-      fileResult = await this.client.invoke(
-        new Api.upload.GetFile({
-          location: chunkLocation,
-          offset: BigInt(alignedOffset) as any,
-          limit: downloadLimit,
-          precise: true,
-          cdnSupported: true,
-        })
-      );
+      fileResult = await invokeGetFile(alignedOffset, downloadLimit);
     } catch (err: any) {
       console.error('[ChunkByOffset] GetFile failed — alignedOffset:', alignedOffset, 'limit:', downloadLimit, err?.message);
       throw err;
@@ -830,15 +930,7 @@ export class TelegramClientManager {
       const retryLimit = Math.min(PART_SIZE, fileSize - aligned512);
       let retryResult: any;
       try {
-        retryResult = await this.client.invoke(
-          new Api.upload.GetFile({
-            location: chunkLocation,
-            offset: BigInt(aligned512) as any,
-            limit: retryLimit,
-            precise: true,
-            cdnSupported: true,
-          })
-        );
+        retryResult = await invokeGetFile(aligned512, retryLimit);
       } catch (err: any) {
         console.error('[ChunkByOffset] Retry GetFile failed:', err?.message);
         throw err;
@@ -883,21 +975,20 @@ export class TelegramClientManager {
 
     console.log('[DownloadMerge] Sorted parts:', sortedParts.map(p => ({ idx: (p as any).part_index, msgId: p.telegram_message_id })));
 
-    // Download each part sequentially
-    const parts: Blob[] = [];
-    for (let i = 0; i < sortedParts.length; i++) {
-      const part = sortedParts[i];
-      const messageId = part.telegram_message_id;
-      console.log('[DownloadMerge] Downloading part', i, 'messageId:', messageId);
-      
-      if (!messageId) {
-        throw new Error(`Missing telegram_message_id for part: ${part.file_id}`);
-      }
-      
-      const blob = await this.downloadFile(messageId, mimeType);
-      console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
-      parts.push(blob);
-    }
+    // Download parts with bounded parallelism (order is restored below via the index)
+    const partSemaphore = new Semaphore(3);
+    const parts: Blob[] = await Promise.all(
+      sortedParts.map((part, i) => partSemaphore.withSlot(async () => {
+        const messageId = part.telegram_message_id;
+        console.log('[DownloadMerge] Downloading part', i, 'messageId:', messageId);
+        if (!messageId) {
+          throw new Error(`Missing telegram_message_id for part: ${part.file_id}`);
+        }
+        const blob = await this.downloadFile(messageId, mimeType);
+        console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
+        return blob;
+      }))
+    );
 
     console.log('[DownloadMerge] All parts downloaded, merging...');
     // Merge all parts using Blob
@@ -936,7 +1027,7 @@ export class TelegramClientManager {
     await (this.client as any).signInUserWithQrCode(
       { apiId, apiHash },
       {
-        qrCode: async (qr: { token: Buffer; expires: number }) => {
+        qrCode: async (qr: { token: Uint8Array; expires: number }) => {
           // URL-safe base64: mobile Telegram URL-decodes query params, so
           // standard base64's '+' becomes space and corrupts the token bytes.
           const tokenBase64 = btoa(String.fromCharCode(...new Uint8Array(qr.token)))

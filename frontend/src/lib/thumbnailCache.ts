@@ -3,18 +3,28 @@ const STORE_NAME = 'thumbs';
 const MAX_ENTRIES = 500;
 const EVICT_COUNT = 100;
 
+// Reuse a single connection instead of opening/closing IndexedDB on every get/set —
+// matters now that thumbnail loading fans out several parallel requests per folder.
+let dbPromise: Promise<IDBDatabase> | null = null;
+
 function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 2);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 2);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => {
+        dbPromise = null;
+        reject(req.error);
+      };
+    });
+  }
+  return dbPromise;
 }
 
 export async function getCachedThumbnail(fileId: string): Promise<Blob | null> {
@@ -27,7 +37,6 @@ export async function getCachedThumbnail(fileId: string): Promise<Blob | null> {
       resolve(entry?.blob ?? null);
     };
     req.onerror = () => reject(req.error);
-    tx.oncomplete = () => db.close();
   });
 }
 
@@ -74,6 +83,5 @@ export async function setCachedThumbnail(fileId: string, blob: Blob): Promise<vo
     const req = tx.objectStore(STORE_NAME).put({ blob, ts: Date.now() }, fileId);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
-    tx.oncomplete = () => db.close();
   });
 }

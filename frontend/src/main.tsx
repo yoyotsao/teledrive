@@ -6,6 +6,11 @@ import { getTelegramClient } from './lib/gramjs';
 // Global state for keepalive mechanism
 let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 const KEEPALIVE_INTERVAL_MS = 15000; // 15 seconds
+// Skip the getMe() ping in ensureTelegramConnected() if the connection was verified
+// alive (by either the keepalive tick or a prior chunk request) within this window —
+// avoids a round trip before every single 512KB SW chunk request.
+const CONNECTION_CHECK_INTERVAL_MS = 20000;
+let lastVerifiedAliveAt = 0;
 let isStreamingActive = false;
 // Set to true when the user closes the video; reset when a new video opens.
 // Preload chunk requests that arrive after close are rejected immediately.
@@ -16,27 +21,33 @@ let streamingStopped = false;
  * Returns true if connected, false otherwise.
  */
 async function ensureTelegramConnected(): Promise<boolean> {
+  if (Date.now() - lastVerifiedAliveAt < CONNECTION_CHECK_INTERVAL_MS) {
+    return true;
+  }
+
   console.log('[App] === ensureTelegramConnected START ===');
   const telegramClient = getTelegramClient();
-  
+
   // Instead of just checking isConnected(), actually try a ping
   // to verify the connection is truly alive
   try {
     const pingSuccess = await telegramClient.invokePing();
     console.log('[App] ping result:', pingSuccess);
     if (pingSuccess) {
+      lastVerifiedAliveAt = Date.now();
       console.log('[App] === ensureTelegramConnected: ALREADY CONNECTED (ping success) ===');
       return true;
     }
   } catch (err: any) {
     console.log('[App] ping failed:', err?.message || err);
   }
-  
+
   console.log('[App] Telegram not responding, attempting reconnection...');
-  
+
   try {
     // Try to reconnect the client
     await telegramClient.connect();
+    lastVerifiedAliveAt = Date.now();
     console.log('[App] Telegram reconnected successfully');
     console.log('[App] === ensureTelegramConnected: RECONNECTED ===');
     return true;
@@ -44,7 +55,7 @@ async function ensureTelegramConnected(): Promise<boolean> {
     console.error('[App] Failed to reconnect:', err?.message || err);
     console.log('[App] === ensureTelegramConnected: FAILED ===');
   }
-  
+
   return false;
 }
 
@@ -85,12 +96,14 @@ function startKeepalive() {
     try {
       // Try a simple API call to verify connection
       await telegramClient.invokePing();
+      lastVerifiedAliveAt = Date.now();
       console.log('[App] Keepalive: connection truly ALIVE (ping success)');
     } catch (err: any) {
       console.log('[App] Keepalive: ping failed, connection likely dead:', err?.message || err);
       console.log('[App] Keepalive: attempting reconnect...');
       try {
         await telegramClient.connect();
+        lastVerifiedAliveAt = Date.now();
         console.log('[App] Keepalive: RECONNECTED');
       } catch (reconnectErr: any) {
         console.error('[App] Keepalive: reconnect failed:', reconnectErr?.message || reconnectErr);
@@ -99,12 +112,12 @@ function startKeepalive() {
   }, KEEPALIVE_INTERVAL_MS);
 }
 
-// Register Service Worker with cache-busting (use timestamp for always-fresh SW)
-const SW_VERSION = Date.now();
+// Register Service Worker (nginx serves /sw.js with Cache-Control: no-cache,
+// so the browser always revalidates and picks up updates without a cache-busting query string)
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker
-      .register(`/sw.js?v=${SW_VERSION}`)
+      .register('/sw.js')
       .then((registration) => {
         console.log('[App] Service Worker registered:', registration.scope);
         

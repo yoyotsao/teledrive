@@ -41,6 +41,13 @@ export default defineConfig(({ mode }) => {
       commonjsOptions: {
         ignoreDynamicRequires: true,
       },
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            telegram: ['telegram'],
+          },
+        },
+      },
     },
     define: {
       'import.meta.env.VITE_TELEGRAM_API_ID': JSON.stringify(env.VITE_TELEGRAM_API_ID || ''),

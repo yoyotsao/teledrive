@@ -1,13 +1,12 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { FileData } from '@aperturerobotics/chonky';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api, generateThumbnail } from '../api/client';
 import { sha256File } from '../lib/hashFile';
 import { getTelegramClient } from '../lib/gramjs';
 import { generateVideoThumbnail } from '../lib/videoThumbnail';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
-import { FileInfo } from '../types';
+import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
-import { MAX_UPLOAD_CONCURRENCY } from '../config';
+import { MAX_CONCURRENT_FILES } from '../config';
 
 
 function formatFileSize(bytes: number): string {
@@ -22,6 +21,8 @@ export function ChonkyDrive() {
   const [breadcrumb, setBreadcrumb] = useState<FileData[]>([]);
   const [files, setFiles] = useState<FileData[]>([]);
   const [originalFiles, setOriginalFiles] = useState<FileInfo[]>([]);
+  // O(1) lookup instead of `originalFiles.find(...)` inside the render loop (O(n) per card = O(n^2) per render)
+  const originalFilesById = useMemo(() => new Map(originalFiles.map((f) => [f.file_id, f])), [originalFiles]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
@@ -67,35 +68,46 @@ export function ChonkyDrive() {
     const thumbFiles = files.filter(
       (f) => (f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/'))
              && f.thumbnail_message_id
+             && !pendingThumbsRef.current.has(f.file_id)
     );
+    if (thumbFiles.length === 0) return;
+    thumbFiles.forEach((f) => pendingThumbsRef.current.add(f.file_id));
 
-    for (const file of thumbFiles) {
-      if (signal?.aborted) break;
-      if (pendingThumbsRef.current.has(file.file_id)) continue;
-      pendingThumbsRef.current.add(file.file_id);
-
+    // 1. Check IndexedDB cache for all files in parallel (bounded) — instant hits show immediately
+    const cacheCheckSemaphore = new Semaphore(6);
+    const misses: FileInfo[] = [];
+    await Promise.all(thumbFiles.map((file) => cacheCheckSemaphore.withSlot(async () => {
+      if (signal?.aborted) return;
       try {
-        // 1. IndexedDB cache hit → instant display
         const cached = await getCachedThumbnail(file.file_id);
         if (cached) {
           setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(cached) }));
-          continue;
+        } else {
+          misses.push(file);
         }
-
-        if (signal?.aborted) break;
-
-        // 2. Cache miss → download via GramJS directly from Telegram
-        const blob = await getTelegramClient().downloadThumbnail(file.thumbnail_message_id!);
-
-        // 3. Persist in IndexedDB for next load
-        await setCachedThumbnail(file.file_id, blob);
-        setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
-      } catch (err: any) {
-        pendingThumbsRef.current.delete(file.file_id);
-        if (err?.name !== 'AbortError') {
-          console.warn(`[Thumb] Error for ${file.filename}:`, err?.message);
-        }
+      } catch {
+        misses.push(file);
       }
+    })));
+
+    if (signal?.aborted || misses.length === 0) return;
+
+    // 2. Cache misses → one getMessages round trip for the whole batch, then parallel downloadMedia
+    const messageIdToFile = new Map(misses.map((f) => [f.thumbnail_message_id!, f]));
+    try {
+      const blobs = await getTelegramClient().downloadThumbnails(Array.from(messageIdToFile.keys()));
+      for (const [messageId, blob] of blobs) {
+        const file = messageIdToFile.get(messageId);
+        if (!file || signal?.aborted) continue;
+        setCachedThumbnail(file.file_id, blob).catch(() => {});
+        setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
+      }
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        console.warn('[Thumb] Batch download error:', err?.message);
+      }
+    } finally {
+      misses.forEach((f) => pendingThumbsRef.current.delete(f.file_id));
     }
   }, []);
 
@@ -198,11 +210,10 @@ export function ChonkyDrive() {
   }, [currentFolderId]);
 
 
-  useEffect(() => {
-    if (Object.keys(thumbnails).length > 0) {
-      setFiles((prev) => prev.map(f => ({ ...f })));
-    }
-  }, [thumbnails]);
+  // Note: cards read `thumbnails[...]` directly during render (see the files.map below),
+  // so no effect is needed here to propagate thumbnail arrivals — the component already
+  // re-renders whenever `thumbnails` state changes. (Previously this cloned all `files`
+  // objects on every single thumbnail arrival, forcing a full-grid re-render per thumbnail.)
 
   // Box select: track mouse during drag, update selection rect + selected files
   useEffect(() => {
@@ -527,7 +538,7 @@ export function ChonkyDrive() {
       batches.push(droppedFiles.slice(i, i + ALBUM_BATCH));
     }
 
-    const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
+    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
     let batchBaseIndex = 0;
     const uploadPromises = batches.map((batch) => {
       const baseIndex = batchBaseIndex;
@@ -587,7 +598,7 @@ export function ChonkyDrive() {
       batches.push(pickedFiles.slice(i, i + ALBUM_BATCH));
     }
 
-    const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
+    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
     let batchBaseIndex = 0;
     const uploadPromises = batches.map((batch) => {
       const baseIndex = batchBaseIndex;
@@ -758,7 +769,7 @@ export function ChonkyDrive() {
 
     // Limit concurrent file uploads — too many simultaneous sendFile() calls
     // cause GramJS to resolve "me" to entity ID 0 and crash.
-    const fileSemaphore = new Semaphore(MAX_UPLOAD_CONCURRENCY);
+    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
 
     // All upload promises collected so we can await them.
     const uploadPromises: Promise<void>[] = [];
@@ -940,7 +951,7 @@ export function ChonkyDrive() {
     }
 
     // 防止把資料夾拖進自己裡面
-    if (selectedIds.includes(folderId)) return;
+    if (folderId !== null && selectedIds.includes(folderId)) return;
 
     if (selectedIds.length === 0) {
       console.log('[Drop] No files to move, returning');
@@ -971,7 +982,7 @@ export function ChonkyDrive() {
        setBreadcrumb((prev) => [...prev, file]);
      } else {
        // Double-click file to preview
-       const original = originalFiles.find((f) => f.file_id === file.id);
+       const original = originalFilesById.get(file.id);
        if (original) {
          setPreviewFile(original);
          setPreviewUrl(null);
@@ -1296,7 +1307,7 @@ export function ChonkyDrive() {
           }}
         >
           {files.map((file) => {
-            const original = originalFiles.find((f) => f.file_id === file.id);
+            const original = originalFilesById.get(file.id);
             const isImage = original?.mime_type?.startsWith('image/');
             const isVideo = original?.mime_type?.startsWith('video/');
             const thumbnailUrl = original ? thumbnails[original.file_id] : null;

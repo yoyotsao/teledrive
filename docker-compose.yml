@@ -15,14 +15,11 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_TELEGRAM_API_ID: ${VITE_TELEGRAM_API_ID}
+        VITE_TELEGRAM_API_HASH: ${VITE_TELEGRAM_API_HASH}
     ports:
       - "3000:3000"
-    env_file: .env
-    environment:
-      - BACKEND_URL=http://backend:8000
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
     depends_on:
       - backend
     restart: unless-stopped

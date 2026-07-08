@@ -97,6 +97,18 @@ class Database:
         except aiosqlite.OperationalError:
             pass
 
+        # Indexes for the query patterns in get_files_paginated / find_by_hash /
+        # find_file_by_name_and_parent (avoids full table scans as row count grows)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_user_parent ON files(telegram_user_id, isDir, parent_id)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_split_group ON files(split_group_id)"
+        )
+
         # Upload sessions table
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS upload_sessions (

@@ -31,9 +31,10 @@ export interface FileData {
   id: string;
   name: string;
   isDir: boolean;
-  path: string;
+  parentId?: string;
   size?: number;
-  modifiedAt?: string;
+  modDate?: Date;
+  thumbnailUrl?: string;
 }
 
 export interface UploadResult {

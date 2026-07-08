@@ -21,26 +21,44 @@ export interface LoginResponse {
   first_name?: string;
 }
 
+// One automatic retry for timeouts — the initial request can occasionally lose
+// the race against server/proxy warm-up right after a reload.
+async function withTimeoutRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err: any) {
+    const isTimeout = err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '');
+    if (!isTimeout) throw err;
+    try {
+      return await fn();
+    } catch {
+      throw new Error('載入逾時，請稍後再試');
+    }
+  }
+}
+
 export const api = {
   loginToBackend: async (sessionString: string): Promise<LoginResponse> => {
     const response = await client.post<LoginResponse>('/auth/login', { session_string: sessionString });
     return response.data;
   },
-  listFiles: async (page: number = 1, pageSize: number = 50, parentId?: string): Promise<FileListResponse> => {
-    const response = await client.get<FileListResponse>('/files', {
-      params: { page, page_size: pageSize, parent_id: parentId },
-      timeout: 15000,
-    });
-    return response.data;
-  },
+  listFiles: async (page: number = 1, pageSize: number = 50, parentId?: string): Promise<FileListResponse> =>
+    withTimeoutRetry(async () => {
+      const response = await client.get<FileListResponse>('/files', {
+        params: { page, page_size: pageSize, parent_id: parentId },
+        timeout: 15000,
+      });
+      return response.data;
+    }),
 
-  listFolders: async (parentId: string | null = null): Promise<FileListResponse> => {
-    const response = await client.get<FileListResponse>('/folders', {
-      params: { parent_id: parentId },
-      timeout: 15000,
-    });
-    return response.data;
-  },
+  listFolders: async (parentId: string | null = null): Promise<FileListResponse> =>
+    withTimeoutRetry(async () => {
+      const response = await client.get<FileListResponse>('/folders', {
+        params: { parent_id: parentId },
+        timeout: 15000,
+      });
+      return response.data;
+    }),
 
   createFolder: async (name: string, parentId: string | null = null): Promise<FileInfo> => {
     const response = await client.post<FileInfo>('/folders', {

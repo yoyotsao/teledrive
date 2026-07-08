@@ -20,9 +20,11 @@ function App() {
       setAuthState('unauthenticated');
       return;
     }
-    // Restore session silently; any failure → re-login
+    // Show the file browser immediately — the file list only needs the backend JWT.
+    // The Telegram MTProto handshake runs in the background; GramJS-dependent actions
+    // (thumbnails, upload, download, preview) await client.waitUntilReady() internally.
+    setAuthState('authenticated');
     getTelegramClient().initialize(API_ID, API_HASH, sessionString)
-      .then(() => { setAuthState('authenticated'); })
       .catch(() => {
         clearCredentialsFromStorage();
         setAuthState('unauthenticated');

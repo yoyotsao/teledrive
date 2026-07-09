@@ -394,6 +394,15 @@ class FileService:
         rows = await db.find_by_hash(file_hash, telegram_user_id)
         return [self._row_to_file_info(r) for r in rows]
 
+    async def find_by_hashes(self, hashes: List[str], telegram_user_id: int) -> Dict[str, List[FileInfo]]:
+        """Return file records for multiple SHA-256 hashes at once, grouped by hash."""
+        db = await self._get_db()
+        rows_by_hash = await db.find_by_hashes(hashes, telegram_user_id)
+        return {
+            file_hash: [self._row_to_file_info(r) for r in rows]
+            for file_hash, rows in rows_by_hash.items()
+        }
+
     async def list_folders(
         self,
         parent_id: Optional[str] = None,
@@ -467,17 +476,27 @@ class FileService:
             logger.info(f"File deleted: {file_id}")
         return result
 
-    async def delete_folder(self, folder_id: str) -> bool:
-        """Delete a folder from metadata only if it is a directory."""
+    async def delete_folder(self, folder_id: str) -> tuple[int, List[int]]:
+        """Recursively delete a folder and everything inside it.
+
+        Returns (deleted_record_count, telegram_message_ids) so the caller can
+        clean up the Telegram messages of the contained files.
+        """
         db = await self._get_db()
-        # First check if it's a folder
         row = await db.get_file(folder_id)
-        if row and row.get('isDir'):
-            result = await db.delete_file(folder_id)
-            if result:
-                logger.info(f"Folder deleted: {folder_id}")
-            return result
-        return False
+        if not row or not row.get('isDir'):
+            return 0, []
+
+        subtree = await db.get_subtree(folder_id)
+        message_ids = [
+            mid
+            for r in subtree
+            for mid in (r.get('telegram_message_id'), r.get('thumbnail_message_id'))
+            if mid
+        ]
+        deleted = await db.delete_files_by_ids([r['file_id'] for r in subtree])
+        logger.info(f"Folder deleted recursively: {folder_id} ({deleted} records)")
+        return deleted, message_ids
 
     async def delete_all(self, telegram_user_id: int = 0) -> int:
         """Delete all files and folders for the given user (or all if 0)."""

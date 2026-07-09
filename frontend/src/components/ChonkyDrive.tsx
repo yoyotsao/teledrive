@@ -7,6 +7,7 @@ import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { MAX_CONCURRENT_FILES } from '../config';
+import { planUploads, registerDuplicateParts, hashFileBounded, PlannedFile } from '../lib/uploadPlanner';
 
 
 function formatFileSize(bytes: number): string {
@@ -42,6 +43,7 @@ export function ChonkyDrive() {
   const dragCounterRef = useRef(0);
   const isDraggingRef = useRef(false); // Track external file drag for upload
   const pendingThumbsRef = useRef<Set<string>>(new Set());
+  const thumbRefreshTimerRef = useRef<number | null>(null);
   const thumbnailAbortRef = useRef<AbortController | null>(null);
 
   const PAGE_SIZE = 200;
@@ -209,6 +211,18 @@ export function ChonkyDrive() {
     }
   }, [currentFolderId]);
 
+  // Debounced refresh for fire-and-forget thumbnail saves: a 50-image batch
+  // collapses into one folder re-list instead of one full re-list per thumbnail.
+  const scheduleThumbnailRefresh = useCallback(() => {
+    if (thumbRefreshTimerRef.current !== null) {
+      window.clearTimeout(thumbRefreshTimerRef.current);
+    }
+    thumbRefreshTimerRef.current = window.setTimeout(() => {
+      thumbRefreshTimerRef.current = null;
+      loadContents();
+    }, 2000);
+  }, [loadContents]);
+
 
   // Note: cards read `thumbnails[...]` directly during render (see the files.map below),
   // so no effect is needed here to propagate thumbnail arrivals — the component already
@@ -275,12 +289,21 @@ export function ChonkyDrive() {
     const handleKeyDown = async (event: KeyboardEvent) => {
       if (event.key === 'Delete' && selectedFiles.size > 0) {
         event.preventDefault();
-        const confirmed = confirm(`Delete ${selectedFiles.size} selected file(s)?`);
+        const hasFolder = files.some((f) => selectedFiles.has(f.id) && f.isDir);
+        const warning = hasFolder
+          ? ' Folders will be deleted with ALL their contents.'
+          : '';
+        const confirmed = confirm(`Delete ${selectedFiles.size} selected item(s)?${warning}`);
         if (!confirmed) return;
 
         try {
           for (const fileId of selectedFiles) {
-            await api.deleteFile(fileId);
+            const entry = files.find((f) => f.id === fileId);
+            if (entry?.isDir) {
+              await api.deleteFolder(fileId);
+            } else {
+              await api.deleteFile(fileId);
+            }
           }
           setSelectedFiles(new Set());
           loadContents();
@@ -293,7 +316,7 @@ export function ChonkyDrive() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedFiles, loadContents]);
+  }, [selectedFiles, files, loadContents]);
 
   const handleNavigateToBreadcrumb = (index: number) => {
     if (index === 0) {
@@ -357,7 +380,14 @@ export function ChonkyDrive() {
     event.preventDefault();
   }, []);
 
-  const uploadWithThumbnail = async (file: File, onProgress?: (pct: number) => void): Promise<void> => {
+  // precomputedHash: string when planUploads() already proved the file is fresh (skip
+  // internal dedup check); null when hashing failed at plan time (upload without dedup);
+  // undefined when called without a pre-pass (legacy fallback: check for duplicates here).
+  const uploadWithThumbnail = async (
+    file: File,
+    onProgress?: (pct: number) => void,
+    precomputedHash?: string | null,
+  ): Promise<Array<{ message_id: number; access_hash?: string; size: number }>> => {
     const isImage = file.type.startsWith('image/');
     const isVideo = file.type.startsWith('video/');
     const isImageOrVideo = isImage || isVideo;
@@ -382,39 +412,33 @@ export function ChonkyDrive() {
       );
     }
 
-    // Hash-based deduplication: compute SHA-256 and check if file already uploaded
-    const fileHash = await sha256File(file);
-    const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] }));
-
-    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-    if (hashCheck.found && hashCheck.files.length > 0) {
-      console.log('[Upload] Duplicate detected by hash, skipping Telegram upload for:', file.name);
-      onProgress?.(100);
-      await Promise.all(hashCheck.files.map((existing, i) =>
-        api.registerFile({
-          filename: file.name,
-          filesize: existing.filesize,
-          mimeType: existing.mime_type ?? undefined,
-          messageId: existing.telegram_message_id!,
-          fileId: `${splitGroupId}-${i}`,
-          accessHash: existing.access_hash ?? undefined,
-          parentId: currentFolderId ?? undefined,
-          isSplitFile: true,
-          splitGroupId,
-          partIndex: existing.part_index ?? i,
-          totalParts: hashCheck.files.length,
-          originalName: file.name,
-          fileHash,
-        })
-      ));
-      console.log('[Upload] Dedup: registered', hashCheck.files.length, 'parts from existing upload');
-      return;
+    let fileHash: string | null = precomputedHash ?? null;
+    if (precomputedHash === undefined) {
+      fileHash = await sha256File(file).catch(() => null);
+      if (fileHash) {
+        const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] as FileInfo[] }));
+        if (hashCheck.found && hashCheck.files.length > 0) {
+          console.log('[Upload] Duplicate detected by hash, skipping Telegram upload for:', file.name);
+          onProgress?.(100);
+          const asExisting = hashCheck.files.map((f) => ({
+            filesize: f.filesize,
+            mime_type: f.mime_type,
+            telegram_message_id: f.telegram_message_id!,
+            access_hash: f.access_hash,
+            part_index: f.part_index,
+          }));
+          await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
+          console.log('[Upload] Dedup: registered', asExisting.length, 'parts from existing upload');
+          return asExisting.map((p) => ({ message_id: p.telegram_message_id, access_hash: p.access_hash ?? undefined, size: p.filesize }));
+        }
+      }
     }
 
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
     const uploadResult = await telegramClient.uploadFileSplit(file, onProgress);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
+
+    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
     // Register all parts first so the file appears immediately in the UI
     await Promise.all(uploadResult.parts.map((part, i) =>
@@ -431,7 +455,7 @@ export function ChonkyDrive() {
         partIndex: i,
         totalParts: uploadResult.parts.length,
         originalName: file.name,
-        fileHash,
+        fileHash: fileHash ?? undefined,
       })
     ));
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
@@ -446,24 +470,24 @@ export function ChonkyDrive() {
           const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
           await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
           console.log('[Thumb] Saved thumbnail_message_id:', thumbResult.message_id);
-          loadContents();
+          scheduleThumbnailRefresh();
         } catch (err: any) {
           console.error('[Thumb] Thumbnail upload failed (non-fatal):', err?.message || err);
         }
       })();
     }
+
+    return uploadResult.parts;
   };
 
   const uploadAlbumBatch = async (
     batch: File[],
-    baseIndex: number,
-    results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>,
-    setResults: () => void,
-  ): Promise<void> => {
+    hashes: Array<string | null>,
+    onProgress?: (file: File, pct: number) => void,
+  ): Promise<Array<{ message_id: number; access_hash?: string; size: number } | null>> => {
     const telegramClient = getTelegramClient();
     const albumResults = await telegramClient.uploadAlbum(batch, (fileIdx, pct) => {
-      results[baseIndex + fileIdx] = { ...results[baseIndex + fileIdx], progress: pct };
-      setResults();
+      onProgress?.(batch[fileIdx], pct);
     });
 
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -484,9 +508,145 @@ export function ChonkyDrive() {
           partIndex: undefined,
           totalParts: undefined,
           originalName: file.name,
+          fileHash: hashes[j] ?? undefined,
         });
       })
     );
+
+    return albumResults.map((part) =>
+      part.message_id ? { message_id: part.message_id, access_hash: part.access_hash, size: part.size } : null
+    );
+  };
+
+  type UploadRow = { name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string };
+
+  /**
+   * Shared upload entry point for drag-drop and the file picker. Runs the dedup
+   * pre-pass BEFORE any file touches fileSemaphore, so duplicates (which never
+   * hit Telegram) can't hold a concurrency slot that a real upload needs.
+   */
+  const startUploadBatch = async (selectedFiles: File[]): Promise<void> => {
+    const initialFiles: UploadRow[] = selectedFiles.map((f) => ({
+      name: f.name,
+      progress: 0,
+      status: 'uploading',
+    }));
+    setUploadingFiles(initialFiles);
+
+    const results: UploadRow[] = initialFiles.map((f) => ({ ...f }));
+    const indexByFile = new Map<File, number>();
+    selectedFiles.forEach((f, i) => indexByFile.set(f, i));
+
+    const setRowStatus = (file: File, patch: Partial<UploadRow>) => {
+      const i = indexByFile.get(file);
+      if (i === undefined) return;
+      results[i] = { ...results[i], ...patch };
+      setUploadingFiles([...results]);
+    };
+
+    const plan = await planUploads(selectedFiles);
+
+    // Duplicates already in the DB: register immediately, never touch fileSemaphore.
+    const registerSemaphore = new Semaphore(8);
+    const duplicatePromises = plan.duplicates.map((dup) =>
+      registerSemaphore.withSlot(() =>
+        registerDuplicateParts(
+          dup.file,
+          dup.hash,
+          dup.existing.map((f) => ({
+            filesize: f.filesize,
+            mime_type: f.mime_type,
+            telegram_message_id: f.telegram_message_id!,
+            access_hash: f.access_hash,
+            part_index: f.part_index,
+          })),
+          currentFolderId,
+        )
+      ).then(() => {
+        setRowStatus(dup.file, { progress: 100, status: 'complete' });
+      }).catch((err: any) => {
+        setRowStatus(dup.file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : '註冊失敗' });
+      })
+    );
+
+    // Files sharing a hash within this selection: only the representative
+    // uploads for real; dependents register against its result once it's done.
+    const registerDependents = async (
+      planned: PlannedFile,
+      parts: Array<{ message_id: number; access_hash?: string; size: number }> | null,
+      mimeType: string,
+    ) => {
+      if (planned.dependents.length === 0) return;
+      if (!parts || parts.length === 0) {
+        planned.dependents.forEach((dep) => setRowStatus(dep, { progress: 0, status: 'error', error: '來源檔案上傳失敗' }));
+        return;
+      }
+      const asExisting = parts.map((p, i) => ({
+        filesize: p.size,
+        mime_type: mimeType,
+        telegram_message_id: p.message_id,
+        access_hash: p.access_hash,
+        part_index: i,
+      }));
+      await Promise.all(planned.dependents.map((dep) =>
+        registerDuplicateParts(dep, planned.hash, asExisting, currentFolderId)
+          .then(() => setRowStatus(dep, { progress: 100, status: 'complete' }))
+          .catch((err: any) => setRowStatus(dep, { progress: 0, status: 'error', error: err instanceof Error ? err.message : '註冊失敗' }))
+      ));
+    };
+
+    const ALBUM_BATCH = 10;
+    const freshBatches: PlannedFile[][] = [];
+    for (let i = 0; i < plan.fresh.length; i += ALBUM_BATCH) {
+      freshBatches.push(plan.fresh.slice(i, i + ALBUM_BATCH));
+    }
+
+    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
+    // A size-1 tail batch normally rides the album path too (SendMultiMedia
+    // accepts a single item), so it isn't throttled as a standalone message.
+    // Exceptions that keep the classic single-file path: the user dropped just
+    // one file (preserve thumbnail generation), or the file is large enough to
+    // need the split/chunked upload.
+    const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
+    const freshPromises = freshBatches.map((batch) => {
+      if (batch.length === 1 && (selectedFiles.length === 1 || batch[0].file.size > SINGLE_PATH_SIZE_LIMIT)) {
+        const planned = batch[0];
+        const file = planned.file;
+        return fileSemaphore.withSlot(() =>
+          uploadWithThumbnail(file, (pct) => setRowStatus(file, { progress: pct }), planned.hash)
+        ).then(async (parts) => {
+          setRowStatus(file, { progress: 100, status: 'complete' });
+          await registerDependents(planned, parts, file.type);
+        }).catch(async (err: any) => {
+          setRowStatus(file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' });
+          await registerDependents(planned, null, file.type);
+        });
+      }
+
+      return fileSemaphore.withSlot(() =>
+        uploadAlbumBatch(batch.map((p) => p.file), batch.map((p) => p.hash), (file, pct) => setRowStatus(file, { progress: pct }))
+      ).then(async (albumResults) => {
+        await Promise.all(batch.map(async (planned, j) => {
+          const res = albumResults[j];
+          if (res) {
+            setRowStatus(planned.file, { progress: 100, status: 'complete' });
+            await registerDependents(planned, [res], planned.file.type);
+          } else {
+            setRowStatus(planned.file, { progress: 0, status: 'error', error: 'Upload failed' });
+            await registerDependents(planned, null, planned.file.type);
+          }
+        }));
+      }).catch(async (err: any) => {
+        await Promise.all(batch.map(async (planned) => {
+          setRowStatus(planned.file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' });
+          await registerDependents(planned, null, planned.file.type);
+        }));
+      });
+    });
+
+    await Promise.allSettled([...duplicatePromises, ...freshPromises]);
+
+    loadContents();
   };
 
   const handleDrop = useCallback(async (event: React.DragEvent) => {
@@ -520,123 +680,14 @@ export function ChonkyDrive() {
     const droppedFiles = Array.from(event.dataTransfer.files);
     if (droppedFiles.length === 0) return;
 
-    const initialFiles = droppedFiles.map((f) => ({
-      name: f.name,
-      progress: 0,
-      status: 'uploading' as const,
-    }));
-    setUploadingFiles(initialFiles);
-
-    const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = initialFiles.map((f) => ({
-      ...f,
-      status: 'uploading' as const,
-    }));
-
-    const ALBUM_BATCH = 10;
-    const batches: File[][] = [];
-    for (let i = 0; i < droppedFiles.length; i += ALBUM_BATCH) {
-      batches.push(droppedFiles.slice(i, i + ALBUM_BATCH));
-    }
-
-    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
-    let batchBaseIndex = 0;
-    const uploadPromises = batches.map((batch) => {
-      const baseIndex = batchBaseIndex;
-      batchBaseIndex += batch.length;
-
-      if (batch.length === 1) {
-        const file = batch[0];
-        const i = baseIndex;
-        return fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
-          results[i] = { ...results[i], progress: pct };
-          setUploadingFiles([...results]);
-        })).then(() => {
-          results[i] = { name: file.name, progress: 100, status: 'complete' };
-        }).catch((err: any) => {
-          results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
-        }).finally(() => {
-          setUploadingFiles([...results]);
-        });
-      }
-
-      return fileSemaphore.withSlot(() =>
-        uploadAlbumBatch(batch, baseIndex, results, () => setUploadingFiles([...results]))
-      ).then(() => {
-        for (let j = 0; j < batch.length; j++) {
-          results[baseIndex + j] = { name: batch[j].name, progress: 100, status: 'complete' };
-        }
-      }).catch((err: any) => {
-        for (let j = 0; j < batch.length; j++) {
-          results[baseIndex + j] = { name: batch[j].name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
-        }
-      }).finally(() => {
-        setUploadingFiles([...results]);
-      });
-    });
-
-    await Promise.allSettled(uploadPromises);
-
-    loadContents();
-  }, [currentFolderId, loadContents, uploadWithThumbnail, isDraggingInternal]);
+    await startUploadBatch(droppedFiles);
+  }, [currentFolderId, loadContents, isDraggingInternal]);
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const pickedFiles = Array.from(event.target.files || []);
     if (pickedFiles.length === 0) return;
 
-    const initialFiles = pickedFiles.map((f) => ({
-      name: f.name,
-      progress: 0,
-      status: 'uploading' as const,
-    }));
-    setUploadingFiles(initialFiles);
-
-    const results: Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }> = [...initialFiles];
-
-    const ALBUM_BATCH = 10;
-    const batches: File[][] = [];
-    for (let i = 0; i < pickedFiles.length; i += ALBUM_BATCH) {
-      batches.push(pickedFiles.slice(i, i + ALBUM_BATCH));
-    }
-
-    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
-    let batchBaseIndex = 0;
-    const uploadPromises = batches.map((batch) => {
-      const baseIndex = batchBaseIndex;
-      batchBaseIndex += batch.length;
-
-      if (batch.length === 1) {
-        const file = batch[0];
-        const i = baseIndex;
-        return fileSemaphore.withSlot(() => uploadWithThumbnail(file, (pct) => {
-          results[i] = { ...results[i], progress: pct };
-          setUploadingFiles([...results]);
-        })).then(() => {
-          results[i] = { name: file.name, progress: 100, status: 'complete' };
-        }).catch((err: any) => {
-          results[i] = { name: file.name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
-        }).finally(() => {
-          setUploadingFiles([...results]);
-        });
-      }
-
-      return fileSemaphore.withSlot(() =>
-        uploadAlbumBatch(batch, baseIndex, results, () => setUploadingFiles([...results]))
-      ).then(() => {
-        for (let j = 0; j < batch.length; j++) {
-          results[baseIndex + j] = { name: batch[j].name, progress: 100, status: 'complete' };
-        }
-      }).catch((err: any) => {
-        for (let j = 0; j < batch.length; j++) {
-          results[baseIndex + j] = { name: batch[j].name, progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' };
-        }
-      }).finally(() => {
-        setUploadingFiles([...results]);
-      });
-    });
-
-    await Promise.allSettled(uploadPromises);
-
-    loadContents();
+    await startUploadBatch(pickedFiles);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -695,36 +746,13 @@ export function ChonkyDrive() {
       setUploadingFiles([...visibleFiles]);
     };
 
-    // Upload one file after its parent folder is ready.
-    const uploadFileEntry = async (file: File, folderPath: string): Promise<void> => {
+    // Upload one file after its parent folder is ready. Called only for files
+    // already proven fresh (not a duplicate) — hash check happens before this
+    // is invoked, outside fileSemaphore.
+    const uploadFileEntryFresh = async (file: File, folderPath: string, fileHash: string | null): Promise<void> => {
       const telegramClient = getTelegramClient();
       const folderId = await ensureFolder(folderPath);
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-      const fileHash = await sha256File(file);
-      const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] }));
-
-      if (hashCheck.found && hashCheck.files.length > 0) {
-        console.log('[Upload] Duplicate detected by hash (folder upload):', file.name);
-        await Promise.all(hashCheck.files.map((existing, j) =>
-          api.registerFile({
-            filename: file.name,
-            filesize: existing.filesize,
-            mimeType: existing.mime_type ?? undefined,
-            messageId: existing.telegram_message_id!,
-            fileId: `${splitGroupId}-${j}`,
-            accessHash: existing.access_hash ?? undefined,
-            parentId: folderId ?? undefined,
-            isSplitFile: true,
-            splitGroupId,
-            partIndex: existing.part_index ?? j,
-            totalParts: hashCheck.files.length,
-            originalName: file.name,
-            fileHash,
-          })
-        ));
-        return;
-      }
 
       const uploadResult = await telegramClient.uploadFileSplit(file);
       await Promise.all(uploadResult.parts.map((part, j) =>
@@ -741,7 +769,7 @@ export function ChonkyDrive() {
           partIndex: j,
           totalParts: uploadResult.parts.length,
           originalName: file.name,
-          fileHash,
+          fileHash: fileHash ?? undefined,
         })
       ));
       // Thumbnail — fire-and-forget
@@ -795,9 +823,27 @@ export function ChonkyDrive() {
             discovered++;
             addVisible({ name: file.name, progress: 0, status: 'uploading' });
             updateUI();
-            const p = fileSemaphore.withSlot(() =>
-              uploadFileEntry(file, basePath.replace(/\/$/, ''))
-            ).then(() => {
+            const folderPath = basePath.replace(/\/$/, '');
+            const p = (async () => {
+              const fileHash = await hashFileBounded(file);
+              if (fileHash) {
+                const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] as FileInfo[] }));
+                if (hashCheck.found && hashCheck.files.length > 0) {
+                  console.log('[Upload] Duplicate detected by hash (folder upload):', file.name);
+                  const folderId = await ensureFolder(folderPath);
+                  const asExisting = hashCheck.files.map((f) => ({
+                    filesize: f.filesize,
+                    mime_type: f.mime_type,
+                    telegram_message_id: f.telegram_message_id!,
+                    access_hash: f.access_hash,
+                    part_index: f.part_index,
+                  }));
+                  await registerDuplicateParts(file, fileHash, asExisting, folderId);
+                  return;
+                }
+              }
+              await fileSemaphore.withSlot(() => uploadFileEntryFresh(file, folderPath, fileHash));
+            })().then(() => {
               completed++;
               updateVisible(file.name, { progress: 100, status: 'complete' });
               updateUI();

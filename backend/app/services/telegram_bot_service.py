@@ -191,13 +191,20 @@ class TelegramMTProtoService:
     
     async def delete_file(self, message_id: int) -> bool:
         """Delete a message containing a file."""
+        return await self.delete_messages([message_id])
+
+    async def delete_messages(self, message_ids: list) -> bool:
+        """Delete multiple messages, batched to respect Telegram's 100-id limit."""
         try:
             client = await self.connect()
-            await client.delete_messages('me', [message_id])
-            logger.info(f"File deleted: message_id={message_id}")
+            batch_size = 100
+            for i in range(0, len(message_ids), batch_size):
+                batch = message_ids[i:i + batch_size]
+                await client.delete_messages('me', batch)
+            logger.info(f"Telegram messages deleted: {len(message_ids)}")
             return True
         except Exception as e:
-            logger.error(f"Failed to delete file: {e}")
+            logger.error(f"Failed to delete Telegram messages: {e}")
             return False
     
     async def download_file(self, file_id: str, access_hash: str, offset: int = 0, limit: int = 1024 * 1024) -> bytes:

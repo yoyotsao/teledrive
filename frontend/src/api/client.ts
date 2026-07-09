@@ -185,6 +185,19 @@ export const api = {
     });
     return response.data;
   },
+
+  checkFileHashes: async (hashes: string[]): Promise<Record<string, FileInfo[]>> => {
+    const CHUNK = 200;
+    const merged: Record<string, FileInfo[]> = {};
+    for (let i = 0; i < hashes.length; i += CHUNK) {
+      const chunk = hashes.slice(i, i + CHUNK);
+      const response = await client.post<{ results: Record<string, FileInfo[]> }>('/files/check-hashes', {
+        hashes: chunk,
+      });
+      Object.assign(merged, response.data.results);
+    }
+    return merged;
+  },
 };
 
 export function generateThumbnail(file: File, maxSize: number = 200): Promise<Blob | null> {

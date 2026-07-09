@@ -4,8 +4,9 @@ import { CustomFile } from "telegram/client/uploads";
 import { Api } from "telegram/tl";
 import bigInt from "big-integer";
 import { api } from "../api/client";
-import { MAX_CONCURRENT_CHUNKS, CHUNK_RETRY_COUNT } from "../config";
+import { MAX_CONCURRENT_CHUNKS, CHUNK_RETRY_COUNT, MESSAGE_SENDS_PER_SECOND, MESSAGE_SEND_BURST } from "../config";
 import { Semaphore } from "./semaphore";
+import { RateLimiter } from "./rateLimiter";
 
 /**
  * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
@@ -46,6 +47,43 @@ const PART_SIZE = 512 * 1024; // 512KB
 // Module-level semaphore shared across all file uploads
 const uploadSemaphore = new Semaphore(MAX_CONCURRENT_CHUNKS);
 
+// Throttles Telegram message-creating RPCs (sendFile / SendMultiMedia) to avoid
+// FLOOD_WAIT. Does NOT gate chunk uploads (SaveBigFilePart) — those stay bounded
+// by uploadSemaphore only, so large-file throughput is unaffected.
+const messageRateLimiter = new RateLimiter(MESSAGE_SENDS_PER_SECOND, MESSAGE_SEND_BURST);
+
+// Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT (or looks
+// like GramJS silently slept on one), penalize the shared limiter so all
+// pending sends slow down instead of piling more requests onto the flood.
+const FLOOD_SLEEP_SUSPECT_MS = 5000;
+const FLOOD_PENALTY_MS = 10_000;
+
+function isFloodError(err: unknown): boolean {
+  const e = err as { errorMessage?: string; message?: string } | null;
+  return `${e?.errorMessage ?? ''} ${e?.message ?? ''}`.includes('FLOOD');
+}
+
+function penalizeForFlood(label: string, err: unknown): void {
+  const seconds = (err as { seconds?: number } | null)?.seconds;
+  const waitMs = (typeof seconds === 'number' && seconds > 0 ? seconds : FLOOD_PENALTY_MS / 1000) * 1000;
+  console.warn(`[GramJS] ${label} hit FLOOD_WAIT — pausing message sends for ${waitMs}ms`);
+  messageRateLimiter.penalize(waitMs);
+}
+
+/**
+ * floodSleepThreshold makes GramJS sleep through FLOOD_WAIT < 300s instead of
+ * throwing, so a slow message-send invoke is the only visible symptom. Only
+ * meaningful for pure message sends (SendMultiMedia) where the file bytes were
+ * already uploaded — sendFile calls include byte transfer and would false-positive.
+ */
+function reportSuspectedFloodSleep(label: string, startedAt: number): void {
+  const elapsed = Date.now() - startedAt;
+  if (elapsed > FLOOD_SLEEP_SUSPECT_MS) {
+    console.warn(`[GramJS] ${label} took ${elapsed}ms — suspected FLOOD sleep, penalizing sends for ${FLOOD_PENALTY_MS}ms`);
+    messageRateLimiter.penalize(FLOOD_PENALTY_MS);
+  }
+}
+
 /**
  * Generate a random BigInteger for fileId in SaveBigFilePart operations.
  * Uses big-integer library for compatibility with GramJS API.
@@ -72,7 +110,7 @@ export class TelegramClientManager {
   private client: TelegramClient | null = null;
   private session: StringSession | null = null;
   // Limit concurrent sendFile calls — parallel sendFile before "me" entity is cached causes ID 0 errors
-  private readonly sendFileSemaphore = new Semaphore(2);
+  private readonly sendFileSemaphore = new Semaphore(3);
   // Tracks the in-flight/most recent initialize() call so operations issued while
   // the UI has already mounted (App no longer blocks on the MTProto handshake) can wait for it.
   private initPromise: Promise<void> | null = null;
@@ -164,12 +202,17 @@ export class TelegramClientManager {
     return this.sendFileSemaphore.withSlot(async () => {
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
+          await messageRateLimiter.wait();
           return await this.client!.sendFile("me", params);
         } catch (err: any) {
           const isEntityZero = err?.message?.includes('ID 0') || err?.message?.includes('Entity');
           if (isEntityZero && attempt < maxRetries - 1) {
             console.warn(`[GramJS] sendFile entity-0 error (attempt ${attempt + 1}), refreshing entity cache...`);
             try { await this.client!.getMe(); } catch { /* ignore */ }
+            continue;
+          }
+          if (isFloodError(err) && attempt < maxRetries - 1) {
+            penalizeForFlood('sendFile', err);
             continue;
           }
           throw err;
@@ -262,7 +305,9 @@ export class TelegramClientManager {
     // Create CustomFile for thumbnail
     const customFile = new CustomFile(filename, file.size, "", buffer);
 
-    // Send thumbnail to Saved Messages
+    // Send thumbnail to Saved Messages — this creates a message, so it must
+    // share the rate limiter or thumbnails become the FLOOD_WAIT trigger.
+    await messageRateLimiter.wait();
     const message = await this.client.sendFile("me", {
       file: customFile,
       workers: 2, // Fewer workers for thumbnails
@@ -499,9 +544,24 @@ export class TelegramClientManager {
     );
 
     const peer = await this.client.getInputEntity('me');
-    const updates = await this.client.invoke(
-      new Api.messages.SendMultiMedia({ peer, multiMedia })
-    ) as any;
+    let updates: any;
+    for (let attempt = 0; ; attempt++) {
+      await messageRateLimiter.wait();
+      const startedAt = Date.now();
+      try {
+        updates = await this.client.invoke(
+          new Api.messages.SendMultiMedia({ peer, multiMedia })
+        ) as any;
+        reportSuspectedFloodSleep('SendMultiMedia', startedAt);
+        break;
+      } catch (err) {
+        if (isFloodError(err) && attempt < 1) {
+          penalizeForFlood('SendMultiMedia', err);
+          continue;
+        }
+        throw err;
+      }
+    }
 
     const messages: Api.Message[] = (updates.updates ?? [])
       .filter((u: any) => u.className === 'UpdateNewMessage' || u.className === 'UpdateNewChannelMessage')

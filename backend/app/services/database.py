@@ -102,8 +102,9 @@ class Database:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_files_user_parent ON files(telegram_user_id, isDir, parent_id)"
         )
+        # find_by_hash/find_by_hashes always filter by (file_hash, telegram_user_id) together
         await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash)"
+            "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash, telegram_user_id)"
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_files_split_group ON files(split_group_id)"
@@ -190,6 +191,30 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def find_by_hashes(self, hashes: List[str], telegram_user_id: int) -> dict[str, List[dict]]:
+        """Find file records for multiple SHA-256 hashes at once, grouped by hash."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if not hashes:
+            return {}
+
+        result: dict[str, List[dict]] = {}
+        # SQLite has a bound-variable limit (~999-32766 depending on build); chunk to stay safe.
+        CHUNK = 500
+        for i in range(0, len(hashes), CHUNK):
+            chunk = hashes[i:i + CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await self._conn.execute(
+                f"SELECT * FROM files WHERE file_hash IN ({placeholders}) "
+                f"AND telegram_user_id = ? AND isDir = 0 ORDER BY file_hash, part_index ASC",
+                (*chunk, telegram_user_id),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                d = dict(row)
+                result.setdefault(d["file_hash"], []).append(d)
+        return result
     
     async def get_file(self, file_id: str, telegram_user_id: Optional[int] = None) -> Optional[dict]:
         """Get a file by ID, optionally filtered by telegram_user_id."""
@@ -432,6 +457,41 @@ class Database:
         await self._conn.commit()
         return cursor.rowcount > 0
     
+    async def get_subtree(self, root_id: str) -> List[dict]:
+        """Get a file/folder row and every descendant underneath it (recursive)."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._conn.execute("""
+            WITH RECURSIVE subtree(file_id) AS (
+                SELECT file_id FROM files WHERE file_id = ?
+                UNION
+                SELECT f.file_id FROM files f JOIN subtree s ON f.parent_id = s.file_id
+            )
+            SELECT * FROM files WHERE file_id IN (SELECT file_id FROM subtree)
+        """, (root_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def delete_files_by_ids(self, file_ids: List[str]) -> int:
+        """Delete multiple file records in one transaction. Returns rows deleted."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if not file_ids:
+            return 0
+
+        deleted = 0
+        batch_size = 500  # stay well under SQLite's variable limit
+        for i in range(0, len(file_ids), batch_size):
+            batch = file_ids[i:i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            cursor = await self._conn.execute(
+                f"DELETE FROM files WHERE file_id IN ({placeholders})", batch
+            )
+            deleted += cursor.rowcount
+        await self._conn.commit()
+        return deleted
+
     async def get_files_by_split_group(self, split_group_id: str, telegram_user_id: int = 0) -> List[dict]:
         """Get all files belonging to a split group, sorted by part_index."""
         if not self._conn:

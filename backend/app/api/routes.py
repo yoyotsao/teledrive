@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect, Depends
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from pathlib import Path
 
@@ -195,6 +195,10 @@ class LoginResponse(BaseModel):
     first_name: Optional[str] = None
 
 
+class CheckHashesRequest(BaseModel):
+    hashes: list[str] = Field(..., max_length=1000)
+
+
 class RegisterFileRequest(BaseModel):
     filename: str
     filesize: int
@@ -275,6 +279,17 @@ async def check_file_hash(
     if not files:
         return {"found": False, "files": []}
     return {"found": True, "files": [f.model_dump() for f in files]}
+
+
+@router.post("/files/check-hashes")
+async def check_file_hashes(
+    request: CheckHashesRequest,
+    current_user: int = Depends(get_current_user),
+):
+    """Batch-check multiple SHA-256 hashes at once, grouped by hash."""
+    file_service = get_file_service()
+    results = await file_service.find_by_hashes(request.hashes, current_user)
+    return {"results": {h: [f.model_dump() for f in files] for h, files in results.items()}}
 
 
 @router.post("/files/register", response_model=FileInfo)
@@ -391,6 +406,17 @@ async def get_file_info(file_id: str, current_user: int = Depends(get_current_us
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _delete_telegram_messages(message_ids: list) -> None:
+    """Best-effort deletion of Telegram messages — never fails the request."""
+    if not message_ids:
+        return
+    try:
+        bot_service = await get_bot_service()
+        await bot_service.delete_messages(message_ids)
+    except Exception as e:
+        logger.warning(f"Telegram message delete failed (non-fatal): {e}")
+
+
 @router.delete("/files/{file_id}")
 async def delete_file(file_id: str, current_user: int = Depends(get_current_user)):
     try:
@@ -400,6 +426,14 @@ async def delete_file(file_id: str, current_user: int = Depends(get_current_user
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
 
+        # Folders must cascade — deleting only the folder row orphans every
+        # descendant record (they become invisible in the UI but stay in SQLite).
+        if getattr(file_info, 'isDir', False):
+            deleted_count, message_ids = await file_service.delete_folder(file_id)
+            await _delete_telegram_messages(message_ids)
+            logger.info(f"Deleted folder {file_id} recursively ({deleted_count} records)")
+            return {"message": "Folder deleted", "file_id": file_id, "records_deleted": deleted_count}
+
         # For split files, collect all parts so we can delete their Telegram messages too.
         # The UI only passes part_index=0's file_id, so we must look up siblings here.
         all_parts = []
@@ -407,21 +441,24 @@ async def delete_file(file_id: str, current_user: int = Depends(get_current_user
             db = await file_service._get_db()
             all_parts = await db.get_files_by_split_group(file_info.split_group_id, telegram_user_id=current_user)
         else:
-            all_parts = [{"file_id": file_id, "telegram_message_id": file_info.telegram_message_id}]
+            all_parts = [{
+                "file_id": file_id,
+                "telegram_message_id": file_info.telegram_message_id,
+                "thumbnail_message_id": file_info.thumbnail_message_id,
+            }]
 
         # Delete all DB records
         for part in all_parts:
             await file_service.delete_file(part["file_id"])
 
         # Delete Telegram messages (best-effort — don't fail the whole request on Telegram error)
-        message_ids = [p["telegram_message_id"] for p in all_parts if p.get("telegram_message_id")]
-        if message_ids:
-            try:
-                bot_service = await get_bot_service()
-                for mid in message_ids:
-                    await bot_service.delete_file(mid)
-            except Exception as e:
-                logger.warning(f"Telegram message delete failed (non-fatal): {e}")
+        message_ids = [
+            mid
+            for p in all_parts
+            for mid in (p.get("telegram_message_id"), p.get("thumbnail_message_id"))
+            if mid
+        ]
+        await _delete_telegram_messages(message_ids)
 
         deleted_count = len(all_parts)
         logger.info(f"Deleted file {file_id} and {deleted_count} part(s)")
@@ -754,20 +791,21 @@ async def list_folders(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/folders/{folder_id}")
+@router.delete("/folders/{folder_id}")
 async def delete_folder(folder_id: str, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
         file_info = await file_service.get_file_info(folder_id, telegram_user_id=current_user)
-        
+
         if not file_info:
             raise HTTPException(status_code=404, detail="Folder not found")
-        
+
         if not getattr(file_info, 'isDir', False):
             raise HTTPException(status_code=400, detail="Not a folder")
-        
-        await file_service.delete_folder(folder_id)
-        return {"message": "Folder deleted", "folder_id": folder_id}
+
+        deleted_count, message_ids = await file_service.delete_folder(folder_id)
+        await _delete_telegram_messages(message_ids)
+        return {"message": "Folder deleted", "folder_id": folder_id, "records_deleted": deleted_count}
     except HTTPException:
         raise
     except Exception as e:

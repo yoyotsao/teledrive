@@ -222,6 +222,25 @@ export class TelegramClientManager {
   }
 
   /**
+   * Upload thumbnail bytes and return an InputFile for embedding as a document
+   * thumb. This is SaveFilePart traffic — NOT a message send — so it does not
+   * go through messageRateLimiter. Returns undefined on any failure (non-fatal:
+   * the file uploads without a thumbnail).
+   */
+  private async uploadThumbInputFile(thumb: Blob | null | undefined): Promise<Api.TypeInputFile | undefined> {
+    if (!thumb || !this.client) return undefined;
+    try {
+      const arrayBuffer = await thumb.arrayBuffer();
+      const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+      const customFile = new CustomFile('thumb.jpg', thumb.size, '', buf);
+      return await (this.client as any).uploadFile({ file: customFile, workers: 1 });
+    } catch (err) {
+      console.warn('[Thumb] thumb bytes upload failed (non-fatal):', err);
+      return undefined;
+    }
+  }
+
+  /**
    * Upload a file to Telegram Saved Messages.
    * @param file - The file to upload (Browser File object)
    * @returns Promise with upload result containing message_id, file_id, and access_hash
@@ -345,10 +364,11 @@ export class TelegramClientManager {
    * @param file - The file to upload (Browser File object)
    * @returns Promise with upload results containing message_id, file_id, access_hash, and size for each part
    */
-  async uploadFileSplit(file: File, onProgress?: (pct: number) => void): Promise<{
+  async uploadFileSplit(file: File, onProgress?: (pct: number) => void, thumb?: Blob | null): Promise<{
     parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>;
     originalName: string;
     totalParts: number;
+    hasThumbnail: boolean;
   }> {
     await this.waitUntilReady();
     if (!this.client) {
@@ -364,10 +384,12 @@ export class TelegramClientManager {
       const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
       const customFile = new CustomFile(file.name, file.size, "", buffer);
 
+      const thumbInput = await this.uploadThumbInputFile(thumb);
       const message = await this.sendFileLocked({
         file: customFile,
         workers: 4,
         forceDocument: true,
+        ...(thumbInput ? { thumb: thumbInput } : {}),
       });
 
       const msg = message as Api.Message;
@@ -393,6 +415,7 @@ export class TelegramClientManager {
         parts: [{ message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size }],
         originalName: file.name,
         totalParts: 1,
+        hasThumbnail: !!thumbInput,
       };
     }
 
@@ -402,6 +425,7 @@ export class TelegramClientManager {
     let remainingSize = file.size;
     const totalChunks = Math.ceil(file.size / PART_SIZE);
     let completedChunks = 0;
+    let thumbAttached = false;
 
     console.log('[SplitUpload] Large file - total parts:', totalChunks);
 
@@ -467,7 +491,13 @@ export class TelegramClientManager {
       });
 
       try {
-        const message = await this.sendFileLocked({ file: inputFileBig, forceDocument: true });
+        const thumbInput = segmentStartOffset === 0 ? await this.uploadThumbInputFile(thumb) : undefined;
+        if (thumbInput) thumbAttached = true;
+        const message = await this.sendFileLocked({
+          file: inputFileBig,
+          forceDocument: true,
+          ...(thumbInput ? { thumb: thumbInput } : {}),
+        });
         const msg = message as Api.Message;
         console.log('[SplitUpload] File sent successfully, message_id:', msg?.id);
         const media = msg.media;
@@ -505,13 +535,15 @@ export class TelegramClientManager {
       parts: uploadedParts,
       originalName: file.name,
       totalParts: uploadedParts.reduce((sum, p) => sum + Math.ceil(p.size / PART_SIZE), 0),
+      hasThumbnail: thumbAttached,
     };
   }
 
   async uploadAlbum(
     files: File[],
     onProgress?: (fileIdx: number, pct: number) => void,
-  ): Promise<Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>> {
+    thumbs?: Array<Blob | null>,
+  ): Promise<Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
@@ -527,16 +559,18 @@ export class TelegramClientManager {
           workers: 1,
           onProgress: (pct: number) => onProgress?.(idx, Math.round(pct * 100)),
         });
-        return { inputFile, file };
+        const thumbInput = await this.uploadThumbInputFile(thumbs?.[idx]);
+        return { inputFile, thumbInput, file };
       })
     );
 
-    const multiMedia = inputFiles.map(({ inputFile, file }) =>
+    const multiMedia = inputFiles.map(({ inputFile, thumbInput, file }) =>
       new Api.InputSingleMedia({
         media: new Api.InputMediaUploadedDocument({
           file: inputFile,
           mimeType: file.type || 'application/octet-stream',
           attributes: [new Api.DocumentAttributeFilename({ fileName: file.name })],
+          ...(thumbInput ? { thumb: thumbInput } : {}),
         }),
         message: '',
         randomId: generateRandomBigInt(),
@@ -545,6 +579,7 @@ export class TelegramClientManager {
 
     const peer = await this.client.getInputEntity('me');
     let updates: any;
+    console.log('[Album] SendMultiMedia batch size:', files.length);
     for (let attempt = 0; ; attempt++) {
       await messageRateLimiter.wait();
       const startedAt = Date.now();
@@ -570,7 +605,7 @@ export class TelegramClientManager {
 
     return files.map((file, idx) => {
       const msg = messages[idx];
-      if (!msg) return { message_id: 0, file_id: '', access_hash: undefined, size: file.size };
+      if (!msg) return { message_id: 0, file_id: '', access_hash: undefined, size: file.size, has_thumbnail: false };
       const media = msg.media as any;
       let fileId = '';
       let accessHash: string | undefined;
@@ -581,13 +616,14 @@ export class TelegramClientManager {
         fileId = String(media.photo.id);
         accessHash = media.photo.accessHash ? String(media.photo.accessHash) : undefined;
       }
-      return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size };
+      return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, has_thumbnail: !!inputFiles[idx].thumbInput };
     });
   }
 
   /**
-   * Download a thumbnail from Telegram by message_id.
-   * @param messageId - The Telegram message ID of the thumbnail
+   * Download the embedded thumb PhotoSize of a file's own message by message_id.
+   * Never downloads the document body (could be a 500MB video).
+   * @param messageId - The Telegram message ID of the file (NOT a separate thumbnail message)
    * @returns Promise with Blob of the thumbnail image
    */
   async downloadThumbnail(messageId: number): Promise<Blob> {
@@ -599,14 +635,20 @@ export class TelegramClientManager {
     // Get the message from Saved Messages
     const messages = await this.client.getMessages("me", { ids: [messageId] });
     const message = messages[0] as Api.Message;
-    
+
     if (!message || !message.media) {
       throw new Error("Message not found or has no media");
     }
 
-    // Download the media
-    const buffer = await this.client.downloadMedia(message.media);
-    
+    const media = message.media as any;
+    const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
+    if (!doc?.thumbs?.length) {
+      throw new Error("No embedded thumbnail");
+    }
+
+    // Download ONLY the embedded thumb PhotoSize — never the document itself
+    const buffer = await this.client.downloadMedia(message.media, { thumb: doc.thumbs.length - 1 });
+
     if (!buffer) {
       throw new Error("Failed to download thumbnail");
     }
@@ -616,11 +658,13 @@ export class TelegramClientManager {
   }
 
   /**
-   * Download many thumbnails at once — one getMessages round trip for all
-   * message ids, then bounded-parallel downloadMedia per thumbnail. Used when
-   * opening a folder so N thumbnails don't cost N sequential getMessages calls.
-   * @param messageIds - Telegram message IDs of the thumbnails
-   * @returns Map of messageId -> Blob (entries with no media or a failed download are omitted)
+   * Download many embedded thumbnails at once — one getMessages round trip for
+   * all message ids (each the file's OWN message, not a separate thumbnail
+   * message), then bounded-parallel downloadMedia of just the thumb PhotoSize
+   * per file. Used when opening a folder so N thumbnails don't cost N
+   * sequential getMessages calls. Never downloads a document body.
+   * @param messageIds - Telegram message IDs of the files themselves
+   * @returns Map of messageId -> Blob (entries with no embedded thumb or a failed download are omitted)
    */
   async downloadThumbnails(messageIds: number[]): Promise<Map<number, Blob>> {
     await this.waitUntilReady();
@@ -639,8 +683,11 @@ export class TelegramClientManager {
         downloadSemaphore.withSlot(async () => {
           const msg = message as Api.Message | undefined;
           if (!msg || !msg.media) return;
+          const media = msg.media as any;
+          const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
+          if (!doc?.thumbs?.length) return; // no embedded thumb — nothing to show
           try {
-            const buffer = await this.client!.downloadMedia(msg.media);
+            const buffer = await this.client!.downloadMedia(msg.media, { thumb: doc.thumbs.length - 1 });
             if (buffer) {
               result.set(msg.id, new Blob([buffer], { type: 'image/jpeg' }));
             }

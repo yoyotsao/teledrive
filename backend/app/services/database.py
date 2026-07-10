@@ -47,7 +47,7 @@ class Database:
                 mime_type TEXT,
                 file_type TEXT NOT NULL,
                 telegram_message_id INTEGER,
-                thumbnail_message_id INTEGER,
+                has_thumbnail INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 direct_url TEXT,
                 access_hash TEXT,
@@ -146,12 +146,12 @@ class Database:
         mime_type: Optional[str],
         file_type: str,
         telegram_message_id: Optional[int],
-        thumbnail_message_id: Optional[int],
         created_at: str,
         direct_url: Optional[str],
         access_hash: Optional[str],
         parent_id: Optional[str],
         is_dir: bool,
+        has_thumbnail: bool = False,
         is_split_file: bool = False,
         original_name: Optional[str] = None,
         part_index: Optional[int] = None,
@@ -167,14 +167,14 @@ class Database:
         await self._conn.execute("""
             INSERT OR REPLACE INTO files (
                 file_id, filename, filesize, mime_type, file_type,
-                telegram_message_id, thumbnail_message_id,
+                telegram_message_id, has_thumbnail,
                 created_at, direct_url, access_hash, parent_id, isDir,
                 is_split_file, original_name, part_index, total_parts, split_group_id,
                 telegram_user_id, file_hash
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_id, filename, filesize, mime_type, file_type,
-            telegram_message_id, thumbnail_message_id,
+            telegram_message_id, 1 if has_thumbnail else 0,
             created_at, direct_url, access_hash, parent_id, 1 if is_dir else 0,
             1 if is_split_file else 0, original_name, part_index, total_parts, split_group_id,
             telegram_user_id, file_hash,
@@ -333,7 +333,6 @@ class Database:
     async def update_file(
         self,
         file_id: str,
-        thumbnail_message_id: Optional[int] = None,
         parent_id: Optional[str] = None,
         set_parent_id: bool = False
     ) -> Optional[dict]:
@@ -343,10 +342,6 @@ class Database:
 
         updates = []
         params = []
-
-        if thumbnail_message_id is not None:
-            updates.append("thumbnail_message_id = ?")
-            params.append(thumbnail_message_id)
 
         if set_parent_id:
             updates.append("parent_id = ?")

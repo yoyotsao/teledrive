@@ -44,7 +44,7 @@ class FileService:
             mime_type=row['mime_type'],
             file_type=FileType(row['file_type']),
             telegram_message_id=row['telegram_message_id'],
-            thumbnail_message_id=row['thumbnail_message_id'],
+            has_thumbnail=bool(row.get('has_thumbnail') or 0),
             created_at=datetime.fromisoformat(row['created_at']) if isinstance(row['created_at'], str) else row['created_at'],
             direct_url=row.get('direct_url'),
             access_hash=row.get('access_hash'),
@@ -191,14 +191,14 @@ class FileService:
                 mime_type=file_info.mime_type,
                 file_type=file_info.file_type.value,
             telegram_message_id=file_info.telegram_message_id,
-            thumbnail_message_id=file_info.thumbnail_message_id,
+            has_thumbnail=file_info.has_thumbnail,
             created_at=file_info.created_at.isoformat(),
             direct_url=file_info.direct_url,
                 access_hash=file_info.access_hash,
                 parent_id=file_info.parent_id,
                 is_dir=file_info.isDir
             )
-            
+
             logger.info(f"Upload completed: {file_id}")
         
         return {
@@ -218,7 +218,7 @@ class FileService:
         file_id: str,
         access_hash: Optional[str] = None,
         parent_id: Optional[str] = None,
-        thumbnail_message_id: Optional[int] = None,
+        has_thumbnail: bool = False,
         is_split_file: bool = False,
         original_name: Optional[str] = None,
         part_index: Optional[int] = None,
@@ -251,7 +251,7 @@ class FileService:
             mime_type=mime_type,
             file_type=file_type,
             telegram_message_id=message_id,
-            thumbnail_message_id=thumbnail_message_id,
+            has_thumbnail=has_thumbnail,
             created_at=created_at,
             direct_url=None,
             access_hash=access_hash,
@@ -281,7 +281,7 @@ class FileService:
             mime_type=file_info.mime_type,
             file_type=file_info.file_type.value,
             telegram_message_id=file_info.telegram_message_id,
-            thumbnail_message_id=file_info.thumbnail_message_id,
+            has_thumbnail=file_info.has_thumbnail,
             created_at=file_info.created_at.isoformat(),
             direct_url=file_info.direct_url,
             access_hash=file_info.access_hash,
@@ -296,7 +296,7 @@ class FileService:
             file_hash=file_hash,
         )
 
-        logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, thumbnail: {thumbnail_message_id}")
+        logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, has_thumbnail: {has_thumbnail}")
         
         return file_info
     
@@ -341,7 +341,7 @@ class FileService:
             mime_type=file_info.mime_type,
             file_type=file_info.file_type.value,
             telegram_message_id=file_info.telegram_message_id,
-                thumbnail_message_id=file_info.thumbnail_message_id,
+                has_thumbnail=file_info.has_thumbnail,
                 created_at=file_info.created_at.isoformat(),
             direct_url=file_info.direct_url,
             access_hash=file_info.access_hash,
@@ -456,7 +456,7 @@ class FileService:
             mime_type=folder_info.mime_type,
             file_type=folder_info.file_type.value,
             telegram_message_id=folder_info.telegram_message_id,
-            thumbnail_message_id=folder_info.thumbnail_message_id,
+            has_thumbnail=folder_info.has_thumbnail,
             created_at=folder_info.created_at.isoformat(),
             direct_url=folder_info.direct_url,
             access_hash=folder_info.access_hash,
@@ -491,7 +491,7 @@ class FileService:
         message_ids = [
             mid
             for r in subtree
-            for mid in (r.get('telegram_message_id'), r.get('thumbnail_message_id'))
+            for mid in (r.get('telegram_message_id'),)
             if mid
         ]
         deleted = await db.delete_files_by_ids([r['file_id'] for r in subtree])
@@ -508,14 +508,13 @@ class FileService:
         logger.info(f"All files deleted: {count} items")
         return count
 
-    async def update_file(self, file_id: str, thumbnail_message_id: Optional[int] = None, parent_id: Optional[str] = None, set_parent_id: bool = False) -> Optional[FileInfo]:
+    async def update_file(self, file_id: str, parent_id: Optional[str] = None, set_parent_id: bool = False) -> Optional[FileInfo]:
         """Update file metadata."""
         db = await self._get_db()
-        logger.info(f"update_file called: file_id={file_id}, thumbnail_message_id={thumbnail_message_id}, parent_id={parent_id}, set_parent_id={set_parent_id}")
+        logger.info(f"update_file called: file_id={file_id}, parent_id={parent_id}, set_parent_id={set_parent_id}")
 
         updated_row = await db.update_file(
             file_id,
-            thumbnail_message_id=thumbnail_message_id,
             parent_id=parent_id,
             set_parent_id=set_parent_id
         )

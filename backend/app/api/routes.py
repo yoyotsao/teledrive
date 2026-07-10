@@ -68,67 +68,37 @@ async def extract_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> None:
     await asyncio.to_thread(run_ffmpeg)
 
 async def _download_thumbnail_base64(client, message_id: int) -> Optional[str]:
-    """Download thumbnail from user's Telegram account using their Telethon client."""
-    try:
-        from telethon.tl.functions.upload import GetFileRequest
-        from telethon.tl.types import InputPhotoFileLocation
+    """Download ONLY the embedded thumb PhotoSize of the file's own message.
 
+    Never downloads the document body (could be a 500MB video). Falls back to
+    the full document only for image/* mime types (the image IS the thumbnail
+    source and is small).
+    """
+    try:
+        import io
         message = await client.get_messages('me', ids=message_id)
         if not message:
             logger.error(f"Thumbnail: Message {message_id} not found")
             return None
-
-        photo = getattr(message, 'photo', None)
-        if photo:
-            sizes = getattr(photo, 'sizes', [])
-            if sizes:
-                largest = next((s for s in sizes if getattr(s, 'type', '').lower() == 'y'), sizes[-1])
-                thumb_size = getattr(largest, 'type', '')
-                input_loc = InputPhotoFileLocation(
-                    id=photo.id,
-                    access_hash=getattr(photo, 'access_hash', 0) or 0,
-                    file_reference=getattr(photo, 'file_reference', b'') or b'',
-                    thumb_size=thumb_size,
-                )
-                result = await client(GetFileRequest(location=input_loc, offset=0, limit=256 * 1024))
-                if hasattr(result, 'bytes') and result.bytes:
-                    return base64.b64encode(bytes(result.bytes)).decode()
-
         media = getattr(message, 'media', None)
-        if media:
-            if hasattr(media, 'photo') and media.photo:
-                photo = media.photo
-                sizes = getattr(photo, 'sizes', [])
-                if sizes:
-                    largest = sizes[-1]
-                    input_loc = InputPhotoFileLocation(
-                        id=photo.id,
-                        access_hash=getattr(photo, 'access_hash', 0) or 0,
-                        file_reference=getattr(photo, 'file_reference', b'') or b'',
-                        thumb_size=getattr(largest, 'type', ''),
-                    )
-                    result = await client(GetFileRequest(location=input_loc, offset=0, limit=256 * 1024))
-                    if hasattr(result, 'bytes') and result.bytes:
-                        return base64.b64encode(bytes(result.bytes)).decode()
+        doc = getattr(media, 'document', None) if media else None
+        if doc is None:
+            return None
 
-            doc = getattr(media, 'document', None)
-            if doc:
-                doc_mime = getattr(doc, 'mime_type', '') or ''
-                thumb = getattr(doc, 'thumb', None)
-                if thumb:
-                    loc = getattr(thumb, 'location', None)
-                    if loc:
-                        result = await client(GetFileRequest(location=loc, offset=0, limit=256 * 1024))
-                        if hasattr(result, 'bytes') and result.bytes:
-                            return base64.b64encode(bytes(result.bytes)).decode()
-                if doc_mime.startswith('image/'):
-                    import io
-                    buf = io.BytesIO()
-                    await client.download_media(message, file=buf)
-                    doc_bytes = buf.getvalue()
-                    if doc_bytes:
-                        return base64.b64encode(doc_bytes).decode()
+        if getattr(doc, 'thumbs', None):
+            buf = io.BytesIO()
+            # thumb=-1 → largest embedded PhotoSize; a few KB, never the document
+            await client.download_media(message, file=buf, thumb=-1)
+            data = buf.getvalue()
+            if data:
+                return base64.b64encode(data).decode()
 
+        if (getattr(doc, 'mime_type', '') or '').startswith('image/'):
+            buf = io.BytesIO()
+            await client.download_media(message, file=buf)
+            data = buf.getvalue()
+            if data:
+                return base64.b64encode(data).decode()
         return None
     except Exception as e:
         logger.error(f"_download_thumbnail_base64 failed: {e}")
@@ -207,7 +177,7 @@ class RegisterFileRequest(BaseModel):
     file_id: str
     access_hash: Optional[str] = None
     parent_id: Optional[str] = None
-    thumbnail_message_id: Optional[int] = None
+    has_thumbnail: bool = False
     is_split_file: bool = False
     original_name: Optional[str] = None
     part_index: Optional[int] = None
@@ -222,12 +192,7 @@ class CreateFolderRequest(BaseModel):
 
 
 class UpdateFileRequest(BaseModel):
-    thumbnail_message_id: Optional[int] = None
     parent_id: Optional[str] = None
-
-
-class VideoThumbnailRequest(BaseModel):
-    message_id: int
 
 
 @router.post("/auth/login", response_model=LoginResponse)
@@ -311,7 +276,7 @@ async def register_file(
             file_id=request.file_id,
             access_hash=request.access_hash,
             parent_id=request.parent_id,
-            thumbnail_message_id=request.thumbnail_message_id,
+            has_thumbnail=request.has_thumbnail,
             is_split_file=request.is_split_file,
             original_name=request.original_name,
             part_index=request.part_index,
@@ -323,32 +288,6 @@ async def register_file(
         return file_info
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/files/thumbnail/upload")
-async def upload_thumbnail(file: UploadFile = File(...)):
-    """
-    DEPRECATED: This endpoint is no longer supported.
-    
-    The correct architecture is:
-    1. Frontend uses GramJS to upload thumbnail directly to Telegram
-    2. Frontend calls /files/register with thumbnail_message_id
-    
-    This approach avoids file transfer through the backend.
-    """
-    raise HTTPException(
-        status_code=410,
-        detail="This endpoint is deprecated. Use frontend to upload thumbnail to Telegram, then call /files/register with thumbnail_message_id."
-    )
-
-
-@router.post("/videos/thumbnail")
-async def generate_video_thumbnail(request: VideoThumbnailRequest):
-    """DEPRECATED: Use frontend FFmpeg WASM to generate thumbnail, upload to Telegram, then call /files/register with thumbnail_message_id."""
-    raise HTTPException(
-        status_code=410,
-        detail="This endpoint is deprecated. Use frontend FFmpeg WASM to generate video thumbnail, upload to Telegram, then call /files/register with thumbnail_message_id."
-    )
 
 
 @router.post("/files/upload")
@@ -444,7 +383,6 @@ async def delete_file(file_id: str, current_user: int = Depends(get_current_user
             all_parts = [{
                 "file_id": file_id,
                 "telegram_message_id": file_info.telegram_message_id,
-                "thumbnail_message_id": file_info.thumbnail_message_id,
             }]
 
         # Delete all DB records
@@ -455,7 +393,7 @@ async def delete_file(file_id: str, current_user: int = Depends(get_current_user
         message_ids = [
             mid
             for p in all_parts
-            for mid in (p.get("telegram_message_id"), p.get("thumbnail_message_id"))
+            for mid in (p.get("telegram_message_id"),)
             if mid
         ]
         await _delete_telegram_messages(message_ids)
@@ -483,20 +421,19 @@ async def delete_all_files(current_user: int = Depends(get_current_user)):
 @router.patch("/files/{file_id}")
 async def update_file(file_id: str, request: UpdateFileRequest, current_user: int = Depends(get_current_user)):
     """
-    Update file metadata (e.g., thumbnail_message_id, parent_id for move).
+    Update file metadata (e.g., parent_id for move).
     """
     try:
-        logger.info(f"Update file request: file_id={file_id}, thumbnail_message_id={request.thumbnail_message_id}, parent_id={request.parent_id}")
+        logger.info(f"Update file request: file_id={file_id}, parent_id={request.parent_id}")
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
-        
+
         if not file_info:
             logger.error(f"File not found: {file_id}")
             raise HTTPException(status_code=404, detail="File not found")
-        
+
         updated_info = await file_service.update_file(
             file_id,
-            thumbnail_message_id=request.thumbnail_message_id,
             parent_id=request.parent_id,
             set_parent_id='parent_id' in request.model_fields_set
         )
@@ -560,13 +497,12 @@ async def get_file_thumbnail(file_id: str, current_user: int = Depends(get_curre
         if not (mime_type.startswith('image/') or mime_type.startswith('video/')):
             raise HTTPException(status_code=400, detail="Not an image or video file")
 
-        # For videos: only use dedicated thumbnail_message_id — never fall back to
-        # telegram_message_id because that points to the video document itself (500MB+).
-        # For images: telegram_message_id IS the image, so fallback is safe.
+        # Thumbnails are embedded in the file's own message. For videos we must
+        # have an embedded thumb; downloading the document itself is forbidden.
         is_video = mime_type.startswith('video/')
-        message_id = file_info.thumbnail_message_id
-        if not message_id and not is_video:
-            message_id = file_info.telegram_message_id
+        if is_video and not file_info.has_thumbnail:
+            raise HTTPException(status_code=404, detail="No thumbnail available")
+        message_id = file_info.telegram_message_id
         if not message_id:
             raise HTTPException(status_code=404, detail="No thumbnail available")
 

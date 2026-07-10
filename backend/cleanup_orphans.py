@@ -65,7 +65,7 @@ def main() -> int:
     message_ids = sorted({
         mid
         for r in targets
-        for mid in (r.get("telegram_message_id"), r.get("thumbnail_message_id"))
+        for mid in (r.get("telegram_message_id"),)
         if mid
     })
 

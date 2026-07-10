@@ -12,7 +12,7 @@ USER_ID = 1
 
 
 async def _insert(db: Database, file_id: str, parent_id=None, is_dir=False,
-                  msg_id=None, thumb_id=None):
+                  msg_id=None, has_thumb=False):
     await db.insert_file(
         file_id=file_id,
         filename=file_id,
@@ -20,7 +20,7 @@ async def _insert(db: Database, file_id: str, parent_id=None, is_dir=False,
         mime_type=None,
         file_type="other",
         telegram_message_id=msg_id,
-        thumbnail_message_id=thumb_id,
+        has_thumbnail=has_thumb,
         created_at="2026-01-01T00:00:00",
         direct_url=None,
         access_hash=None,
@@ -31,9 +31,9 @@ async def _insert(db: Database, file_id: str, parent_id=None, is_dir=False,
 
 
 async def _build_tree(db: Database):
-    """root_folder/ ├─ file_a (msg 11, thumb 12) └─ sub_folder/ └─ file_b (msg 21)"""
+    """root_folder/ ├─ file_a (msg 11, embedded thumb) └─ sub_folder/ └─ file_b (msg 21)"""
     await _insert(db, "root_folder", is_dir=True)
-    await _insert(db, "file_a", parent_id="root_folder", msg_id=11, thumb_id=12)
+    await _insert(db, "file_a", parent_id="root_folder", msg_id=11, has_thumb=True)
     await _insert(db, "sub_folder", parent_id="root_folder", is_dir=True)
     await _insert(db, "file_b", parent_id="sub_folder", msg_id=21)
     await _insert(db, "outside_file", msg_id=99)  # must survive the delete
@@ -73,8 +73,8 @@ def test_delete_folder_cascades_and_reports_telegram_messages(tmp_path):
         deleted_count, message_ids = await fs.delete_folder("root_folder")
 
         assert deleted_count == 4
-        # telegram + thumbnail messages of every descendant file
-        assert sorted(message_ids) == [11, 12, 21]
+        # embedded thumbs die with the file message — only file messages listed
+        assert sorted(message_ids) == [11, 21]
         # only the unrelated root file remains
         assert await _count_rows(db) == 1
         remaining = await db.get_file("outside_file")

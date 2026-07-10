@@ -46,7 +46,7 @@ class FileInfo(BaseModel):
     mime_type: Optional[str] = Field(None, description="MIME type")
     file_type: FileType = Field(..., description="Categorized file type")
     telegram_message_id: Optional[int] = Field(None, description="Message ID in Telegram")
-    thumbnail_message_id: Optional[int] = Field(default=None, description="Message ID for thumbnail in Telegram")
+    has_thumbnail: bool = Field(default=False, description="Whether a thumbnail is embedded in the file's own Telegram message")
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Upload timestamp")
     direct_url: Optional[str] = Field(None, description="Direct CDN URL (if available)")
     access_hash: Optional[str] = Field(None, description="File access hash for MTProto download")

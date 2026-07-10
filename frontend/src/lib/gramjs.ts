@@ -303,60 +303,6 @@ export class TelegramClientManager {
   }
 
   /**
-   * Upload a thumbnail image to Telegram Saved Messages.
-   * @param file - The thumbnail blob to upload
-   * @param filename - The filename for the thumbnail
-   * @returns Promise with upload result containing message_id and file_id
-   */
-  async uploadThumbnail(file: Blob, filename: string): Promise<{
-    message_id: number;
-    file_id: string;
-  }> {
-    await this.waitUntilReady();
-    if (!this.client) {
-      throw new Error("Client not initialized. Call initialize() first.");
-    }
-
-    // Convert Blob to array buffer then to Buffer (polyfilled)
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-
-    // Create CustomFile for thumbnail
-    const customFile = new CustomFile(filename, file.size, "", buffer);
-
-    // Send thumbnail to Saved Messages — this creates a message, so it must
-    // share the rate limiter or thumbnails become the FLOOD_WAIT trigger.
-    await messageRateLimiter.wait();
-    const message = await this.client.sendFile("me", {
-      file: customFile,
-      workers: 2, // Fewer workers for thumbnails
-    });
-
-    // Extract message and media info
-    const msg = message as Api.Message;
-    const media = msg.media;
-
-    // Get file_id from document or photo
-    let fileId = "";
-    if (media) {
-      // Use constructor name to identify media type
-      const mediaConstructor = (media as { className?: string }).className;
-      if (mediaConstructor === "MessageMediaDocument") {
-        const doc = media as unknown as { document: { id: bigint } };
-        fileId = String(doc.document.id);
-      } else if (mediaConstructor === "MessageMediaPhoto") {
-        const photo = media as unknown as { photo: { id: bigint } };
-        fileId = String(photo.photo.id);
-      }
-    }
-
-    return {
-      message_id: msg.id,
-      file_id: fileId,
-    };
-  }
-
-  /**
    * Upload a large file to Telegram using SaveBigFilePart API.
    * Automatically splits file into 512KB chunks and switches to new file
    * when partIndex reaches MAX_PARTS (3900 parts = 2GB).

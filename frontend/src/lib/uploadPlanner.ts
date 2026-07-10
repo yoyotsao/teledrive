@@ -80,6 +80,7 @@ export interface RegisterableExistingPart {
   telegram_message_id: number;
   access_hash?: string | null;
   part_index?: number | null;
+  has_thumbnail?: boolean;
 }
 
 /**
@@ -104,6 +105,7 @@ export async function registerDuplicateParts(
       fileId: `${splitGroupId}-${i}`,
       accessHash: part.access_hash ?? undefined,
       parentId: parentId ?? undefined,
+      hasThumbnail: (part.part_index ?? i) === 0 ? (part.has_thumbnail ?? false) : false,
       isSplitFile: true,
       splitGroupId,
       partIndex: part.part_index ?? i,

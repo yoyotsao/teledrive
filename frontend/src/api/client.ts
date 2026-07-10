@@ -102,30 +102,6 @@ export const api = {
     return null;
   },
 
-  uploadThumbnail: async (thumbnailBlob: Blob): Promise<{ message_id: number; file_id: string }> => {
-    const formData = new FormData();
-    formData.append('file', thumbnailBlob, 'thumbnail.jpg');
-    const response = await client.post<{ message_id: number; file_id: string }>('/files/thumbnail/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
-    return response.data;
-  },
-
-  updateFile: async (fileId: string, thumbnailMessageId?: number, parentId?: string): Promise<FileInfo> => {
-    const response = await client.patch<FileInfo>(`/files/${fileId}`, {
-      thumbnail_message_id: thumbnailMessageId,
-      parent_id: parentId,
-    });
-    return response.data;
-  },
-
-  generateVideoThumbnail: async (messageId: number): Promise<{ message_id: number; file_id: string }> => {
-    const response = await client.post<{ message_id: number; file_id: string }>('/videos/thumbnail', {
-      message_id: messageId,
-    });
-    return response.data;
-  },
-
   moveFile: async (fileId: string, newParentId: string | null): Promise<FileInfo> => {
     const response = await client.patch<FileInfo>(`/files/${fileId}`, {
       parent_id: newParentId,
@@ -141,7 +117,7 @@ export const api = {
     fileId: string;
     accessHash?: string;
     parentId?: string;
-    thumbnailMessageId?: number;
+    hasThumbnail?: boolean;
     isSplitFile?: boolean;
     splitGroupId?: string;
     partIndex?: number;
@@ -157,7 +133,7 @@ export const api = {
       file_id: params.fileId,
       access_hash: params.accessHash,
       parent_id: params.parentId,
-      thumbnail_message_id: params.thumbnailMessageId,
+      has_thumbnail: params.hasThumbnail ?? false,
       is_split_file: params.isSplitFile ?? false,
       split_group_id: params.splitGroupId,
       part_index: params.partIndex,

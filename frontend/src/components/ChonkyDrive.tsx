@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { api, generateThumbnail } from '../api/client';
+import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
 import { getTelegramClient } from '../lib/gramjs';
-import { generateVideoThumbnail } from '../lib/videoThumbnail';
+import { captureThumb } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
@@ -43,7 +43,6 @@ export function ChonkyDrive() {
   const dragCounterRef = useRef(0);
   const isDraggingRef = useRef(false); // Track external file drag for upload
   const pendingThumbsRef = useRef<Set<string>>(new Set());
-  const thumbRefreshTimerRef = useRef<number | null>(null);
   const thumbnailAbortRef = useRef<AbortController | null>(null);
 
   const PAGE_SIZE = 200;
@@ -69,7 +68,8 @@ export function ChonkyDrive() {
   const loadThumbnails = useCallback(async (files: FileInfo[], signal?: AbortSignal) => {
     const thumbFiles = files.filter(
       (f) => (f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/'))
-             && f.thumbnail_message_id
+             && f.has_thumbnail
+             && f.telegram_message_id
              && !pendingThumbsRef.current.has(f.file_id)
     );
     if (thumbFiles.length === 0) return;
@@ -95,7 +95,7 @@ export function ChonkyDrive() {
     if (signal?.aborted || misses.length === 0) return;
 
     // 2. Cache misses → one getMessages round trip for the whole batch, then parallel downloadMedia
-    const messageIdToFile = new Map(misses.map((f) => [f.thumbnail_message_id!, f]));
+    const messageIdToFile = new Map(misses.map((f) => [f.telegram_message_id!, f]));
     try {
       const blobs = await getTelegramClient().downloadThumbnails(Array.from(messageIdToFile.keys()));
       for (const [messageId, blob] of blobs) {
@@ -210,19 +210,6 @@ export function ChonkyDrive() {
       loadContents();
     }
   }, [currentFolderId]);
-
-  // Debounced refresh for fire-and-forget thumbnail saves: a 50-image batch
-  // collapses into one folder re-list instead of one full re-list per thumbnail.
-  const scheduleThumbnailRefresh = useCallback(() => {
-    if (thumbRefreshTimerRef.current !== null) {
-      window.clearTimeout(thumbRefreshTimerRef.current);
-    }
-    thumbRefreshTimerRef.current = window.setTimeout(() => {
-      thumbRefreshTimerRef.current = null;
-      loadContents();
-    }, 2000);
-  }, [loadContents]);
-
 
   // Note: cards read `thumbnails[...]` directly during render (see the files.map below),
   // so no effect is needed here to propagate thumbnail arrivals — the component already
@@ -387,30 +374,13 @@ export function ChonkyDrive() {
     file: File,
     onProgress?: (pct: number) => void,
     precomputedHash?: string | null,
-  ): Promise<Array<{ message_id: number; access_hash?: string; size: number }>> => {
-    const isImage = file.type.startsWith('image/');
-    const isVideo = file.type.startsWith('video/');
-    const isImageOrVideo = isImage || isVideo;
-
+  ): Promise<Array<{ message_id: number; access_hash?: string; size: number; has_thumbnail: boolean }>> => {
     const telegramClient = getTelegramClient();
 
-    // Start thumbnail capture NOW from the local file so it runs concurrently with the upload.
-    // Capturing a frame from a local file takes < 1 second regardless of file size,
-    // so the blob will be ready long before a large upload finishes.
-    let thumbPromise: Promise<Blob | null> | null = null;
-    if (isImageOrVideo) {
-      const THUMB_TIMEOUT_MS = 60000;
-      const capturePromise = isVideo ? generateVideoThumbnail(file) : generateThumbnail(file, 200);
-      thumbPromise = Promise.race([
-        capturePromise,
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Thumbnail timeout')), THUMB_TIMEOUT_MS)
-        ),
-      ]).then(
-        (blob) => { console.log('[Thumb] Local capture done, blob size:', (blob as Blob).size); return blob as Blob; },
-        (err) => { console.error('[Thumb] Local capture failed:', err?.message || err); return null; }
-      );
-    }
+    // Start thumbnail capture NOW from the local file so it runs concurrently with
+    // the dedup check. Capturing a frame from a local file takes < 1 second
+    // regardless of file size.
+    const thumbPromise: Promise<Blob | null> = captureThumb(file, 60000);
 
     let fileHash: string | null = precomputedHash ?? null;
     if (precomputedHash === undefined) {
@@ -426,16 +396,18 @@ export function ChonkyDrive() {
             telegram_message_id: f.telegram_message_id!,
             access_hash: f.access_hash,
             part_index: f.part_index,
+            has_thumbnail: f.has_thumbnail,
           }));
           await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
           console.log('[Upload] Dedup: registered', asExisting.length, 'parts from existing upload');
-          return asExisting.map((p) => ({ message_id: p.telegram_message_id, access_hash: p.access_hash ?? undefined, size: p.filesize }));
+          return asExisting.map((p) => ({ message_id: p.telegram_message_id, access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false }));
         }
       }
     }
 
+    const thumbBlob = await thumbPromise;
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
-    const uploadResult = await telegramClient.uploadFileSplit(file, onProgress);
+    const uploadResult = await telegramClient.uploadFileSplit(file, onProgress, thumbBlob);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
 
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -450,6 +422,7 @@ export function ChonkyDrive() {
         fileId: part.file_id,
         accessHash: part.access_hash,
         parentId: currentFolderId ?? undefined,
+        hasThumbnail: i === 0 && uploadResult.hasThumbnail,
         isSplitFile: true,
         splitGroupId: splitGroupId,
         partIndex: i,
@@ -460,35 +433,19 @@ export function ChonkyDrive() {
     ));
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
 
-    // Upload the already-captured thumbnail blob to Telegram and save its message_id
-    if (thumbPromise) {
-      (async () => {
-        try {
-          const thumbBlob = await thumbPromise;
-          if (!thumbBlob) return;
-          console.log('[Thumb] Uploading thumbnail to Telegram...');
-          const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-          await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-          console.log('[Thumb] Saved thumbnail_message_id:', thumbResult.message_id);
-          scheduleThumbnailRefresh();
-        } catch (err: any) {
-          console.error('[Thumb] Thumbnail upload failed (non-fatal):', err?.message || err);
-        }
-      })();
-    }
-
-    return uploadResult.parts;
+    return uploadResult.parts.map((p, i) => ({ ...p, has_thumbnail: i === 0 && uploadResult.hasThumbnail }));
   };
 
   const uploadAlbumBatch = async (
     batch: File[],
     hashes: Array<string | null>,
     onProgress?: (file: File, pct: number) => void,
-  ): Promise<Array<{ message_id: number; access_hash?: string; size: number } | null>> => {
+  ): Promise<Array<{ message_id: number; access_hash?: string; size: number; has_thumbnail: boolean } | null>> => {
     const telegramClient = getTelegramClient();
+    const thumbs = await Promise.all(batch.map((file) => captureThumb(file)));
     const albumResults = await telegramClient.uploadAlbum(batch, (fileIdx, pct) => {
       onProgress?.(batch[fileIdx], pct);
-    });
+    }, thumbs);
 
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     await Promise.all(
@@ -503,6 +460,7 @@ export function ChonkyDrive() {
           fileId: part.file_id || `${splitGroupId}-${j}`,
           accessHash: part.access_hash,
           parentId: currentFolderId ?? undefined,
+          hasThumbnail: part.has_thumbnail,
           isSplitFile: false,
           splitGroupId: undefined,
           partIndex: undefined,
@@ -514,7 +472,9 @@ export function ChonkyDrive() {
     );
 
     return albumResults.map((part) =>
-      part.message_id ? { message_id: part.message_id, access_hash: part.access_hash, size: part.size } : null
+      part.message_id
+        ? { message_id: part.message_id, access_hash: part.access_hash, size: part.size, has_thumbnail: part.has_thumbnail }
+        : null
     );
   };
 
@@ -559,6 +519,7 @@ export function ChonkyDrive() {
             telegram_message_id: f.telegram_message_id!,
             access_hash: f.access_hash,
             part_index: f.part_index,
+            has_thumbnail: f.has_thumbnail,
           })),
           currentFolderId,
         )
@@ -587,6 +548,7 @@ export function ChonkyDrive() {
         telegram_message_id: p.message_id,
         access_hash: p.access_hash,
         part_index: i,
+        has_thumbnail: i === 0 ? (p as any).has_thumbnail ?? false : false,
       }));
       await Promise.all(planned.dependents.map((dep) =>
         registerDuplicateParts(dep, planned.hash, asExisting, currentFolderId)
@@ -754,7 +716,8 @@ export function ChonkyDrive() {
       const folderId = await ensureFolder(folderPath);
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
-      const uploadResult = await telegramClient.uploadFileSplit(file);
+      const thumbBlob = await captureThumb(file);
+      const uploadResult = await telegramClient.uploadFileSplit(file, undefined, thumbBlob);
       await Promise.all(uploadResult.parts.map((part, j) =>
         api.registerFile({
           filename: file.name,
@@ -764,6 +727,7 @@ export function ChonkyDrive() {
           fileId: part.file_id,
           accessHash: part.access_hash,
           parentId: folderId ?? undefined,
+          hasThumbnail: j === 0 && uploadResult.hasThumbnail,
           isSplitFile: true,
           splitGroupId: splitGroupId,
           partIndex: j,
@@ -772,27 +736,6 @@ export function ChonkyDrive() {
           fileHash: fileHash ?? undefined,
         })
       ));
-      // Thumbnail — fire-and-forget
-      const isImageOrVideo = file.type.startsWith('image/') || file.type.startsWith('video/');
-      if (isImageOrVideo) {
-        (async () => {
-          try {
-            const isVideo = file.type.startsWith('video/');
-            let thumbBlob: Blob | null = null;
-            if (isVideo) {
-              thumbBlob = await Promise.race([
-                generateVideoThumbnail(file),
-                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000)),
-              ]);
-            } else {
-              thumbBlob = await generateThumbnail(file, 200);
-            }
-            if (!thumbBlob) return;
-            const thumbResult = await telegramClient.uploadThumbnail(thumbBlob, 'thumbnail.jpg');
-            await api.updateFile(uploadResult.parts[0].file_id, thumbResult.message_id);
-          } catch { /* non-fatal */ }
-        })();
-      }
     };
 
     // Limit concurrent file uploads — too many simultaneous sendFile() calls
@@ -837,6 +780,7 @@ export function ChonkyDrive() {
                     telegram_message_id: f.telegram_message_id!,
                     access_hash: f.access_hash,
                     part_index: f.part_index,
+                    has_thumbnail: f.has_thumbnail,
                   }));
                   await registerDuplicateParts(file, fileHash, asExisting, folderId);
                   return;

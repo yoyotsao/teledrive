@@ -7,6 +7,14 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Classic (non-module) script — guaranteed to run before any ES module, including
+         node_modules/telegram's TL-schema builder which calls the bare `Buffer.isBuffer(...)`
+         at module-evaluation time. vite-plugin-node-polyfills reliably polyfills Buffer in
+         `vite dev` (esbuild pre-bundling) but NOT in the `vite build` production bundle, where
+         this deeply-nested CommonJS reference is left unpatched, crashing the whole app with
+         "Cannot read properties of undefined (reading 'isBuffer')" before React ever renders.
+         Regenerate via `node scripts/build-buffer-polyfill.mjs` if the `buffer` dependency changes. -->
+    <script src="/buffer-polyfill.js"></script>
     <!-- Runs synchronously before any ES module so GramJS W3CWebSocket captures the patched constructor.
          On HTTPS, browsers block ws:// (mixed content). Maps Telegram DC IPs to their official
          wss:// domain endpoints (pluto/venus/aurora/vesta/flora.web.telegram.org) so the browser

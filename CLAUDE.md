@@ -51,12 +51,13 @@ Get-NetTCPConnection -LocalPort 3000 -State Listen | ForEach-Object { taskkill /
 
 ### Data Flow — Upload
 
-1. Browser generates thumbnail via Canvas API from the local file
+1. Browser generates thumbnail via Canvas API from the local file (single-file drops only — see note below)
 2. Browser splits file into 512KB chunks (max 1000 per segment; larger files get a `split_group_id`)
-3. Browser uploads chunks to Telegram via **GramJS**, embedding the thumbnail as the document's `thumb` on the final `sendFile`/`SendMultiMedia` call → gets `message_id` (no separate thumbnail message)
-4. Small files (≤10MB) batch up to 10 at a time into a single `SendMultiMedia` album call to avoid FLOOD_WAIT
-5. Browser calls `POST /api/v1/files/register` with metadata only (including `has_thumbnail`)
-6. Backend stores metadata in SQLite — **no binary data**
+3. Browser uploads chunks to Telegram via **GramJS** → gets `message_id`. Single-file/large-file uploads embed the thumbnail as the document's `thumb` on the final `sendFile` call (no separate thumbnail message)
+4. Browser calls `POST /api/v1/files/register` with metadata only (including `has_thumbnail`)
+5. Backend stores metadata in SQLite — **no binary data**
+
+Note: multi-file drops (folder uploads, dropping several files at once) send each file as its own `sendFile` message, rate-limited via `messageRateLimiter` to avoid FLOOD_WAIT — they do NOT get an embedded thumbnail, and are NOT batched into a single `messages.SendMultiMedia` call. `SendMultiMedia` was tried but found to hang indefinitely against this account/GramJS version (see `docs/superpowers/specs/2026-07-10-embedded-thumb-album-upload-design.md`) and was abandoned in favor of reliability.
 
 ### Data Flow — Download
 

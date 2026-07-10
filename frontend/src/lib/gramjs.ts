@@ -241,6 +241,34 @@ export class TelegramClientManager {
   }
 
   /**
+   * Call sendFileLocked with an optional thumbnail attached. GramJS's own
+   * sendFile() `thumb` option expects a RAW file (native File/Buffer/path) —
+   * it uploads the thumb itself internally — unlike InputMediaUploadedDocument
+   * (used by uploadAlbum) which needs an already-uploaded InputFile. Passing a
+   * CustomFile or pre-uploaded InputFile here throws "Could not create file
+   * from [object Object]" inside GramJS.
+   *
+   * If attaching the thumb fails, retries once without it so a thumbnail
+   * problem never blocks the file upload itself.
+   */
+  private async sendFileWithOptionalThumb(
+    params: Record<string, unknown>,
+    thumb?: Blob | null,
+  ): Promise<{ message: unknown; hasThumbnail: boolean }> {
+    if (!thumb) {
+      return { message: await this.sendFileLocked(params), hasThumbnail: false };
+    }
+    const thumbFile = new File([thumb], 'thumb.jpg', { type: thumb.type || 'image/jpeg' });
+    try {
+      const message = await this.sendFileLocked({ ...params, thumb: thumbFile });
+      return { message, hasThumbnail: true };
+    } catch (err) {
+      console.warn('[Thumb] sendFile with thumb failed, retrying without thumb (non-fatal):', err);
+      return { message: await this.sendFileLocked(params), hasThumbnail: false };
+    }
+  }
+
+  /**
    * Upload a file to Telegram Saved Messages.
    * @param file - The file to upload (Browser File object)
    * @returns Promise with upload result containing message_id, file_id, and access_hash
@@ -330,13 +358,11 @@ export class TelegramClientManager {
       const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
       const customFile = new CustomFile(file.name, file.size, "", buffer);
 
-      const thumbInput = await this.uploadThumbInputFile(thumb);
-      const message = await this.sendFileLocked({
+      const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
         file: customFile,
         workers: 4,
         forceDocument: true,
-        ...(thumbInput ? { thumb: thumbInput } : {}),
-      });
+      }, thumb);
 
       const msg = message as Api.Message;
       let fileId = "";
@@ -361,7 +387,7 @@ export class TelegramClientManager {
         parts: [{ message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size }],
         originalName: file.name,
         totalParts: 1,
-        hasThumbnail: !!thumbInput,
+        hasThumbnail,
       };
     }
 
@@ -437,13 +463,11 @@ export class TelegramClientManager {
       });
 
       try {
-        const thumbInput = segmentStartOffset === 0 ? await this.uploadThumbInputFile(thumb) : undefined;
-        if (thumbInput) thumbAttached = true;
-        const message = await this.sendFileLocked({
+        const { message, hasThumbnail: segmentHasThumbnail } = await this.sendFileWithOptionalThumb({
           file: inputFileBig,
           forceDocument: true,
-          ...(thumbInput ? { thumb: thumbInput } : {}),
-        });
+        }, segmentStartOffset === 0 ? thumb : undefined);
+        if (segmentHasThumbnail) thumbAttached = true;
         const msg = message as Api.Message;
         console.log('[SplitUpload] File sent successfully, message_id:', msg?.id);
         const media = msg.media;

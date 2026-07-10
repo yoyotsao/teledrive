@@ -51,11 +51,12 @@ Get-NetTCPConnection -LocalPort 3000 -State Listen | ForEach-Object { taskkill /
 
 ### Data Flow — Upload
 
-1. Browser generates thumbnail via Canvas API → uploads to Telegram via **GramJS** → gets `thumbnail_message_id`
+1. Browser generates thumbnail via Canvas API from the local file
 2. Browser splits file into 512KB chunks (max 1000 per segment; larger files get a `split_group_id`)
-3. Browser uploads chunks to Telegram via **GramJS** → gets `message_id`
-4. Browser calls `POST /api/v1/files/register` with metadata only
-5. Backend stores metadata in SQLite — **no binary data**
+3. Browser uploads chunks to Telegram via **GramJS**, embedding the thumbnail as the document's `thumb` on the final `sendFile`/`SendMultiMedia` call → gets `message_id` (no separate thumbnail message)
+4. Small files (≤10MB) batch up to 10 at a time into a single `SendMultiMedia` album call to avoid FLOOD_WAIT
+5. Browser calls `POST /api/v1/files/register` with metadata only (including `has_thumbnail`)
+6. Backend stores metadata in SQLite — **no binary data**
 
 ### Data Flow — Download
 
@@ -109,7 +110,7 @@ All prefixed with `/api/v1`:
 | GET | `/files` | List files (supports `parent_id`, `split_group_id`, pagination) |
 | GET | `/files/{id}` | Get file metadata |
 | POST | `/files/register` | Register uploaded file (after GramJS upload) |
-| PATCH | `/files/{id}` | Update metadata (thumbnail, parent_id) |
+| PATCH | `/files/{id}` | Update metadata (parent_id for move) |
 | DELETE | `/files/{id}` | Delete file |
 | GET | `/files/{id}/download` | Get download metadata (message_id, access_hash) |
 | GET | `/files/{id}/thumbnail` | Get thumbnail as JPEG |
@@ -140,4 +141,4 @@ BACKEND_PORT=8000         # default
 - Files >512MB (>1000 chunks) must be split into multiple records sharing a `split_group_id`.
 - Do not add endpoints that read/write binary file data.
 - Ports are fixed: backend 8000, frontend dev 3000.
-- For video thumbnails, only use `thumbnail_message_id` — never fall back to `telegram_message_id` (that points to the video document itself).
+- Thumbnails are embedded in the file's own Telegram message as a document thumb (`InputMediaUploadedDocument.thumb` / `sendFile`'s `thumb` option). To download a thumbnail, fetch ONLY the thumb PhotoSize (GramJS `downloadMedia(media, { thumb })`, Telethon `download_media(..., thumb=-1)`) — never the document body.

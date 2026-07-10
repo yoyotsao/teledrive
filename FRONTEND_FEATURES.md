@@ -272,7 +272,7 @@ cd D:\teledrive\frontend && npm run dev
 | 後端連線失敗 | 確認 backend 已啟動，port 8000 可連線 |
 | Telegram 連線失敗 | 確認 .env 中的 API_ID、API_HASH、SESSION 是否正確 |
 | 上傳卡住 | 檢查瀏覽器主控台是否有 MTProto 錯誤 |
-| 縮圖顯示不出來 | 檢查是否有 thumbnail_message_id |
+| 縮圖顯示不出來 | 檢查 file 的 has_thumbnail 是否為 true（縮圖已內嵌於檔案自身 message） |
 | 預覽播放失敗 | 使用 fallback blob URL 下載測試 |
 
 ---

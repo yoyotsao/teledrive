@@ -1,14 +1,31 @@
 # 內嵌縮圖 + 資料夾上傳 album 聚批 — 設計文件
 
 日期:2026-07-10
-狀態:待審核
+狀態:已實作(附實作後修正,見下方「實作後發現的 API 限制」)
 
 ## 目標
 
 消除小檔案上傳(尤其是縮圖與整個資料夾上傳)造成的 FLOOD_WAIT:
 
-1. **縮圖不再產生獨立 Telegram message** — 改用 `InputMediaUploadedDocument.thumb` 內嵌在檔案本身的 message 上,額外 message 成本歸零。
+1. **縮圖不再產生獨立 Telegram message** — 改用 `InputMediaUploadedDocument.thumb` / `sendFile()` 的 `thumb` 參數內嵌在檔案本身的 message 上,額外 message 成本歸零。**（實作後發現:僅單檔/大檔路徑可行,album 批次路徑不支援,詳見下方）**
 2. **資料夾上傳導入 album 聚批** — 小檔案(≤10MB)累積 10 個一批,用一次 `SendMultiMedia` 送出。
+
+## 實作後發現的 API 限制(2026-07-10 補充)
+
+實作並用真實帳號測試後發現:**Telegram 的 `messages.SendMultiMedia` 不接受 `InputMediaUploadedDocument.thumb` 欄位** —— 只要批次中任一項目帶 `thumb`,整批直接被伺服器以 `400 MEDIA_INVALID` 拒絕。這是實測確認的 Telegram API 硬限制,不是客戶端 bug:
+
+| 路徑 | RPC | 帶 thumb | 結果 |
+|---|---|---|---|
+| 單檔(`uploadFileSplit` → `sendFile()`) | `messages.SendMedia` | 是 | ✅ 成功 |
+| album 批次(`uploadAlbum`) | `messages.SendMultiMedia` | 是 | ❌ `400 MEDIA_INVALID` |
+| album 批次(`uploadAlbum`) | `messages.SendMultiMedia` | 否 | ✅ 成功 |
+
+另外,GramJS 的 `sendFile()` 便利方法的 `thumb` 參數也不接受「已預先上傳好的 InputFile」——它期望原始檔案(自己內部上傳),與 `InputMediaUploadedDocument.thumb`(手動組 TL 請求專用,需要預先上傳的 InputFile)語意不同,兩者不可混用。
+
+**修正後的實際行為**:
+- 縮圖內嵌僅套用在**單檔路徑**與**大檔分段路徑**(`uploadFileSplit`,經 `sendFile()`)。
+- **album 批次上傳的檔案一律 `has_thumbnail: false`**(恢復成加入本功能前的行為,只是仍保有 FLOOD_WAIT 批次化的效益)。
+- 「目標 1」的縮圖零額外 message 效益,只在單檔/大檔上傳時成立;透過資料夾上傳小檔累積器批次送出的圖片/影片,現階段沒有縮圖。
 
 ### 效果估算(100 張照片的資料夾)
 

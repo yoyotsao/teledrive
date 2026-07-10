@@ -222,25 +222,6 @@ export class TelegramClientManager {
   }
 
   /**
-   * Upload thumbnail bytes and return an InputFile for embedding as a document
-   * thumb. This is SaveFilePart traffic — NOT a message send — so it does not
-   * go through messageRateLimiter. Returns undefined on any failure (non-fatal:
-   * the file uploads without a thumbnail).
-   */
-  private async uploadThumbInputFile(thumb: Blob | null | undefined): Promise<Api.TypeInputFile | undefined> {
-    if (!thumb || !this.client) return undefined;
-    try {
-      const arrayBuffer = await thumb.arrayBuffer();
-      const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-      const customFile = new CustomFile('thumb.jpg', thumb.size, '', buf);
-      return await (this.client as any).uploadFile({ file: customFile, workers: 1 });
-    } catch (err) {
-      console.warn('[Thumb] thumb bytes upload failed (non-fatal):', err);
-      return undefined;
-    }
-  }
-
-  /**
    * Call sendFileLocked with an optional thumbnail attached. GramJS's own
    * sendFile() `thumb` option expects a RAW file (native File/Buffer/path) —
    * it uploads the thumb itself internally — unlike InputMediaUploadedDocument
@@ -512,13 +493,19 @@ export class TelegramClientManager {
   async uploadAlbum(
     files: File[],
     onProgress?: (fileIdx: number, pct: number) => void,
-    thumbs?: Array<Blob | null>,
   ): Promise<Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
 
+    // NOTE: InputMediaUploadedDocument.thumb is NOT supported here — Telegram
+    // rejects messages.SendMultiMedia with 400 MEDIA_INVALID as soon as ANY
+    // item in the batch carries a thumb (confirmed empirically: identical
+    // batches succeed with thumb omitted). Embedded thumbnails are therefore
+    // only available via the single-file/large-file path (uploadFileSplit),
+    // which uses sendFile()'s own thumb handling instead of a manually built
+    // InputMediaUploadedDocument. Album-batched files upload with has_thumbnail: false.
     const inputFiles = await Promise.all(
       files.map(async (file, idx) => {
         const arrayBuffer = await file.arrayBuffer();
@@ -529,18 +516,16 @@ export class TelegramClientManager {
           workers: 1,
           onProgress: (pct: number) => onProgress?.(idx, Math.round(pct * 100)),
         });
-        const thumbInput = await this.uploadThumbInputFile(thumbs?.[idx]);
-        return { inputFile, thumbInput, file };
+        return { inputFile, file };
       })
     );
 
-    const multiMedia = inputFiles.map(({ inputFile, thumbInput, file }) =>
+    const multiMedia = inputFiles.map(({ inputFile, file }) =>
       new Api.InputSingleMedia({
         media: new Api.InputMediaUploadedDocument({
           file: inputFile,
           mimeType: file.type || 'application/octet-stream',
           attributes: [new Api.DocumentAttributeFilename({ fileName: file.name })],
-          ...(thumbInput ? { thumb: thumbInput } : {}),
         }),
         message: '',
         randomId: generateRandomBigInt(),
@@ -586,7 +571,7 @@ export class TelegramClientManager {
         fileId = String(media.photo.id);
         accessHash = media.photo.accessHash ? String(media.photo.accessHash) : undefined;
       }
-      return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, has_thumbnail: !!inputFiles[idx].thumbInput };
+      return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, has_thumbnail: false };
     });
   }
 

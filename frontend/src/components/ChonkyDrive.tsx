@@ -443,10 +443,12 @@ export function ChonkyDrive() {
     parentIds?: Array<string | null>,
   ): Promise<Array<{ message_id: number; access_hash?: string; size: number; has_thumbnail: boolean } | null>> => {
     const telegramClient = getTelegramClient();
-    const thumbs = await Promise.all(batch.map((file) => captureThumb(file)));
+    // No thumb capture here — messages.SendMultiMedia rejects the whole batch
+    // with 400 MEDIA_INVALID if any item's InputMediaUploadedDocument carries
+    // a thumb. See uploadAlbum()'s comment in gramjs.ts.
     const albumResults = await telegramClient.uploadAlbum(batch, (fileIdx, pct) => {
       onProgress?.(batch[fileIdx], pct);
-    }, thumbs);
+    });
 
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     await Promise.all(

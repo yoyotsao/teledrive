@@ -440,6 +440,7 @@ export function ChonkyDrive() {
     batch: File[],
     hashes: Array<string | null>,
     onProgress?: (file: File, pct: number) => void,
+    parentIds?: Array<string | null>,
   ): Promise<Array<{ message_id: number; access_hash?: string; size: number; has_thumbnail: boolean } | null>> => {
     const telegramClient = getTelegramClient();
     const thumbs = await Promise.all(batch.map((file) => captureThumb(file)));
@@ -459,7 +460,7 @@ export function ChonkyDrive() {
           messageId: part.message_id,
           fileId: part.file_id || `${splitGroupId}-${j}`,
           accessHash: part.access_hash,
-          parentId: currentFolderId ?? undefined,
+          parentId: (parentIds ? parentIds[j] : currentFolderId) ?? undefined,
           hasThumbnail: part.has_thumbnail,
           isSplitFile: false,
           splitGroupId: undefined,
@@ -745,6 +746,46 @@ export function ChonkyDrive() {
     // All upload promises collected so we can await them.
     const uploadPromises: Promise<void>[] = [];
 
+    // Small-file accumulator: fresh files ≤10MB batch into one SendMultiMedia
+    // (10 files = 1 message). Batches may mix files from different subfolders —
+    // the album lands in Saved Messages; parent_id is per-file DB metadata.
+    type PendingSmall = { file: File; folderPath: string; hash: string | null };
+    const ALBUM_BATCH = 10;
+    const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
+    let smallBuffer: PendingSmall[] = [];
+
+    const flushSmallBuffer = (): void => {
+      if (smallBuffer.length === 0) return;
+      const batch = smallBuffer;
+      smallBuffer = [];
+      const p = fileSemaphore.withSlot(async () => {
+        const folderIds = await Promise.all(batch.map((e) => ensureFolder(e.folderPath)));
+        const results = await uploadAlbumBatch(
+          batch.map((e) => e.file),
+          batch.map((e) => e.hash),
+          (file, pct) => { updateVisible(file.name, { progress: pct }); updateUI(); },
+          folderIds,
+        );
+        results.forEach((res, j) => {
+          if (res) {
+            completed++;
+            updateVisible(batch[j].file.name, { progress: 100, status: 'complete' });
+          } else {
+            failed++;
+            updateVisible(batch[j].file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+          }
+        });
+        updateUI();
+      }).catch(() => {
+        batch.forEach((e) => {
+          failed++;
+          updateVisible(e.file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+        });
+        updateUI();
+      });
+      uploadPromises.push(p);
+    };
+
     // Read all entries from a DirectoryReader (may require multiple calls).
     const readAllEntries = (reader: any): Promise<any[]> =>
       new Promise<any[]>((resolve, reject) => {
@@ -767,7 +808,7 @@ export function ChonkyDrive() {
             addVisible({ name: file.name, progress: 0, status: 'uploading' });
             updateUI();
             const folderPath = basePath.replace(/\/$/, '');
-            const p = (async () => {
+            const p = (async (): Promise<'deferred' | 'done'> => {
               const fileHash = await hashFileBounded(file);
               if (fileHash) {
                 const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] as FileInfo[] }));
@@ -783,11 +824,18 @@ export function ChonkyDrive() {
                     has_thumbnail: f.has_thumbnail,
                   }));
                   await registerDuplicateParts(file, fileHash, asExisting, folderId);
-                  return;
+                  return 'done';
                 }
               }
+              if (file.size <= SMALL_FILE_LIMIT) {
+                smallBuffer.push({ file, folderPath, hash: fileHash });
+                if (smallBuffer.length >= ALBUM_BATCH) flushSmallBuffer();
+                return 'deferred';
+              }
               await fileSemaphore.withSlot(() => uploadFileEntryFresh(file, folderPath, fileHash));
-            })().then(() => {
+              return 'done';
+            })().then((kind) => {
+              if (kind === 'deferred') return;
               completed++;
               updateVisible(file.name, { progress: 100, status: 'complete' });
               updateUI();
@@ -814,7 +862,10 @@ export function ChonkyDrive() {
     const rootEntries = Array.from({ length: items.length }, (_, i) => items[i].webkitGetAsEntry?.()).filter(Boolean);
     await Promise.all(rootEntries.map((e) => processEntry(e, '')));
 
-    // Wait for every upload that was enqueued during traversal.
+    // Traversal enqueues hash-check promises; they may still be adding files to
+    // smallBuffer. Wait for them, flush the tail batch, then wait for the flush.
+    await Promise.allSettled(uploadPromises);
+    flushSmallBuffer();
     await Promise.allSettled(uploadPromises);
 
     updateUI();

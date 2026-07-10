@@ -87,8 +87,9 @@ test-files/
 # Playwright report
 playwright-report/
 
-# Telegram session string (sensitive credential — never commit)
+# Telegram session string/file (sensitive credential — never commit)
 .session_string.txt
+*.session
 
 # Thumbnail cache (generated at runtime by backend)
 backend/thumbnails/

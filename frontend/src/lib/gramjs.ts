@@ -52,10 +52,9 @@ const uploadSemaphore = new Semaphore(MAX_CONCURRENT_CHUNKS);
 // by uploadSemaphore only, so large-file throughput is unaffected.
 const messageRateLimiter = new RateLimiter(MESSAGE_SENDS_PER_SECOND, MESSAGE_SEND_BURST);
 
-// Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT (or looks
-// like GramJS silently slept on one), penalize the shared limiter so all
-// pending sends slow down instead of piling more requests onto the flood.
-const FLOOD_SLEEP_SUSPECT_MS = 5000;
+// Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
+// the shared limiter so all pending sends slow down instead of piling more
+// requests onto the flood.
 const FLOOD_PENALTY_MS = 10_000;
 
 function isFloodError(err: unknown): boolean {
@@ -68,20 +67,6 @@ function penalizeForFlood(label: string, err: unknown): void {
   const waitMs = (typeof seconds === 'number' && seconds > 0 ? seconds : FLOOD_PENALTY_MS / 1000) * 1000;
   console.warn(`[GramJS] ${label} hit FLOOD_WAIT — pausing message sends for ${waitMs}ms`);
   messageRateLimiter.penalize(waitMs);
-}
-
-/**
- * floodSleepThreshold makes GramJS sleep through FLOOD_WAIT < 300s instead of
- * throwing, so a slow message-send invoke is the only visible symptom. Only
- * meaningful for pure message sends (SendMultiMedia) where the file bytes were
- * already uploaded — sendFile calls include byte transfer and would false-positive.
- */
-function reportSuspectedFloodSleep(label: string, startedAt: number): void {
-  const elapsed = Date.now() - startedAt;
-  if (elapsed > FLOOD_SLEEP_SUSPECT_MS) {
-    console.warn(`[GramJS] ${label} took ${elapsed}ms — suspected FLOOD sleep, penalizing sends for ${FLOOD_PENALTY_MS}ms`);
-    messageRateLimiter.penalize(FLOOD_PENALTY_MS);
-  }
 }
 
 /**
@@ -499,80 +484,52 @@ export class TelegramClientManager {
       throw new Error("Client not initialized. Call initialize() first.");
     }
 
-    // NOTE: InputMediaUploadedDocument.thumb is NOT supported here — Telegram
-    // rejects messages.SendMultiMedia with 400 MEDIA_INVALID as soon as ANY
-    // item in the batch carries a thumb (confirmed empirically: identical
-    // batches succeed with thumb omitted). Embedded thumbnails are therefore
-    // only available via the single-file/large-file path (uploadFileSplit),
-    // which uses sendFile()'s own thumb handling instead of a manually built
-    // InputMediaUploadedDocument. Album-batched files upload with has_thumbnail: false.
-    const inputFiles = await Promise.all(
+    // messages.SendMultiMedia (grouped album send) does not work reliably
+    // against this account/GramJS combination — confirmed empirically:
+    // invoking it hangs forever waiting for a response that never arrives,
+    // REGARDLESS of batch size (even a single-item "batch" hangs identically),
+    // while the exact same file sent via sendFile()/SendMedia succeeds
+    // immediately. So instead of grouping files into one message, each file is
+    // sent as its OWN message via the same sendFileLocked() path the
+    // single-file upload uses (proven working), paced by messageRateLimiter
+    // (shared with sendFile) to avoid FLOOD_WAIT — trading away the
+    // "N files = 1 message" cost reduction for reliability. Thumbnails are
+    // still not attempted here; embedding a thumb is only exercised on the
+    // single-file/large-file path.
+    return Promise.all(
       files.map(async (file, idx) => {
-        const arrayBuffer = await file.arrayBuffer();
-        const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-        const customFile = new CustomFile(file.name, file.size, "", buf);
-        const inputFile = await (this.client as any).uploadFile({
-          file: customFile,
-          workers: 1,
-          onProgress: (pct: number) => onProgress?.(idx, Math.round(pct * 100)),
-        });
-        return { inputFile, file };
-      })
-    );
-
-    const multiMedia = inputFiles.map(({ inputFile, file }) =>
-      new Api.InputSingleMedia({
-        media: new Api.InputMediaUploadedDocument({
-          file: inputFile,
-          mimeType: file.type || 'application/octet-stream',
-          attributes: [new Api.DocumentAttributeFilename({ fileName: file.name })],
-        }),
-        message: '',
-        randomId: generateRandomBigInt(),
-      })
-    );
-
-    const peer = await this.client.getInputEntity('me');
-    let updates: any;
-    console.log('[Album] SendMultiMedia batch size:', files.length);
-    for (let attempt = 0; ; attempt++) {
-      await messageRateLimiter.wait();
-      const startedAt = Date.now();
-      try {
-        updates = await this.client.invoke(
-          new Api.messages.SendMultiMedia({ peer, multiMedia })
-        ) as any;
-        reportSuspectedFloodSleep('SendMultiMedia', startedAt);
-        break;
-      } catch (err) {
-        if (isFloodError(err) && attempt < 1) {
-          penalizeForFlood('SendMultiMedia', err);
-          continue;
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+          const customFile = new CustomFile(file.name, file.size, "", buf);
+          const message = await this.sendFileLocked({
+            file: customFile,
+            workers: 1,
+            forceDocument: true,
+          });
+          onProgress?.(idx, 100);
+          const msg = message as Api.Message;
+          let fileId = '';
+          let accessHash: string | undefined;
+          if (msg.media) {
+            const mediaConstructor = (msg.media as { className?: string }).className;
+            if (mediaConstructor === 'MessageMediaDocument') {
+              const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
+              fileId = String(doc.document.id);
+              accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
+            } else if (mediaConstructor === 'MessageMediaPhoto') {
+              const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
+              fileId = String(photo.photo.id);
+              accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
+            }
+          }
+          return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, has_thumbnail: false };
+        } catch (err) {
+          console.error('[Album] Individual file send failed:', file.name, err);
+          return { message_id: 0, file_id: '', access_hash: undefined, size: file.size, has_thumbnail: false };
         }
-        throw err;
-      }
-    }
-
-    const messages: Api.Message[] = (updates.updates ?? [])
-      .filter((u: any) => u.className === 'UpdateNewMessage' || u.className === 'UpdateNewChannelMessage')
-      .map((u: any) => u.message as Api.Message)
-      .filter((m: any) => m && m.media);
-
-    return files.map((file, idx) => {
-      const msg = messages[idx];
-      if (!msg) return { message_id: 0, file_id: '', access_hash: undefined, size: file.size, has_thumbnail: false };
-      const media = msg.media as any;
-      let fileId = '';
-      let accessHash: string | undefined;
-      if (media?.className === 'MessageMediaDocument') {
-        fileId = String(media.document.id);
-        accessHash = media.document.accessHash ? String(media.document.accessHash) : undefined;
-      } else if (media?.className === 'MessageMediaPhoto') {
-        fileId = String(media.photo.id);
-        accessHash = media.photo.accessHash ? String(media.photo.accessHash) : undefined;
-      }
-      return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, has_thumbnail: false };
-    });
+      })
+    );
   }
 
   /**

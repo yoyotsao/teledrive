@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
-import { getTelegramClient } from '../lib/gramjs';
-import { captureThumb } from '../lib/thumbCapture';
+import { getTelegramClient, getChunkRateStats, PreparedAlbumFile, AlbumFileResult } from '../lib/gramjs';
+import { captureThumb, isMediaFile } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
-import { MAX_CONCURRENT_FILES } from '../config';
+import { MAX_CONCURRENT_FILES, ALBUM_BATCH } from '../config';
 import { planUploads, registerDuplicateParts, hashFileBounded, PlannedFile } from '../lib/uploadPlanner';
 
 
@@ -15,6 +15,117 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+/**
+ * Producer/consumer pipeline for album uploads. Each file's byte upload
+ * ("prepare": captureThumb + upload bytes + messages.UploadMedia) runs under
+ * `fileSemaphore` and releases the slot the instant it completes. Grouping
+ * prepared files into a Telegram album (messages.SendMultiMedia) and
+ * registering their metadata happen OUTSIDE the semaphore entirely, once
+ * ALBUM_BATCH files have accumulated (or via flush() for the tail batch).
+ * This keeps the concurrency slots permanently busy with byte uploads
+ * instead of idling on message sends or backend registration round trips.
+ */
+function createAlbumPipeline(fileSemaphore: Semaphore) {
+  const telegramClient = getTelegramClient();
+
+  type PendingEntry = {
+    prepared: PreparedAlbumFile;
+    hash: string | null;
+    parentId: string | null;
+    onProgress?: (pct: number) => void;
+    resolve: (result: AlbumFileResult | null) => void;
+  };
+
+  const pending: PendingEntry[] = [];
+  const preparePromises: Promise<void>[] = [];
+  const sendPromises: Promise<void>[] = [];
+
+  const dispatchBatch = () => {
+    const batch = pending.splice(0, ALBUM_BATCH);
+    if (batch.length === 0) return;
+    sendPromises.push((async () => {
+      const t0 = performance.now();
+      let results: AlbumFileResult[];
+      try {
+        results = await telegramClient.sendAlbum(batch.map((e) => e.prepared));
+      } catch (err) {
+        console.error('[AlbumPipeline] sendAlbum failed:', err);
+        batch.forEach((e) => { e.onProgress?.(100); e.resolve(null); });
+        return;
+      }
+      const tSend = performance.now();
+      const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      await Promise.all(batch.map((entry, j) => {
+        const res = results[j];
+        const file = entry.prepared.file;
+        if (!res.message_id) {
+          entry.onProgress?.(100);
+          entry.resolve(null);
+          return Promise.resolve();
+        }
+        return api.registerFile({
+          filename: file.name,
+          filesize: file.size,
+          mimeType: file.type || undefined,
+          messageId: res.message_id,
+          fileId: res.file_id || `${splitGroupId}-${j}`,
+          accessHash: res.access_hash,
+          parentId: entry.parentId ?? undefined,
+          hasThumbnail: res.has_thumbnail,
+          isSplitFile: false,
+          splitGroupId: undefined,
+          partIndex: undefined,
+          totalParts: undefined,
+          originalName: file.name,
+          fileHash: entry.hash ?? undefined,
+        }).then(
+          () => { entry.onProgress?.(100); entry.resolve({ message_id: res.message_id, file_id: res.file_id, access_hash: res.access_hash, size: res.size, has_thumbnail: res.has_thumbnail }); },
+          (err) => { console.error('[AlbumPipeline] registerFile failed:', err); entry.onProgress?.(100); entry.resolve(null); },
+        );
+      }));
+      console.log(`[Perf] dispatchBatch x${batch.length}: sendAlbum=${Math.round(tSend - t0)}ms register=${Math.round(performance.now() - tSend)}ms`);
+    })());
+  };
+
+  return {
+    /** Prepare one file under fileSemaphore, releasing the slot the instant
+     * bytes are on Telegram's servers. Resolves once the file's batch has
+     * been sent and registered (which may happen well after this call returns
+     * — the caller awaits the returned promise to know the final outcome). */
+    enqueue(file: File, hash: string | null, parentId: string | null, onProgress?: (pct: number) => void): Promise<AlbumFileResult | null> {
+      return new Promise((resolve) => {
+        const tQueued = performance.now();
+        const p = fileSemaphore.withSlot(async () => {
+          const tSlot = performance.now();
+          const thumb = await captureThumb(file);
+          const tThumb = performance.now();
+          const prepared = await telegramClient.prepareAlbumFile(file, thumb);
+          console.log(`[Perf] enqueue ${file.name}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
+          return prepared;
+        }).then((prepared) => {
+          onProgress?.(50);
+          if (!prepared) { resolve(null); return; }
+          pending.push({ prepared, hash, parentId, onProgress, resolve });
+          if (pending.length >= ALBUM_BATCH) dispatchBatch();
+        }).catch((err) => {
+          console.error('[AlbumPipeline] Prepare failed:', err);
+          onProgress?.(50);
+          resolve(null);
+        });
+        preparePromises.push(p);
+      });
+    },
+    /** Call once all enqueue() calls have been made: waits for every prepare
+     * to finish, sends the leftover partial batch, then waits for every
+     * send+register to complete. */
+    async flush(): Promise<void> {
+      await Promise.allSettled(preparePromises);
+      while (pending.length > 0) dispatchBatch();
+      await Promise.allSettled(sendPromises);
+    },
+  };
 }
 
 export function ChonkyDrive() {
@@ -39,6 +150,10 @@ export function ChonkyDrive() {
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   const [dragOverBreadcrumbId, setDragOverBreadcrumbId] = useState<string | null>(null);
   const [isDraggingInternal, setIsDraggingInternal] = useState(false);
+
+  // Custom confirm modal for deletion — replaces window.confirm() so automated
+  // browser tools (e.g. Playwright) don't get stuck on a native dialog.
+  const [deleteConfirm, setDeleteConfirm] = useState<{ ids: Set<string>; hasFolder: boolean } | null>(null);
 
   const dragCounterRef = useRef(0);
   const isDraggingRef = useRef(false); // Track external file drag for upload
@@ -271,39 +386,37 @@ export function ChonkyDrive() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const performDelete = async (ids: Set<string>) => {
+    try {
+      for (const fileId of ids) {
+        const entry = files.find((f) => f.id === fileId);
+        if (entry?.isDir) {
+          await api.deleteFolder(fileId);
+        } else {
+          await api.deleteFile(fileId);
+        }
+      }
+      setSelectedFiles(new Set());
+      loadContents();
+    } catch (err) {
+      console.error('Failed to delete files:', err);
+      setError(err instanceof Error ? err.message : 'Failed to delete files');
+    }
+  };
+
   // Handle keyboard delete
   useEffect(() => {
-    const handleKeyDown = async (event: KeyboardEvent) => {
+    const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Delete' && selectedFiles.size > 0) {
         event.preventDefault();
         const hasFolder = files.some((f) => selectedFiles.has(f.id) && f.isDir);
-        const warning = hasFolder
-          ? ' Folders will be deleted with ALL their contents.'
-          : '';
-        const confirmed = confirm(`Delete ${selectedFiles.size} selected item(s)?${warning}`);
-        if (!confirmed) return;
-
-        try {
-          for (const fileId of selectedFiles) {
-            const entry = files.find((f) => f.id === fileId);
-            if (entry?.isDir) {
-              await api.deleteFolder(fileId);
-            } else {
-              await api.deleteFile(fileId);
-            }
-          }
-          setSelectedFiles(new Set());
-          loadContents();
-        } catch (err) {
-          console.error('Failed to delete files:', err);
-          setError(err instanceof Error ? err.message : 'Failed to delete files');
-        }
+        setDeleteConfirm({ ids: new Set(selectedFiles), hasFolder });
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedFiles, files, loadContents]);
+  }, [selectedFiles, files]);
 
   const handleNavigateToBreadcrumb = (index: number) => {
     if (index === 0) {
@@ -370,11 +483,19 @@ export function ChonkyDrive() {
   // precomputedHash: string when planUploads() already proved the file is fresh (skip
   // internal dedup check); null when hashing failed at plan time (upload without dedup);
   // undefined when called without a pre-pass (legacy fallback: check for duplicates here).
-  const uploadWithThumbnail = async (
+  //
+  // Only does the Telegram upload — metadata registration is the caller's job, done
+  // AFTER releasing whatever concurrency slot wraps this call, so a slow backend
+  // register never holds up the next file's bytes from starting.
+  const uploadFileToTelegram = async (
     file: File,
     onProgress?: (pct: number) => void,
     precomputedHash?: string | null,
-  ): Promise<Array<{ message_id: number; access_hash?: string; size: number; has_thumbnail: boolean }>> => {
+  ): Promise<{
+    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>;
+    fileHash: string | null;
+    alreadyRegistered: boolean;
+  }> => {
     const telegramClient = getTelegramClient();
 
     // Start thumbnail capture NOW from the local file so it runs concurrently with
@@ -400,7 +521,13 @@ export function ChonkyDrive() {
           }));
           await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
           console.log('[Upload] Dedup: registered', asExisting.length, 'parts from existing upload');
-          return asExisting.map((p) => ({ message_id: p.telegram_message_id, access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false }));
+          return {
+            // file_id is unused here — alreadyRegistered=true tells the caller to
+            // skip registerUploadedParts, which is the only consumer that needs it.
+            parts: asExisting.map((p) => ({ message_id: p.telegram_message_id, file_id: '', access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false })),
+            fileHash,
+            alreadyRegistered: true,
+          };
         }
       }
     }
@@ -410,10 +537,23 @@ export function ChonkyDrive() {
     const uploadResult = await telegramClient.uploadFileSplit(file, onProgress, thumbBlob);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
 
-    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    return {
+      parts: uploadResult.parts.map((p, i) => ({ ...p, has_thumbnail: i === 0 && uploadResult.hasThumbnail })),
+      fileHash,
+      alreadyRegistered: false,
+    };
+  };
 
-    // Register all parts first so the file appears immediately in the UI
-    await Promise.all(uploadResult.parts.map((part, i) =>
+  // Registers Telegram-uploaded parts as file metadata. Called OUTSIDE any
+  // upload concurrency slot so a slow backend never blocks the next upload.
+  const registerUploadedParts = async (
+    file: File,
+    fileHash: string | null,
+    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>,
+    parentId: string | null,
+  ): Promise<void> => {
+    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    await Promise.all(parts.map((part, i) =>
       api.registerFile({
         filename: file.name,
         filesize: part.size,
@@ -421,64 +561,20 @@ export function ChonkyDrive() {
         messageId: part.message_id,
         fileId: part.file_id,
         accessHash: part.access_hash,
-        parentId: currentFolderId ?? undefined,
-        hasThumbnail: i === 0 && uploadResult.hasThumbnail,
-        isSplitFile: true,
+        parentId: parentId ?? undefined,
+        hasThumbnail: part.has_thumbnail,
+        // Only genuinely multi-part uploads are "split files" — a single-part
+        // result must report false so the backend's same-name+parent replace
+        // logic (file_service.py's register_uploaded_file) can fire on re-upload.
+        isSplitFile: parts.length > 1,
         splitGroupId: splitGroupId,
         partIndex: i,
-        totalParts: uploadResult.parts.length,
+        totalParts: parts.length,
         originalName: file.name,
         fileHash: fileHash ?? undefined,
       })
     ));
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
-
-    return uploadResult.parts.map((p, i) => ({ ...p, has_thumbnail: i === 0 && uploadResult.hasThumbnail }));
-  };
-
-  const uploadAlbumBatch = async (
-    batch: File[],
-    hashes: Array<string | null>,
-    onProgress?: (file: File, pct: number) => void,
-    parentIds?: Array<string | null>,
-  ): Promise<Array<{ message_id: number; access_hash?: string; size: number; has_thumbnail: boolean } | null>> => {
-    const telegramClient = getTelegramClient();
-    // No thumb capture here — messages.SendMultiMedia rejects the whole batch
-    // with 400 MEDIA_INVALID if any item's InputMediaUploadedDocument carries
-    // a thumb. See uploadAlbum()'s comment in gramjs.ts.
-    const albumResults = await telegramClient.uploadAlbum(batch, (fileIdx, pct) => {
-      onProgress?.(batch[fileIdx], pct);
-    });
-
-    const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    await Promise.all(
-      albumResults.map((part, j) => {
-        const file = batch[j];
-        if (!part.message_id) return Promise.resolve();
-        return api.registerFile({
-          filename: file.name,
-          filesize: file.size,
-          mimeType: file.type || undefined,
-          messageId: part.message_id,
-          fileId: part.file_id || `${splitGroupId}-${j}`,
-          accessHash: part.access_hash,
-          parentId: (parentIds ? parentIds[j] : currentFolderId) ?? undefined,
-          hasThumbnail: part.has_thumbnail,
-          isSplitFile: false,
-          splitGroupId: undefined,
-          partIndex: undefined,
-          totalParts: undefined,
-          originalName: file.name,
-          fileHash: hashes[j] ?? undefined,
-        });
-      })
-    );
-
-    return albumResults.map((part) =>
-      part.message_id
-        ? { message_id: part.message_id, access_hash: part.access_hash, size: part.size, has_thumbnail: part.has_thumbnail }
-        : null
-    );
   };
 
   type UploadRow = { name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string };
@@ -560,39 +656,45 @@ export function ChonkyDrive() {
       ));
     };
 
-    const ALBUM_BATCH = 10;
-    const freshBatches: PlannedFile[][] = [];
-    for (let i = 0; i < plan.fresh.length; i += ALBUM_BATCH) {
-      freshBatches.push(plan.fresh.slice(i, i + ALBUM_BATCH));
-    }
+    // Only images/videos are eligible for Telegram album grouping. Large media
+    // (needs the split/chunked upload path) and every other file type always
+    // go through the classic single-file path.
+    const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
+    const albumEligible: PlannedFile[] = [];
+    const singleFileOnly: PlannedFile[] = [];
+    plan.fresh.forEach((p) => {
+      if (isMediaFile(p.file) && p.file.size <= SINGLE_PATH_SIZE_LIMIT) {
+        albumEligible.push(p);
+      } else {
+        singleFileOnly.push(p);
+      }
+    });
 
     const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
-    // A size-1 tail batch normally rides the album path too (SendMultiMedia
-    // accepts a single item), so it isn't throttled as a standalone message.
-    // Exceptions that keep the classic single-file path: the user dropped just
-    // one file (preserve thumbnail generation), or the file is large enough to
-    // need the split/chunked upload.
-    const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
-    const freshPromises = freshBatches.map((batch) => {
-      if (batch.length === 1 && (selectedFiles.length === 1 || batch[0].file.size > SINGLE_PATH_SIZE_LIMIT)) {
-        const planned = batch[0];
-        const file = planned.file;
-        return fileSemaphore.withSlot(() =>
-          uploadWithThumbnail(file, (pct) => setRowStatus(file, { progress: pct }), planned.hash)
-        ).then(async (parts) => {
-          setRowStatus(file, { progress: 100, status: 'complete' });
-          await registerDependents(planned, parts, file.type);
-        }).catch(async (err: any) => {
-          setRowStatus(file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' });
-          await registerDependents(planned, null, file.type);
-        });
-      }
+    const albumPipeline = createAlbumPipeline(fileSemaphore);
 
+    const singlePromises = singleFileOnly.map((planned) => {
+      const file = planned.file;
       return fileSemaphore.withSlot(() =>
-        uploadAlbumBatch(batch.map((p) => p.file), batch.map((p) => p.hash), (file, pct) => setRowStatus(file, { progress: pct }))
-      ).then(async (albumResults) => {
-        await Promise.all(batch.map(async (planned, j) => {
-          const res = albumResults[j];
+        uploadFileToTelegram(file, (pct) => setRowStatus(file, { progress: pct }), planned.hash)
+      ).then(async (result) => {
+        if (!result.alreadyRegistered) {
+          await registerUploadedParts(file, result.fileHash, result.parts, currentFolderId);
+        }
+        setRowStatus(file, { progress: 100, status: 'complete' });
+        await registerDependents(planned, result.parts, file.type);
+      }).catch(async (err: any) => {
+        setRowStatus(file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' });
+        await registerDependents(planned, null, file.type);
+      });
+    });
+
+    // Each album-eligible file is enqueued individually — the pipeline groups
+    // them into ALBUM_BATCH-sized albums itself once enough have prepared, so
+    // fileSemaphore only ever gates the byte-upload step (see createAlbumPipeline).
+    const albumFilePromises = albumEligible.map((planned) =>
+      albumPipeline.enqueue(planned.file, planned.hash, currentFolderId, (pct) => setRowStatus(planned.file, { progress: pct }))
+        .then(async (res) => {
           if (res) {
             setRowStatus(planned.file, { progress: 100, status: 'complete' });
             await registerDependents(planned, [res], planned.file.type);
@@ -600,16 +702,13 @@ export function ChonkyDrive() {
             setRowStatus(planned.file, { progress: 0, status: 'error', error: 'Upload failed' });
             await registerDependents(planned, null, planned.file.type);
           }
-        }));
-      }).catch(async (err: any) => {
-        await Promise.all(batch.map(async (planned) => {
-          setRowStatus(planned.file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' });
-          await registerDependents(planned, null, planned.file.type);
-        }));
-      });
-    });
+        })
+    );
 
-    await Promise.allSettled([...duplicatePromises, ...freshPromises]);
+    await Promise.allSettled([...duplicatePromises, ...singlePromises, ...albumFilePromises, albumPipeline.flush()]);
+
+    const { rate, floods } = getChunkRateStats();
+    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} parts/s`);
 
     loadContents();
   };
@@ -711,17 +810,29 @@ export function ChonkyDrive() {
       setUploadingFiles([...visibleFiles]);
     };
 
-    // Upload one file after its parent folder is ready. Called only for files
-    // already proven fresh (not a duplicate) — hash check happens before this
-    // is invoked, outside fileSemaphore.
-    const uploadFileEntryFresh = async (file: File, folderPath: string, fileHash: string | null): Promise<void> => {
+    // Upload one file's bytes to Telegram. Called only for files already proven
+    // fresh (not a duplicate) — hash check happens before this is invoked.
+    // Does NOT register metadata — that happens after the caller releases
+    // fileSemaphore, so a slow backend never blocks the next file's bytes.
+    const uploadFileEntryFresh = async (file: File): Promise<{
+      parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>;
+      hasThumbnail: boolean;
+    }> => {
       const telegramClient = getTelegramClient();
-      const folderId = await ensureFolder(folderPath);
-      const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
       const thumbBlob = await captureThumb(file);
       const uploadResult = await telegramClient.uploadFileSplit(file, undefined, thumbBlob);
-      await Promise.all(uploadResult.parts.map((part, j) =>
+      return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
+    };
+
+    const registerFolderFileParts = async (
+      file: File,
+      fileHash: string | null,
+      folderId: string | null,
+      parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>,
+      hasThumbnail: boolean,
+    ): Promise<void> => {
+      const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      await Promise.all(parts.map((part, j) =>
         api.registerFile({
           filename: file.name,
           filesize: part.size,
@@ -730,11 +841,11 @@ export function ChonkyDrive() {
           fileId: part.file_id,
           accessHash: part.access_hash,
           parentId: folderId ?? undefined,
-          hasThumbnail: j === 0 && uploadResult.hasThumbnail,
-          isSplitFile: true,
+          hasThumbnail: j === 0 && hasThumbnail,
+          isSplitFile: parts.length > 1,
           splitGroupId: splitGroupId,
           partIndex: j,
-          totalParts: uploadResult.parts.length,
+          totalParts: parts.length,
           originalName: file.name,
           fileHash: fileHash ?? undefined,
         })
@@ -745,48 +856,20 @@ export function ChonkyDrive() {
     // cause GramJS to resolve "me" to entity ID 0 and crash.
     const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
 
-    // All upload promises collected so we can await them.
-    const uploadPromises: Promise<void>[] = [];
-
-    // Small-file accumulator: fresh files ≤10MB batch into one SendMultiMedia
-    // (10 files = 1 message). Batches may mix files from different subfolders —
-    // the album lands in Saved Messages; parent_id is per-file DB metadata.
-    type PendingSmall = { file: File; folderPath: string; hash: string | null };
-    const ALBUM_BATCH = 10;
+    // Fresh images/videos ≤10MB go through the same producer/consumer album
+    // pipeline as the drag-drop path: fileSemaphore only gates the byte-upload
+    // step, grouping into SendMultiMedia + registration happen outside it.
     const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
-    let smallBuffer: PendingSmall[] = [];
+    const albumPipeline = createAlbumPipeline(fileSemaphore);
 
-    const flushSmallBuffer = (): void => {
-      if (smallBuffer.length === 0) return;
-      const batch = smallBuffer;
-      smallBuffer = [];
-      const p = fileSemaphore.withSlot(async () => {
-        const folderIds = await Promise.all(batch.map((e) => ensureFolder(e.folderPath)));
-        const results = await uploadAlbumBatch(
-          batch.map((e) => e.file),
-          batch.map((e) => e.hash),
-          (file, pct) => { updateVisible(file.name, { progress: pct }); updateUI(); },
-          folderIds,
-        );
-        results.forEach((res, j) => {
-          if (res) {
-            completed++;
-            updateVisible(batch[j].file.name, { progress: 100, status: 'complete' });
-          } else {
-            failed++;
-            updateVisible(batch[j].file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-          }
-        });
-        updateUI();
-      }).catch(() => {
-        batch.forEach((e) => {
-          failed++;
-          updateVisible(e.file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-        });
-        updateUI();
-      });
-      uploadPromises.push(p);
-    };
+    // Discovery promises track routing decisions (hash check, dedup, enqueue)
+    // for every discovered file — settling means no more files will be added
+    // to albumPipeline or uploadPromises. Upload promises track the actual
+    // Telegram upload + registration work. Keeping these separate lets the
+    // tail album batch flush as soon as discovery finishes, instead of
+    // waiting for every other in-flight upload to complete first.
+    const discoveryPromises: Promise<void>[] = [];
+    const uploadPromises: Promise<void>[] = [];
 
     // Read all entries from a DirectoryReader (may require multiple calls).
     const readAllEntries = (reader: any): Promise<any[]> =>
@@ -810,7 +893,7 @@ export function ChonkyDrive() {
             addVisible({ name: file.name, progress: 0, status: 'uploading' });
             updateUI();
             const folderPath = basePath.replace(/\/$/, '');
-            const p = (async (): Promise<'deferred' | 'done'> => {
+            const discoveryPromise = (async (): Promise<void> => {
               const fileHash = await hashFileBounded(file);
               if (fileHash) {
                 const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] as FileInfo[] }));
@@ -826,27 +909,47 @@ export function ChonkyDrive() {
                     has_thumbnail: f.has_thumbnail,
                   }));
                   await registerDuplicateParts(file, fileHash, asExisting, folderId);
-                  return 'done';
+                  completed++;
+                  updateVisible(file.name, { progress: 100, status: 'complete' });
+                  updateUI();
+                  return;
                 }
               }
-              if (file.size <= SMALL_FILE_LIMIT) {
-                smallBuffer.push({ file, folderPath, hash: fileHash });
-                if (smallBuffer.length >= ALBUM_BATCH) flushSmallBuffer();
-                return 'deferred';
+              if (isMediaFile(file) && file.size <= SMALL_FILE_LIMIT) {
+                const folderId = await ensureFolder(folderPath);
+                const uploadPromise = albumPipeline.enqueue(file, fileHash, folderId, (pct) => { updateVisible(file.name, { progress: pct }); updateUI(); })
+                  .then((res) => {
+                    if (res) {
+                      completed++;
+                      updateVisible(file.name, { progress: 100, status: 'complete' });
+                    } else {
+                      failed++;
+                      updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+                    }
+                    updateUI();
+                  }).catch(() => {
+                    failed++;
+                    updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+                    updateUI();
+                  });
+                uploadPromises.push(uploadPromise);
+                return;
               }
-              await fileSemaphore.withSlot(() => uploadFileEntryFresh(file, folderPath, fileHash));
-              return 'done';
-            })().then((kind) => {
-              if (kind === 'deferred') return;
-              completed++;
-              updateVisible(file.name, { progress: 100, status: 'complete' });
-              updateUI();
-            }).catch(() => {
-              failed++;
-              updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-              updateUI();
-            });
-            uploadPromises.push(p);
+              const folderId = await ensureFolder(folderPath);
+              const uploadPromise = fileSemaphore.withSlot(() => uploadFileEntryFresh(file))
+                .then(async (result) => {
+                  await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
+                  completed++;
+                  updateVisible(file.name, { progress: 100, status: 'complete' });
+                  updateUI();
+                }).catch(() => {
+                  failed++;
+                  updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+                  updateUI();
+                });
+              uploadPromises.push(uploadPromise);
+            })();
+            discoveryPromises.push(discoveryPromise);
             resolve();
           });
         });
@@ -864,11 +967,15 @@ export function ChonkyDrive() {
     const rootEntries = Array.from({ length: items.length }, (_, i) => items[i].webkitGetAsEntry?.()).filter(Boolean);
     await Promise.all(rootEntries.map((e) => processEntry(e, '')));
 
-    // Traversal enqueues hash-check promises; they may still be adding files to
-    // smallBuffer. Wait for them, flush the tail batch, then wait for the flush.
+    // All files have been routed (dedup-registered, enqueued into the album
+    // pipeline, or queued for single-file upload) — safe to flush the tail
+    // album batch now without waiting for any other in-flight upload.
+    await Promise.allSettled(discoveryPromises);
+    await albumPipeline.flush();
     await Promise.allSettled(uploadPromises);
-    flushSmallBuffer();
-    await Promise.allSettled(uploadPromises);
+
+    const { rate, floods } = getChunkRateStats();
+    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} parts/s`);
 
     updateUI();
     loadContents();
@@ -1512,6 +1619,74 @@ export function ChonkyDrive() {
             zIndex: 9999,
           }}
         />
+      )}
+
+      {/* Delete Confirm Modal */}
+      {deleteConfirm && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(0, 0, 0, 0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 2000,
+          }}
+          onClick={() => setDeleteConfirm(null)}
+        >
+          <div
+            style={{
+              background: 'white',
+              borderRadius: '8px',
+              padding: '24px',
+              maxWidth: '360px',
+              boxShadow: '0 10px 40px rgba(0,0,0,0.2)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontSize: '15px', color: '#111827', marginBottom: '20px' }}>
+              Delete {deleteConfirm.ids.size} selected item(s)?
+              {deleteConfirm.hasFolder && ' Folders will be deleted with ALL their contents.'}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+              <button
+                onClick={() => setDeleteConfirm(null)}
+                style={{
+                  padding: '8px 16px',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '6px',
+                  background: 'white',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const ids = deleteConfirm.ids;
+                  setDeleteConfirm(null);
+                  performDelete(ids);
+                }}
+                style={{
+                  padding: '8px 16px',
+                  border: 'none',
+                  borderRadius: '6px',
+                  background: '#dc2626',
+                  color: 'white',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Preview Modal */}

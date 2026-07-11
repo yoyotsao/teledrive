@@ -106,7 +106,10 @@ export async function registerDuplicateParts(
       accessHash: part.access_hash ?? undefined,
       parentId: parentId ?? undefined,
       hasThumbnail: (part.part_index ?? i) === 0 ? (part.has_thumbnail ?? false) : false,
-      isSplitFile: true,
+      // Only genuinely multi-part duplicates are "split files" — a single-part
+      // match must report false so the backend's same-name+parent replace
+      // logic can fire (e.g. re-dropping the same file into the same folder).
+      isSplitFile: parts.length > 1,
       splitGroupId,
       partIndex: part.part_index ?? i,
       totalParts: parts.length,

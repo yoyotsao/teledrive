@@ -3,6 +3,11 @@ import { generateVideoThumbnail } from './videoThumbnail';
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
+/** True for files eligible for Telegram album grouping and thumbnail capture. */
+export function isMediaFile(file: File): boolean {
+  return file.type.startsWith('image/') || file.type.startsWith('video/');
+}
+
 /**
  * Capture a thumbnail blob from a local image/video file. Returns null for
  * non-media files, on capture failure, or on timeout — callers treat null as

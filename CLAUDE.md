@@ -51,13 +51,13 @@ Get-NetTCPConnection -LocalPort 3000 -State Listen | ForEach-Object { taskkill /
 
 ### Data Flow — Upload
 
-1. Browser generates thumbnail via Canvas API from the local file (single-file drops only — see note below)
+1. Browser generates thumbnail via Canvas API from the local file
 2. Browser splits file into 512KB chunks (max 1000 per segment; larger files get a `split_group_id`)
 3. Browser uploads chunks to Telegram via **GramJS** → gets `message_id`. Single-file/large-file uploads embed the thumbnail as the document's `thumb` on the final `sendFile` call (no separate thumbnail message)
 4. Browser calls `POST /api/v1/files/register` with metadata only (including `has_thumbnail`)
 5. Backend stores metadata in SQLite — **no binary data**
 
-Note: multi-file drops (folder uploads, dropping several files at once) send each file as its own `sendFile` message, rate-limited via `messageRateLimiter` to avoid FLOOD_WAIT — they do NOT get an embedded thumbnail, and are NOT batched into a single `messages.SendMultiMedia` call. `SendMultiMedia` was tried but found to hang indefinitely against this account/GramJS version (see `docs/superpowers/specs/2026-07-10-embedded-thumb-album-upload-design.md`) and was abandoned in favor of reliability.
+Note: images/videos ≤10MB from multi-file drops or folder uploads are grouped into a real Telegram album (`messages.SendMultiMedia`, up to `ALBUM_BATCH=10` files = one message), each with its own embedded thumbnail — see `uploadAlbum()` in `frontend/src/lib/gramjs.ts`. Everything else (other file types, or media >10MB) sends as its own `sendFile` message via the classic single-file path, rate-limited via `messageRateLimiter` to avoid FLOOD_WAIT. An earlier investigation wrongly concluded `SendMultiMedia` hangs indefinitely against this account/GramJS version; that was an artifact of a flawed test harness, not a real limitation — confirmed via an isolated Node.js reproduction on 2026-07-10 (see `docs/superpowers/specs/2026-07-10-embedded-thumb-album-upload-design.md` for the correction).
 
 ### Data Flow — Download
 

@@ -4,9 +4,24 @@ import { CustomFile } from "telegram/client/uploads";
 import { Api } from "telegram/tl";
 import bigInt from "big-integer";
 import { api } from "../api/client";
-import { MAX_CONCURRENT_CHUNKS, CHUNK_RETRY_COUNT, MESSAGE_SENDS_PER_SECOND, MESSAGE_SEND_BURST } from "../config";
+import {
+  MAX_CONCURRENT_CHUNKS,
+  CHUNK_RETRY_COUNT,
+  MESSAGE_SENDS_PER_SECOND,
+  MESSAGE_SEND_BURST,
+  ALBUM_SEND_TIMEOUT_MS,
+  CHUNK_RATE_INIT,
+  CHUNK_RATE_MIN,
+  CHUNK_RATE_MAX,
+  CHUNK_RATE_DECREASE_FACTOR,
+  CHUNK_RATE_INCREASE_STEP,
+  CHUNK_RATE_INCREASE_INTERVAL_MS,
+  CHUNK_RATE_CLEAN_WINDOW_MS,
+  CHUNK_RATE_BURST,
+} from "../config";
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
+import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
 
 /**
  * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
@@ -69,10 +84,91 @@ function penalizeForFlood(label: string, err: unknown): void {
   messageRateLimiter.penalize(waitMs);
 }
 
+// Adaptive pacer for chunk uploads (SaveFilePart / SaveBigFilePart). Telegram
+// rate-limits upload parts per account, and this is shared by small files,
+// thumbnails, and large-file splits alike — they all hit the same bucket.
+// Unsynchronized per-request retries (GramJS's built-in behavior) would keep
+// hammering the server during a FLOOD_WAIT penalty and make it escalate
+// (observed 5s → 15s on this account), so every part is paced through a
+// single AIMD limiter: multiplicative rate cut on FLOOD_WAIT, additive
+// ramp-up once clean. Deliberately not cross-penalized with
+// messageRateLimiter — Telegram tracks SaveFilePart and message-send RPCs as
+// separate buckets, so coupling them would only slow down the healthy side.
+const chunkPacer = new AdaptiveRateLimiter({
+  initialRate: CHUNK_RATE_INIT,
+  minRate: CHUNK_RATE_MIN,
+  maxRate: CHUNK_RATE_MAX,
+  decreaseFactor: CHUNK_RATE_DECREASE_FACTOR,
+  increaseStep: CHUNK_RATE_INCREASE_STEP,
+  increaseIntervalMs: CHUNK_RATE_INCREASE_INTERVAL_MS,
+  cleanWindowMs: CHUNK_RATE_CLEAN_WINDOW_MS,
+  burst: CHUNK_RATE_BURST,
+  storageKey: 'teledrive_chunk_rate_v1',
+  label: 'ChunkRate',
+});
+
+/** Exposes the chunk pacer's current rate and flood count for batch-summary logging. */
+export function getChunkRateStats(): { rate: number; floods: number } {
+  return chunkPacer.stats();
+}
+
+/**
+ * Send one SaveFilePart/SaveBigFilePart directly on the upload sender,
+ * paced through the shared chunkPacer. Bypasses client.invoke on purpose:
+ * invoke's floodSleepThreshold auto-sleep is per-request and silent, so
+ * concurrent parts each sleep and retry on their own schedule — exactly the
+ * herd behavior the pacer's virtual-time scheduling avoids.
+ * Non-flood errors are thrown to the caller (which has its own retry loop).
+ */
+async function sendFilePartGated(
+  client: TelegramClient,
+  request: InstanceType<typeof Api.upload.SaveFilePart> | InstanceType<typeof Api.upload.SaveBigFilePart>,
+  label: string,
+): Promise<void> {
+  let floodRetries = 0;
+  for (;;) {
+    await chunkPacer.wait();
+    let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
+    try {
+      sender = await (client as any).getSender((client.session as any).dcId);
+      await sender!.send(request);
+      chunkPacer.reportSuccess();
+      return;
+    } catch (err) {
+      if (isFloodError(err)) {
+        if (++floodRetries > 10) throw err;
+        const seconds = (err as { seconds?: number } | null)?.seconds;
+        console.warn(`[GramJS] ${label} hit FLOOD_WAIT`);
+        chunkPacer.reportFlood(seconds);
+        continue;
+      }
+      if (sender && sender.isConnected && !sender.isConnected()) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/** Rejects with a timeout error if `promise` doesn't settle within `ms`. */
+function invokeWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 /**
  * Generate a random BigInteger for fileId in SaveBigFilePart operations.
  * Uses big-integer library for compatibility with GramJS API.
  */
+export type PreparedAlbumFile = { file: File; media: Api.InputMediaDocument; docId: unknown; hasThumbnail: boolean };
+export type AlbumFileResult = { message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean };
+
 function generateRandomBigInt(): ReturnType<typeof bigInt> {
   // Generate 8 random bytes and convert to BigInteger
   const bytes = new Uint8Array(8);
@@ -391,14 +487,12 @@ export class TelegramClientManager {
             
             for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
               try {
-                await client!.invoke(
-                  new Api.upload.SaveBigFilePart({
-                    fileId: fileId,
-                    filePart: partIdx,
-                    fileTotalParts: partsInSegment,
-                    bytes: bytes,
-                  })
-                );
+                await sendFilePartGated(client!, new Api.upload.SaveBigFilePart({
+                  fileId: fileId,
+                  filePart: partIdx,
+                  fileTotalParts: partsInSegment,
+                  bytes: bytes,
+                }), 'SaveBigFilePart');
                 completedChunks++;
                 onProgress?.(Math.min(99, Math.round((completedChunks / totalChunks) * 100)));
                 console.log('[SplitUpload] Part', partIdx, 'uploaded successfully');
@@ -408,8 +502,8 @@ export class TelegramClientManager {
                 if (retry === CHUNK_RETRY_COUNT - 1) {
                   throw err;
                 }
-                // Exponential backoff (1s/2s/4s...) — GramJS's own floodSleepThreshold
-                // already handles FLOOD_WAIT errors, this covers other transient failures.
+                // Exponential backoff (1s/2s/4s...) — FLOOD_WAIT is handled inside
+                // sendFilePartGated (global pause), this covers other transient failures.
                 await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
               }
             }
@@ -475,61 +569,197 @@ export class TelegramClientManager {
     };
   }
 
-  async uploadAlbum(
-    files: File[],
-    onProgress?: (fileIdx: number, pct: number) => void,
-  ): Promise<Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>> {
+  /**
+   * Upload a small file's (≤10MB) raw bytes as 512KB upload.SaveFilePart
+   * chunks and return the InputFile handle. Replaces GramJS's client.uploadFile
+   * for the album path because that helper (a) hardcodes 128KB parts for files
+   * under 100MB (Utils.getAppropriatedPartSize) — 4× the RPC count per MB,
+   * which trips Telegram's per-account part-rate limit much sooner — and
+   * (b) swallows FLOOD_WAIT with a silent per-request sleep, invisible to our
+   * global backoff. Chunks are bounded by the shared uploadSemaphore and every
+   * part send goes through the global chunk flood gate.
+   */
+  private async uploadFilePartsPaced(buf: { length: number; subarray(start: number, end: number): unknown }, fileName: string): Promise<Api.InputFile> {
+    const client = this.client!;
+    const fileId = generateRandomBigInt();
+    const partCount = Math.max(1, Math.ceil(buf.length / PART_SIZE));
+
+    await Promise.all(Array.from({ length: partCount }, (_, partIdx) =>
+      uploadSemaphore.withSlot(async () => {
+        const bytes = (buf as any).subarray(partIdx * PART_SIZE, Math.min((partIdx + 1) * PART_SIZE, buf.length));
+        for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
+          try {
+            await sendFilePartGated(client, new Api.upload.SaveFilePart({
+              fileId: fileId as any,
+              filePart: partIdx,
+              bytes,
+            }), `SaveFilePart(${fileName})`);
+            return;
+          } catch (err: any) {
+            console.error('[SmallUpload] Part', partIdx, 'of', fileName, 'attempt', retry + 1, 'FAILED:', err?.message || err);
+            if (retry === CHUNK_RETRY_COUNT - 1) throw err;
+            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
+          }
+        }
+      })
+    ));
+
+    return new Api.InputFile({
+      id: fileId as any,
+      parts: partCount,
+      name: fileName,
+      md5Checksum: "",
+    });
+  }
+
+  /**
+   * Prepare a single file for album inclusion: upload raw bytes (+ optional
+   * thumb) as paced 512KB parts, attach the thumb at the messages.UploadMedia stage
+   * (this is what avoids the 400 MEDIA_INVALID seen when a thumb is put
+   * directly on the InputMediaUploadedDocument passed to SendMultiMedia
+   * itself). Mirrors GramJS's own `_sendAlbum` internals (client/uploads.js)
+   * for this half of the flow.
+   *
+   * Split out from the old combined uploadAlbum() so callers can run this
+   * step under a per-file concurrency slot and release that slot the instant
+   * bytes are on Telegram's servers — group assembly (sendAlbum) then runs
+   * unbounded, so the upload queue never idles waiting on message sends or
+   * metadata registration.
+   *
+   * Returns null (and logs) on failure — caller should treat that file as
+   * failed without blocking the rest of the batch.
+   */
+  async prepareAlbumFile(file: File, thumb?: Blob | null): Promise<PreparedAlbumFile | null> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
     }
+    const client = this.client;
 
-    // messages.SendMultiMedia (grouped album send) does not work reliably
-    // against this account/GramJS combination — confirmed empirically:
-    // invoking it hangs forever waiting for a response that never arrives,
-    // REGARDLESS of batch size (even a single-item "batch" hangs identically),
-    // while the exact same file sent via sendFile()/SendMedia succeeds
-    // immediately. So instead of grouping files into one message, each file is
-    // sent as its OWN message via the same sendFileLocked() path the
-    // single-file upload uses (proven working), paced by messageRateLimiter
-    // (shared with sendFile) to avoid FLOOD_WAIT — trading away the
-    // "N files = 1 message" cost reduction for reliability. Thumbnails are
-    // still not attempted here; embedding a thumb is only exercised on the
-    // single-file/large-file path.
-    return Promise.all(
-      files.map(async (file, idx) => {
+    try {
+      const t0 = performance.now();
+      const arrayBuffer = await file.arrayBuffer();
+      const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+      const tRead = performance.now();
+      const fileHandle = await this.uploadFilePartsPaced(buf, file.name);
+      const tBytes = performance.now();
+
+      let uploadedThumb: unknown;
+      if (thumb) {
+        const thumbBuf = (globalThis as any).Buffer.from(new Uint8Array(await thumb.arrayBuffer()));
+        uploadedThumb = await this.uploadFilePartsPaced(thumbBuf, 'thumb.jpg');
+      }
+      const tThumb = performance.now();
+
+      const uploadedMedia = await client.invoke(new Api.messages.UploadMedia({
+        peer: new Api.InputPeerSelf(),
+        media: new Api.InputMediaUploadedDocument({
+          file: fileHandle,
+          mimeType: file.type || 'application/octet-stream',
+          attributes: [new Api.DocumentAttributeFilename({ fileName: file.name })],
+          thumb: uploadedThumb as any,
+          forceFile: true,
+        }),
+      })) as any;
+      const tMedia = performance.now();
+      console.log(`[Perf] prepare ${file.name} (${Math.round(file.size / 1024)}KB): read=${Math.round(tRead - t0)}ms bytes=${Math.round(tBytes - tRead)}ms thumbUp=${Math.round(tThumb - tBytes)}ms uploadMedia=${Math.round(tMedia - tThumb)}ms total=${Math.round(tMedia - t0)}ms`);
+
+      const doc = uploadedMedia.document;
+      if (!doc) throw new Error('UploadMedia returned no document');
+
+      return {
+        file,
+        media: new Api.InputMediaDocument({
+          id: new Api.InputDocument({ id: doc.id, accessHash: doc.accessHash, fileReference: doc.fileReference }),
+        }),
+        docId: doc.id,
+        hasThumbnail: !!thumb,
+      };
+    } catch (err) {
+      console.error('[Album] Prepare failed for', file.name, err);
+      return null;
+    }
+  }
+
+  /**
+   * Group already-prepared files (see prepareAlbumFile) into one Telegram
+   * album — confirmed working against this account/GramJS version via an
+   * isolated Node.js probe (2026-07-10; see
+   * docs/superpowers/specs/2026-07-10-embedded-thumb-album-upload-design.md).
+   * The earlier "SendMultiMedia hangs forever" conclusion was wrong; it was
+   * an artifact of a separate browser/proxy test harness, not a library or
+   * protocol limitation.
+   *
+   * Falls back to sending each prepared file individually (sendFileLocked)
+   * if SendMultiMedia errors or exceeds ALBUM_SEND_TIMEOUT_MS. Does not touch
+   * any per-file concurrency slot — safe to call after those have been
+   * released, so it never blocks the next file's bytes from starting.
+   */
+  async sendAlbum(prepared: PreparedAlbumFile[]): Promise<AlbumFileResult[]> {
+    await this.waitUntilReady();
+    if (!this.client) {
+      throw new Error("Client not initialized. Call initialize() first.");
+    }
+    const client = this.client;
+
+    const emptyResult = (): AlbumFileResult => ({ message_id: 0, file_id: '', access_hash: undefined, size: 0, has_thumbnail: false });
+    const results: AlbumFileResult[] = prepared.map(emptyResult);
+
+    if (prepared.length === 0) return results;
+
+    let sendSucceeded = false;
+    try {
+      const t0 = performance.now();
+      await messageRateLimiter.wait();
+      const tLimiter = performance.now();
+      const multiMedia = prepared.map((p) => new Api.InputSingleMedia({
+        media: p.media,
+        randomId: generateRandomBigInt() as any,
+        message: '',
+      }));
+      const updates = await invokeWithTimeout(
+        client.invoke(new Api.messages.SendMultiMedia({ peer: new Api.InputPeerSelf(), multiMedia })),
+        ALBUM_SEND_TIMEOUT_MS,
+      ) as { updates?: Array<{ message?: { id: number; media?: { document?: { id: unknown; accessHash?: unknown } } } }> };
+      console.log(`[Perf] sendAlbum x${prepared.length}: limiterWait=${Math.round(tLimiter - t0)}ms sendMultiMedia=${Math.round(performance.now() - tLimiter)}ms`);
+
+      // Map back by document id (not array position) — Telegram doesn't guarantee order.
+      const docIdToMessage = new Map<string, { id: number; accessHash?: unknown }>();
+      for (const u of updates.updates ?? []) {
+        const doc = u.message?.media?.document;
+        if (u.message?.id && doc?.id) docIdToMessage.set(String(doc.id), { id: u.message.id, accessHash: doc.accessHash });
+      }
+      prepared.forEach((p, i) => {
+        const found = docIdToMessage.get(String(p.docId));
+        results[i] = found
+          ? { message_id: found.id, file_id: String(p.docId), access_hash: found.accessHash ? String(found.accessHash) : undefined, size: p.file.size, has_thumbnail: p.hasThumbnail }
+          : emptyResult();
+      });
+      sendSucceeded = true;
+    } catch (err) {
+      if (isFloodError(err)) penalizeForFlood('SendMultiMedia', err);
+      console.warn('[Album] SendMultiMedia failed/timed out, falling back to per-file sendFile:', err);
+    }
+
+    if (!sendSucceeded) {
+      await Promise.all(prepared.map(async (p, i) => {
         try {
-          const arrayBuffer = await file.arrayBuffer();
+          const arrayBuffer = await p.file.arrayBuffer();
           const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-          const customFile = new CustomFile(file.name, file.size, "", buf);
-          const message = await this.sendFileLocked({
-            file: customFile,
-            workers: 1,
-            forceDocument: true,
-          });
-          onProgress?.(idx, 100);
-          const msg = message as Api.Message;
-          let fileId = '';
-          let accessHash: string | undefined;
-          if (msg.media) {
-            const mediaConstructor = (msg.media as { className?: string }).className;
-            if (mediaConstructor === 'MessageMediaDocument') {
-              const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
-              fileId = String(doc.document.id);
-              accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
-            } else if (mediaConstructor === 'MessageMediaPhoto') {
-              const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
-              fileId = String(photo.photo.id);
-              accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
-            }
-          }
-          return { message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, has_thumbnail: false };
+          const customFile = new CustomFile(p.file.name, p.file.size, "", buf);
+          const message = await this.sendFileLocked({ file: customFile, workers: 1, forceDocument: true }) as Api.Message;
+          const media = message.media as any;
+          const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
+          results[i] = doc
+            ? { message_id: message.id, file_id: String(doc.id), access_hash: doc.accessHash ? String(doc.accessHash) : undefined, size: p.file.size, has_thumbnail: false }
+            : emptyResult();
         } catch (err) {
-          console.error('[Album] Individual file send failed:', file.name, err);
-          return { message_id: 0, file_id: '', access_hash: undefined, size: file.size, has_thumbnail: false };
+          console.error('[Album] Fallback sendFile failed:', p.file.name, err);
         }
-      })
-    );
+      }));
+    }
+
+    return results;
   }
 
   /**

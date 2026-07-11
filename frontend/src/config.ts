@@ -51,3 +51,46 @@ export const MESSAGE_SEND_BURST = 6;
  * concurrency shortens the dead time before the first byte reaches Telegram.
  */
 export const HASH_CONCURRENCY = 8;
+
+/**
+ * Max files grouped into a single Telegram album (messages.SendMultiMedia).
+ * Telegram's own hard cap for grouped media is 10.
+ */
+export const ALBUM_BATCH = 10;
+
+/**
+ * How long to wait for messages.SendMultiMedia before giving up on the album
+ * and falling back to sending each file as its own message.
+ */
+export const ALBUM_SEND_TIMEOUT_MS = 60_000;
+
+/**
+ * Adaptive rate control for SaveFilePart/SaveBigFilePart chunk uploads
+ * (shared across small files, thumbnails, and large-file splits — they all
+ * hit the same account-level Telegram flood limit). Starts conservative and
+ * ramps up when clean, backs off multiplicatively on FLOOD_WAIT.
+ */
+
+/** Starting chunk send rate in parts/s (2MB/s at 512KB/part) before any ramp-up. */
+export const CHUNK_RATE_INIT = 4;
+
+/** Floor rate in parts/s — worst case still makes forward progress. */
+export const CHUNK_RATE_MIN = 0.5;
+
+/** Ceiling rate in parts/s — above this, MAX_CONCURRENT_CHUNKS is the real bottleneck. */
+export const CHUNK_RATE_MAX = 12;
+
+/** Multiplicative decrease factor applied to the rate on each FLOOD_WAIT. */
+export const CHUNK_RATE_DECREASE_FACTOR = 0.5;
+
+/** Additive increase step (parts/s) applied per ramp-up tick when clean. */
+export const CHUNK_RATE_INCREASE_STEP = 0.5;
+
+/** Minimum time between ramp-up ticks. */
+export const CHUNK_RATE_INCREASE_INTERVAL_MS = 10_000;
+
+/** How long to stay clean after a FLOOD_WAIT before ramp-up resumes. */
+export const CHUNK_RATE_CLEAN_WINDOW_MS = 20_000;
+
+/** Burst allowance (in slots) the chunk rate limiter absorbs before pacing kicks in. */
+export const CHUNK_RATE_BURST = 2;

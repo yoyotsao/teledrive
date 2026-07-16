@@ -12,6 +12,14 @@ from loguru import logger
 # Database path (stored in backend folder)
 DB_PATH = Path(__file__).parent.parent.parent / "teledrive.db"
 
+# Whitelist mapping API sort keys → SQL columns. NEVER interpolate user input
+# into SQL; only values from this dict reach the query string.
+_SORT_COLUMNS = {
+    "name": "filename COLLATE NOCASE",
+    "size": "filesize",
+    "date": "created_at",
+}
+
 
 class Database:
     """SQLite database for file metadata persistence."""
@@ -94,6 +102,12 @@ class Database:
 
         try:
             await self._conn.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
+        except aiosqlite.OperationalError:
+            pass
+
+        # Soft-delete: NULL = live, ISO timestamp string = in trash
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN trashed_at TEXT")
         except aiosqlite.OperationalError:
             pass
 
@@ -186,7 +200,7 @@ class Database:
         if not self._conn:
             raise RuntimeError("Database not connected")
         cursor = await self._conn.execute(
-            "SELECT * FROM files WHERE file_hash = ? AND telegram_user_id = ? AND isDir = 0 ORDER BY part_index ASC",
+            "SELECT * FROM files WHERE file_hash = ? AND telegram_user_id = ? AND isDir = 0 AND trashed_at IS NULL ORDER BY part_index ASC",
             (file_hash, telegram_user_id),
         )
         rows = await cursor.fetchall()
@@ -207,7 +221,7 @@ class Database:
             placeholders = ",".join("?" for _ in chunk)
             cursor = await self._conn.execute(
                 f"SELECT * FROM files WHERE file_hash IN ({placeholders}) "
-                f"AND telegram_user_id = ? AND isDir = 0 ORDER BY file_hash, part_index ASC",
+                f"AND telegram_user_id = ? AND isDir = 0 AND trashed_at IS NULL ORDER BY file_hash, part_index ASC",
                 (*chunk, telegram_user_id),
             )
             rows = await cursor.fetchall()
@@ -242,12 +256,12 @@ class Database:
             raise RuntimeError("Database not connected")
         if parent_id is None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 AND telegram_user_id = ? LIMIT 1",
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
                 (filename, telegram_user_id)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 AND telegram_user_id = ? LIMIT 1",
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
                 (filename, parent_id, telegram_user_id)
             )
         row = await cursor.fetchone()
@@ -259,12 +273,12 @@ class Database:
             raise RuntimeError("Database not connected")
         if parent_id is None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 AND telegram_user_id = ? LIMIT 1",
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
                 (name, telegram_user_id)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 AND telegram_user_id = ? LIMIT 1",
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
                 (name, parent_id, telegram_user_id)
             )
         row = await cursor.fetchone()
@@ -286,32 +300,74 @@ class Database:
         parent_id: Optional[str] = None,
         is_dir: bool = False,
         split_group_id: Optional[str] = None,
-        telegram_user_id: int = 0
+        telegram_user_id: int = 0,
+        sort_by: str = "date",
+        sort_order: str = "desc",
+        search: Optional[str] = None,
+        trashed: bool = False,
     ) -> Tuple[List[dict], int]:
-        """Get files with pagination, filtered by parent_id, isDir, split_group_id, and telegram_user_id."""
+        """Get files with pagination, sorting, optional search, and trash filtering.
+
+        In search mode the parent_id/isDir filters are ignored so the query spans
+        the whole drive and returns both files and folders (callers use the isDir
+        flag to tell them apart).
+        """
         if not self._conn:
             raise RuntimeError("Database not connected")
 
-        # Build query
-        where_clauses = ["isDir = ?", "telegram_user_id = ?"]
-        params: list = [1 if is_dir else 0, telegram_user_id]
+        where_clauses = ["telegram_user_id = ?"]
+        params: list = [telegram_user_id]
 
-        if split_group_id is None:
-            if parent_id is None:
-                where_clauses.append("parent_id IS NULL")
-            else:
-                where_clauses.append("parent_id = ?")
-                params.append(parent_id)
+        # "spanning" modes (search / trash) ignore parent_id + isDir and return
+        # both files and folders in one result set.
+        spanning = bool(search) or trashed
 
-        if split_group_id is not None:
-            where_clauses.append("split_group_id = ?")
-            params.append(split_group_id)
+        if trashed:
+            where_clauses.append("trashed_at IS NOT NULL")
+            # Only trash "roots" — items whose parent isn't itself trashed — so a
+            # trashed folder's contents don't flood the trash listing.
+            where_clauses.append(
+                "(parent_id IS NULL OR parent_id NOT IN "
+                "(SELECT file_id FROM files WHERE trashed_at IS NOT NULL AND telegram_user_id = ?))"
+            )
+            params.append(telegram_user_id)
         else:
-            # Only show the primary part (part_index=0 or non-split) so multi-part files appear once
+            where_clauses.append("trashed_at IS NULL")
+
+        if search:
+            # Escape LIKE metacharacters so a search for "50%" matches literally.
+            esc = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where_clauses.append("filename LIKE ? ESCAPE '\\'")
+            params.append(f"%{esc}%")
+
+        if spanning:
+            # Collapse split parts to the primary part.
             where_clauses.append("(is_split_file = 0 OR part_index = 0 OR part_index IS NULL)")
+        else:
+            where_clauses.append("isDir = ?")
+            params.append(1 if is_dir else 0)
+
+            if split_group_id is not None:
+                where_clauses.append("split_group_id = ?")
+                params.append(split_group_id)
+            else:
+                if parent_id is None:
+                    where_clauses.append("parent_id IS NULL")
+                else:
+                    where_clauses.append("parent_id = ?")
+                    params.append(parent_id)
+                # Only show the primary part so multi-part files appear once
+                where_clauses.append("(is_split_file = 0 OR part_index = 0 OR part_index IS NULL)")
 
         where_sql = " AND ".join(where_clauses)
-        
+
+        # ORDER BY — column comes from a whitelist, direction is a literal string.
+        sort_col = _SORT_COLUMNS.get(sort_by, _SORT_COLUMNS["date"])
+        direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+        # Folders first in spanning views; file_id tiebreak keeps pagination stable.
+        prefix = "isDir DESC, " if spanning else ""
+        order_sql = f"{prefix}{sort_col} {direction}, file_id ASC"
+
         # Get total count
         cursor = await self._conn.execute(
             f"SELECT COUNT(*) FROM files WHERE {where_sql}",
@@ -319,22 +375,23 @@ class Database:
         )
         row = await cursor.fetchone()
         total = row[0] if row else 0
-        
+
         # Get paginated results
         offset = (page - 1) * page_size
         cursor = await self._conn.execute(
-            f"SELECT * FROM files WHERE {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM files WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
             params + [page_size, offset]
         )
         rows = await cursor.fetchall()
-        
+
         return [dict(row) for row in rows], total
     
     async def update_file(
         self,
         file_id: str,
         parent_id: Optional[str] = None,
-        set_parent_id: bool = False
+        set_parent_id: bool = False,
+        filename: Optional[str] = None,
     ) -> Optional[dict]:
         """Update file metadata."""
         if not self._conn:
@@ -346,7 +403,11 @@ class Database:
         if set_parent_id:
             updates.append("parent_id = ?")
             params.append(parent_id)
-        
+
+        if filename is not None:
+            updates.append("filename = ?")
+            params.append(filename)
+
         if not updates:
             return await self.get_file(file_id)
         
@@ -467,6 +528,26 @@ class Database:
         """, (root_id,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def set_trashed(self, file_ids: List[str], trashed_at: Optional[str]) -> int:
+        """Set (or clear, if trashed_at is None) trashed_at on many rows. Returns rows changed."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        if not file_ids:
+            return 0
+
+        changed = 0
+        batch_size = 500  # stay under SQLite's variable limit
+        for i in range(0, len(file_ids), batch_size):
+            batch = file_ids[i:i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            cursor = await self._conn.execute(
+                f"UPDATE files SET trashed_at = ? WHERE file_id IN ({placeholders})",
+                [trashed_at, *batch],
+            )
+            changed += cursor.rowcount
+        await self._conn.commit()
+        return changed
 
     async def delete_files_by_ids(self, file_ids: List[str]) -> int:
         """Delete multiple file records in one transaction. Returns rows deleted."""

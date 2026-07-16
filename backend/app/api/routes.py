@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect, Depends
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
 from pathlib import Path
@@ -193,6 +193,7 @@ class CreateFolderRequest(BaseModel):
 
 class UpdateFileRequest(BaseModel):
     parent_id: Optional[str] = None
+    filename: Optional[str] = None
 
 
 @router.post("/auth/login", response_model=LoginResponse)
@@ -307,11 +308,17 @@ async def list_files(
     page_size: int = Query(50, ge=1, le=10000),
     parent_id: Optional[str] = Query(None),
     split_group_id: Optional[str] = Query(None, description="Filter files by split group ID"),
+    sort_by: Literal["name", "size", "date"] = Query("date"),
+    sort_order: Literal["asc", "desc"] = Query("desc"),
+    search: Optional[str] = Query(None, description="Search filename across the whole drive"),
+    trashed: bool = Query(False, description="List trashed items instead of live ones"),
     current_user: int = Depends(get_current_user),
 ):
     # Convert string "null" to Python None
     if parent_id == "null":
         parent_id = None
+    if search is not None:
+        search = search.strip() or None
     try:
         file_service = get_file_service()
         files, total = await file_service.list_files(
@@ -320,6 +327,10 @@ async def list_files(
             parent_id=parent_id,
             split_group_id=split_group_id,
             telegram_user_id=current_user,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            search=search,
+            trashed=trashed,
         )
         return FileListResponse(
             files=files,
@@ -358,49 +369,51 @@ async def _delete_telegram_messages(message_ids: list) -> None:
 
 @router.delete("/files/{file_id}")
 async def delete_file(file_id: str, current_user: int = Depends(get_current_user)):
+    """Move a file or folder (and its whole subtree) to the trash. Telegram messages are kept."""
     try:
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
-
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
 
-        # Folders must cascade — deleting only the folder row orphans every
-        # descendant record (they become invisible in the UI but stay in SQLite).
-        if getattr(file_info, 'isDir', False):
-            deleted_count, message_ids = await file_service.delete_folder(file_id)
-            await _delete_telegram_messages(message_ids)
-            logger.info(f"Deleted folder {file_id} recursively ({deleted_count} records)")
-            return {"message": "Folder deleted", "file_id": file_id, "records_deleted": deleted_count}
+        items_trashed = await file_service.trash_file(file_id, current_user)
+        return {"message": "Moved to trash", "file_id": file_id, "items_trashed": items_trashed}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # For split files, collect all parts so we can delete their Telegram messages too.
-        # The UI only passes part_index=0's file_id, so we must look up siblings here.
-        all_parts = []
-        if file_info.is_split_file and file_info.split_group_id:
-            db = await file_service._get_db()
-            all_parts = await db.get_files_by_split_group(file_info.split_group_id, telegram_user_id=current_user)
-        else:
-            all_parts = [{
-                "file_id": file_id,
-                "telegram_message_id": file_info.telegram_message_id,
-            }]
 
-        # Delete all DB records
-        for part in all_parts:
-            await file_service.delete_file(part["file_id"])
+@router.post("/files/{file_id}/restore", response_model=FileInfo)
+async def restore_file(file_id: str, current_user: int = Depends(get_current_user)):
+    """Restore a trashed item (and its subtree) from the trash."""
+    try:
+        file_service = get_file_service()
+        try:
+            restored = await file_service.restore_file(file_id, current_user)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        if not restored:
+            raise HTTPException(status_code=404, detail="File not found")
+        return restored
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # Delete Telegram messages (best-effort — don't fail the whole request on Telegram error)
-        message_ids = [
-            mid
-            for p in all_parts
-            for mid in (p.get("telegram_message_id"),)
-            if mid
-        ]
+
+@router.delete("/files/{file_id}/purge")
+async def purge_file(file_id: str, current_user: int = Depends(get_current_user)):
+    """Permanently delete a trashed item (and its subtree), including its Telegram messages."""
+    try:
+        file_service = get_file_service()
+        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+        if not file_info:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        deleted_count, message_ids = await file_service.purge_file(file_id, current_user)
         await _delete_telegram_messages(message_ids)
-
-        deleted_count = len(all_parts)
-        logger.info(f"Deleted file {file_id} and {deleted_count} part(s)")
-        return {"message": "File deleted", "file_id": file_id, "parts_deleted": deleted_count}
+        return {"message": "Permanently deleted", "file_id": file_id, "records_deleted": deleted_count}
     except HTTPException:
         raise
     except Exception as e:
@@ -432,13 +445,22 @@ async def update_file(file_id: str, request: UpdateFileRequest, current_user: in
             logger.error(f"File not found: {file_id}")
             raise HTTPException(status_code=404, detail="File not found")
 
+        new_filename = None
+        if 'filename' in request.model_fields_set:
+            new_filename = (request.filename or "").strip()
+            if not new_filename:
+                raise HTTPException(status_code=400, detail="Filename cannot be empty")
+            if '/' in new_filename or '\\' in new_filename:
+                raise HTTPException(status_code=400, detail="Filename cannot contain / or \\")
+
         updated_info = await file_service.update_file(
             file_id,
             parent_id=request.parent_id,
-            set_parent_id='parent_id' in request.model_fields_set
+            set_parent_id='parent_id' in request.model_fields_set,
+            filename=new_filename,
         )
 
-        logger.info(f"File updated successfully: {file_id}, parent_id set={'parent_id' in request.model_fields_set}, parent_id={request.parent_id}")
+        logger.info(f"File updated successfully: {file_id}, parent_id set={'parent_id' in request.model_fields_set}, parent_id={request.parent_id}, filename={new_filename}")
         return updated_info
     except HTTPException:
         raise
@@ -710,13 +732,20 @@ async def create_folder(request: CreateFolderRequest, current_user: int = Depend
 @router.get("/folders", response_model=FileListResponse)
 async def list_folders(
     parent_id: Optional[str] = Query(None),
+    sort_by: Literal["name", "size", "date"] = Query("date"),
+    sort_order: Literal["asc", "desc"] = Query("desc"),
     current_user: int = Depends(get_current_user),
 ):
     if parent_id == "null":
         parent_id = None
     try:
         file_service = get_file_service()
-        folders = await file_service.list_folders(parent_id=parent_id, telegram_user_id=current_user)
+        folders = await file_service.list_folders(
+            parent_id=parent_id,
+            telegram_user_id=current_user,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
         return FileListResponse(
             files=folders,
             total=len(folders),
@@ -739,9 +768,8 @@ async def delete_folder(folder_id: str, current_user: int = Depends(get_current_
         if not getattr(file_info, 'isDir', False):
             raise HTTPException(status_code=400, detail="Not a folder")
 
-        deleted_count, message_ids = await file_service.delete_folder(folder_id)
-        await _delete_telegram_messages(message_ids)
-        return {"message": "Folder deleted", "folder_id": folder_id, "records_deleted": deleted_count}
+        items_trashed = await file_service.trash_file(folder_id, current_user)
+        return {"message": "Moved to trash", "folder_id": folder_id, "items_trashed": items_trashed}
     except HTTPException:
         raise
     except Exception as e:

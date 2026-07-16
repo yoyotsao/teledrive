@@ -54,6 +54,10 @@ class FileService:
             split_group_id=row.get('split_group_id'),
             part_index=row.get('part_index'),
             file_hash=row.get('file_hash'),
+            trashed_at=(
+                datetime.fromisoformat(row['trashed_at'])
+                if row.get('trashed_at') else None
+            ),
         )
     
     def _detect_file_type(self, mime_type: Optional[str], filename: str) -> FileType:
@@ -237,7 +241,9 @@ class FileService:
         file_type = self._detect_file_type(mime_type, filename)
         created_at = datetime.utcnow()
 
-        # Replace existing file with same name+parent (non-split only; split parts are each unique)
+        # Replace existing file with same name+parent (non-split only; split parts are each unique).
+        # find_file_by_name_and_parent excludes trashed rows, so a same-named file sitting in the
+        # trash is left alone here and stays restorable.
         if not is_split_file:
             existing = await db.find_file_by_name_and_parent(filename, parent_id, telegram_user_id=telegram_user_id)
             if existing:
@@ -371,8 +377,12 @@ class FileService:
         parent_id: Optional[str] = None,
         split_group_id: Optional[str] = None,
         telegram_user_id: int = 0,
+        sort_by: str = "date",
+        sort_order: str = "desc",
+        search: Optional[str] = None,
+        trashed: bool = False,
     ) -> tuple[List[FileInfo], int]:
-        """List all stored files (excluding folders). Optionally filter by split_group_id."""
+        """List stored files. Search mode spans the drive and includes folders; trashed=True lists the trash."""
         db = await self._get_db()
         rows, total = await db.get_files_paginated(
             page=page,
@@ -381,6 +391,10 @@ class FileService:
             is_dir=False,
             split_group_id=split_group_id,
             telegram_user_id=telegram_user_id,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            search=search,
+            trashed=trashed,
         )
         files = [self._row_to_file_info(row) for row in rows]
         # Sort by part_index if filtering by split_group_id
@@ -407,6 +421,8 @@ class FileService:
         self,
         parent_id: Optional[str] = None,
         telegram_user_id: int = 0,
+        sort_by: str = "date",
+        sort_order: str = "desc",
     ) -> List[FileInfo]:
         """List all stored folders (isDir == True). Filter by parent_id."""
         db = await self._get_db()
@@ -416,6 +432,8 @@ class FileService:
             parent_id=parent_id,
             is_dir=True,
             telegram_user_id=telegram_user_id,
+            sort_by=sort_by,
+            sort_order=sort_order,
         )
         folders = [self._row_to_file_info(row) for row in rows]
         return folders
@@ -498,6 +516,60 @@ class FileService:
         logger.info(f"Folder deleted recursively: {folder_id} ({deleted} records)")
         return deleted, message_ids
 
+    async def _collect_subtree_rows(self, root_id: str, telegram_user_id: int) -> List[dict]:
+        """Root row + all descendants, with every split part expanded in."""
+        db = await self._get_db()
+        rows = await db.get_subtree(root_id)
+        seen = {r['file_id'] for r in rows}
+        group_ids = {r.get('split_group_id') for r in rows if r.get('split_group_id')}
+        for gid in group_ids:
+            for part in await db.get_files_by_split_group(gid, telegram_user_id=telegram_user_id):
+                if part['file_id'] not in seen:
+                    seen.add(part['file_id'])
+                    rows.append(part)
+        return rows
+
+    async def trash_file(self, file_id: str, telegram_user_id: int) -> int:
+        """Soft-delete an item and its whole subtree. Telegram messages untouched (restore is free)."""
+        db = await self._get_db()
+        rows = await self._collect_subtree_rows(file_id, telegram_user_id)
+        ids = [r['file_id'] for r in rows]
+        await db.set_trashed(ids, datetime.utcnow().isoformat())
+        logger.info(f"Trashed {len(ids)} item(s) under {file_id}")
+        return len(ids)
+
+    async def restore_file(self, file_id: str, telegram_user_id: int) -> Optional[FileInfo]:
+        """Restore a trashed subtree. If the original parent is gone/trashed, restore to the drive root."""
+        db = await self._get_db()
+        row = await db.get_file(file_id, telegram_user_id=telegram_user_id)
+        if not row:
+            return None
+        if not row.get('trashed_at'):
+            raise ValueError("Item is not in the trash")
+
+        rows = await self._collect_subtree_rows(file_id, telegram_user_id)
+        await db.set_trashed([r['file_id'] for r in rows], None)
+
+        parent_id = row.get('parent_id')
+        if parent_id:
+            parent = await db.get_file(parent_id, telegram_user_id=telegram_user_id)
+            if not parent or parent.get('trashed_at'):
+                await db.update_file(file_id, parent_id=None, set_parent_id=True)
+
+        restored = await db.get_file(file_id, telegram_user_id=telegram_user_id)
+        logger.info(f"Restored {len(rows)} item(s) under {file_id}")
+        return self._row_to_file_info(restored)
+
+    async def purge_file(self, file_id: str, telegram_user_id: int) -> tuple[int, List[int]]:
+        """Permanently delete a subtree. Returns (records_deleted, telegram_message_ids) for cleanup."""
+        db = await self._get_db()
+        rows = await self._collect_subtree_rows(file_id, telegram_user_id)
+        ids = [r['file_id'] for r in rows]
+        message_ids = [r['telegram_message_id'] for r in rows if r.get('telegram_message_id')]
+        deleted = await db.delete_files_by_ids(ids)
+        logger.info(f"Purged {deleted} record(s) under {file_id}")
+        return deleted, message_ids
+
     async def delete_all(self, telegram_user_id: int = 0) -> int:
         """Delete all files and folders for the given user (or all if 0)."""
         db = await self._get_db()
@@ -508,15 +580,16 @@ class FileService:
         logger.info(f"All files deleted: {count} items")
         return count
 
-    async def update_file(self, file_id: str, parent_id: Optional[str] = None, set_parent_id: bool = False) -> Optional[FileInfo]:
+    async def update_file(self, file_id: str, parent_id: Optional[str] = None, set_parent_id: bool = False, filename: Optional[str] = None) -> Optional[FileInfo]:
         """Update file metadata."""
         db = await self._get_db()
-        logger.info(f"update_file called: file_id={file_id}, parent_id={parent_id}, set_parent_id={set_parent_id}")
+        logger.info(f"update_file called: file_id={file_id}, parent_id={parent_id}, set_parent_id={set_parent_id}, filename={filename}")
 
         updated_row = await db.update_file(
             file_id,
             parent_id=parent_id,
-            set_parent_id=set_parent_id
+            set_parent_id=set_parent_id,
+            filename=filename,
         )
         
         if not updated_row:

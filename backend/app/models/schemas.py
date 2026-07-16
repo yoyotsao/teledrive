@@ -56,6 +56,7 @@ class FileInfo(BaseModel):
     split_group_id: Optional[str] = Field(None, description="Group ID shared by all parts of a split file")
     part_index: Optional[int] = Field(None, description="Zero-based index of this part within the split group")
     file_hash: Optional[str] = Field(None, description="SHA-256 hash of the original file for deduplication")
+    trashed_at: Optional[datetime] = Field(None, description="Soft-delete timestamp; NULL means the item is live")
 
 
 class UploadInitResponse(BaseModel):

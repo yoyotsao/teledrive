@@ -18,6 +18,7 @@ export interface FileInfo {
   original_name?: string;
   part_index?: number;
   total_parts?: number;
+  trashed_at?: string | null;
 }
 
 export interface FileListResponse {

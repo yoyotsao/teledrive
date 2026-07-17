@@ -42,19 +42,35 @@ export const api = {
     const response = await client.post<LoginResponse>('/auth/login', { session_string: sessionString });
     return response.data;
   },
-  listFiles: async (page: number = 1, pageSize: number = 50, parentId?: string): Promise<FileListResponse> =>
+  listFiles: async (
+    page: number = 1,
+    pageSize: number = 50,
+    parentId?: string,
+    opts?: { sortBy?: string; sortOrder?: string; search?: string; trashed?: boolean },
+  ): Promise<FileListResponse> =>
     withTimeoutRetry(async () => {
       const response = await client.get<FileListResponse>('/files', {
-        params: { page, page_size: pageSize, parent_id: parentId },
+        params: {
+          page,
+          page_size: pageSize,
+          parent_id: parentId,
+          sort_by: opts?.sortBy,
+          sort_order: opts?.sortOrder,
+          search: opts?.search || undefined,
+          trashed: opts?.trashed || undefined,
+        },
         timeout: 15000,
       });
       return response.data;
     }),
 
-  listFolders: async (parentId: string | null = null): Promise<FileListResponse> =>
+  listFolders: async (
+    parentId: string | null = null,
+    opts?: { sortBy?: string; sortOrder?: string },
+  ): Promise<FileListResponse> =>
     withTimeoutRetry(async () => {
       const response = await client.get<FileListResponse>('/folders', {
-        params: { parent_id: parentId },
+        params: { parent_id: parentId, sort_by: opts?.sortBy, sort_order: opts?.sortOrder },
         timeout: 15000,
       });
       return response.data;
@@ -146,6 +162,20 @@ export const api = {
 
   deleteFile: async (fileId: string): Promise<void> => {
     await client.delete(`/files/${fileId}`);
+  },
+
+  renameFile: async (fileId: string, filename: string): Promise<FileInfo> => {
+    const response = await client.patch<FileInfo>(`/files/${fileId}`, { filename });
+    return response.data;
+  },
+
+  restoreFile: async (fileId: string): Promise<FileInfo> => {
+    const response = await client.post<FileInfo>(`/files/${fileId}/restore`);
+    return response.data;
+  },
+
+  purgeFile: async (fileId: string): Promise<void> => {
+    await client.delete(`/files/${fileId}/purge`);
   },
 
   getSplitGroupFiles: async (splitGroupId: string): Promise<FileListResponse> => {

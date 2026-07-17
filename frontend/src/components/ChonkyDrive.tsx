@@ -8,6 +8,61 @@ import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { MAX_CONCURRENT_FILES, ALBUM_BATCH } from '../config';
 import { planUploads, registerDuplicateParts, hashFileBounded, PlannedFile } from '../lib/uploadPlanner';
+import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
+import { ContextMenu, MenuItem } from './ContextMenu';
+import { ConfirmDialog } from './ConfirmDialog';
+import { RenameDialog } from './RenameDialog';
+import { DetailsPanel } from './DetailsPanel';
+import { fileKind } from '../lib/fileKind';
+import { downloadFileToDisk, fetchFileBlob } from '../lib/download';
+import { useLongPress } from '../hooks/useLongPress';
+
+const isTouch = typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches;
+
+const previewLoadingStyle: React.CSSProperties = { padding: 40, textAlign: 'center', color: 'var(--td-text-muted)', minWidth: 200 };
+
+function navArrowStyle(side: 'left' | 'right'): React.CSSProperties {
+  return {
+    position: 'fixed', [side]: 16, top: '50%', transform: 'translateY(-50%)',
+    background: 'rgba(0,0,0,0.5)', color: 'white', border: 'none', borderRadius: '50%',
+    width: 44, height: 44, cursor: 'pointer', fontSize: 28, zIndex: 1001, lineHeight: 1,
+  };
+}
+
+function previewIconBtn(right: string): React.CSSProperties {
+  return {
+    position: 'absolute', top: 8, right, background: 'rgba(0,0,0,0.5)', color: 'white',
+    border: 'none', borderRadius: '50%', width: 32, height: 32, cursor: 'pointer', fontSize: 16,
+    display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1001,
+  };
+}
+
+// Small contextual-toolbar button.
+function TbBtn({ onClick, danger, children }: { onClick: () => void; danger?: boolean; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: 'var(--td-surface-alt)', border: '1px solid var(--td-border)', cursor: 'pointer',
+        color: danger ? '#dc2626' : 'var(--td-text)', fontSize: 13, padding: '6px 12px', borderRadius: 6, fontWeight: 500,
+      }}
+    >{children}</button>
+  );
+}
+
+function toFileData(f: FileInfo): FileData {
+  return f.isDir
+    ? { id: f.file_id, name: f.filename, isDir: true, parentId: f.parent_id ?? undefined }
+    : { id: f.file_id, name: f.filename, isDir: false, size: f.filesize, modDate: new Date(f.created_at) };
+}
+
+export interface ChonkyDriveProps {
+  view: DriveView;
+  sortBy: SortKey;
+  sortOrder: SortOrder;
+  onNavigateFolder: (folderId: string | null) => void;
+  onSortChange: (by: SortKey, order: SortOrder) => void;
+}
 
 
 function formatFileSize(bytes: number): string {
@@ -128,9 +183,13 @@ function createAlbumPipeline(fileSemaphore: Semaphore) {
   };
 }
 
-export function ChonkyDrive() {
-  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
+export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortChange }: ChonkyDriveProps) {
+  const currentFolderId = view.mode === 'folder' ? view.folderId : null;
+  const isTrash = view.mode === 'trash';
+  const isSearch = view.mode === 'search';
+  const canModify = view.mode === 'folder'; // uploads/dnd/box-select only in a real folder
   const [breadcrumb, setBreadcrumb] = useState<FileData[]>([]);
+  const folderCacheRef = useRef<Map<string, FileInfo>>(new Map());
   const [files, setFiles] = useState<FileData[]>([]);
   const [originalFiles, setOriginalFiles] = useState<FileInfo[]>([]);
   // O(1) lookup instead of `originalFiles.find(...)` inside the render loop (O(n) per card = O(n^2) per render)
@@ -154,8 +213,19 @@ export function ChonkyDrive() {
   // Custom confirm modal for deletion — replaces window.confirm() so automated
   // browser tools (e.g. Playwright) don't get stuck on a native dialog.
   const [deleteConfirm, setDeleteConfirm] = useState<{ ids: Set<string>; hasFolder: boolean } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetId: string | null } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<FileInfo | null>(null);
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [detailsFile, setDetailsFile] = useState<FileInfo | null>(null);
+  const [emptyTrashConfirm, setEmptyTrashConfirm] = useState(false);
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+  const [previewText, setPreviewText] = useState<string | null>(null);
+  // Recent image blob URLs for the gallery — revoked on close to avoid leaks.
+  const galleryUrlsRef = useRef<Map<string, string>>(new Map());
 
   const dragCounterRef = useRef(0);
+  const canModifyRef = useRef(canModify);
+  canModifyRef.current = canModify; // uploads/dnd only meaningful in folder view
   const isDraggingRef = useRef(false); // Track external file drag for upload
   const pendingThumbsRef = useRef<Set<string>>(new Set());
   const thumbnailAbortRef = useRef<AbortController | null>(null);
@@ -228,46 +298,51 @@ export function ChonkyDrive() {
     }
   }, []);
 
+  // One page of results for the current view. Folder mode also pulls the (un-paginated)
+  // folder list so subfolders always show; search/trash return files+folders in one list.
+  const fetchPage = useCallback(async (page: number): Promise<{ items: FileInfo[]; total: number }> => {
+    if (view.mode === 'search') {
+      const resp = await api.listFiles(page, PAGE_SIZE, undefined, { search: view.query, sortBy, sortOrder });
+      return { items: resp.files, total: resp.total };
+    }
+    if (view.mode === 'trash') {
+      const resp = await api.listFiles(page, PAGE_SIZE, undefined, { trashed: true, sortBy, sortOrder });
+      return { items: resp.files, total: resp.total };
+    }
+    if (page === 1) {
+      const [filesResponse, foldersResponse] = await Promise.all([
+        api.listFiles(1, PAGE_SIZE, currentFolderId ?? undefined, { sortBy, sortOrder }),
+        api.listFolders(currentFolderId, { sortBy, sortOrder }),
+      ]);
+      return { items: [...foldersResponse.files, ...filesResponse.files], total: filesResponse.total };
+    }
+    const resp = await api.listFiles(page, PAGE_SIZE, currentFolderId ?? undefined, { sortBy, sortOrder });
+    return { items: resp.files, total: resp.total };
+  }, [view, sortBy, sortOrder, currentFolderId]);
+
   const loadContents = useCallback(async () => {
-    // Cancel any in-progress thumbnail fetches from the previous load cycle
     thumbnailAbortRef.current?.abort();
     const thumbAbort = new AbortController();
     thumbnailAbortRef.current = thumbAbort;
 
     currentPageRef.current = 1;
     hasMoreRef.current = false;
+    setSelectedFiles(new Set()); // view changed — drop selection of now-absent ids
     setLoading(true);
     setError(null);
     try {
-      const [filesResponse, foldersResponse] = await Promise.all([
-        api.listFiles(1, PAGE_SIZE, currentFolderId ?? undefined),
-        api.listFolders(currentFolderId),
-      ]);
-
-      hasMoreRef.current = filesResponse.total > PAGE_SIZE;
-      const allOriginal: FileInfo[] = [...foldersResponse.files, ...filesResponse.files];
+      const { items, total } = await fetchPage(1);
+      hasMoreRef.current = total > PAGE_SIZE;
 
       const fileEntries: FileData[] = [
-        ...allOriginal.filter((f) => f.isDir).map((f): FileData => ({
-          id: f.file_id,
-          name: f.filename,
-          isDir: true,
-          parentId: f.parent_id ?? undefined,
-        })),
-        ...allOriginal.filter((f) => !f.isDir).map((f): FileData => ({
-          id: f.file_id,
-          name: f.filename,
-          isDir: false,
-          size: f.filesize,
-          modDate: new Date(f.created_at),
-          thumbnailUrl: undefined,
-        })),
+        ...items.filter((f) => f.isDir).map(toFileData),
+        ...items.filter((f) => !f.isDir).map(toFileData),
       ];
 
       pendingThumbsRef.current.clear();
       setFiles(fileEntries);
-      setOriginalFiles(allOriginal);
-      loadThumbnails(allOriginal, thumbAbort.signal);
+      setOriginalFiles(items);
+      loadThumbnails(items, thumbAbort.signal);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load files');
       setFiles([]);
@@ -275,7 +350,7 @@ export function ChonkyDrive() {
     } finally {
       setLoading(false);
     }
-  }, [currentFolderId, loadThumbnails]);
+  }, [fetchPage, loadThumbnails]);
 
   const loadMoreFiles = useCallback(async () => {
     if (isLoadingMoreRef.current || !hasMoreRef.current) return;
@@ -283,31 +358,19 @@ export function ChonkyDrive() {
     setIsLoadingMore(true);
     const nextPage = currentPageRef.current + 1;
     try {
-      const filesResponse = await api.listFiles(nextPage, PAGE_SIZE, currentFolderId ?? undefined);
+      const { items, total } = await fetchPage(nextPage);
       currentPageRef.current = nextPage;
-      hasMoreRef.current = nextPage * PAGE_SIZE < filesResponse.total;
-
-      const newOriginals = filesResponse.files;
-      setOriginalFiles((prev) => [...prev, ...newOriginals]);
-      setFiles((prev) => [
-        ...prev,
-        ...newOriginals.map((f): FileData => ({
-          id: f.file_id,
-          name: f.filename,
-          isDir: false,
-          size: f.filesize,
-          modDate: new Date(f.created_at),
-          thumbnailUrl: undefined,
-        })),
-      ]);
-      loadThumbnails(newOriginals);
+      hasMoreRef.current = nextPage * PAGE_SIZE < total;
+      setOriginalFiles((prev) => [...prev, ...items]);
+      setFiles((prev) => [...prev, ...items.map(toFileData)]);
+      loadThumbnails(items);
     } catch (err) {
       console.error('Failed to load more files:', err);
     } finally {
       isLoadingMoreRef.current = false;
       setIsLoadingMore(false);
     }
-  }, [currentFolderId, loadThumbnails]);
+  }, [fetchPage, loadThumbnails]);
 
   useEffect(() => {
     const sentinel = sentinelRef.current;
@@ -321,10 +384,31 @@ export function ChonkyDrive() {
   }, [loadMoreFiles]);
 
   useEffect(() => {
-    if (currentFolderId !== undefined) {
-      loadContents();
-    }
-  }, [currentFolderId]);
+    loadContents();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadContents]);
+
+  // Rebuild the breadcrumb from the parent_id chain so deep-links / reloads work.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (view.mode !== 'folder' || !view.folderId) { setBreadcrumb([]); return; }
+      const chain: FileData[] = [];
+      const cache = folderCacheRef.current;
+      let id: string | null = view.folderId;
+      let guard = 0;
+      while (id && guard++ < 100) {
+        let f: FileInfo | undefined = cache.get(id);
+        if (!f) {
+          try { f = await api.getFile(id); cache.set(id, f); } catch { break; }
+        }
+        chain.unshift({ id: f.file_id, name: f.filename, isDir: true, parentId: f.parent_id ?? undefined });
+        id = f.parent_id ?? null;
+      }
+      if (!cancelled) setBreadcrumb(chain);
+    })();
+    return () => { cancelled = true; };
+  }, [view]);
 
   // Note: cards read `thumbnails[...]` directly during render (see the files.map below),
   // so no effect is needed here to propagate thumbnail arrivals — the component already
@@ -386,15 +470,13 @@ export function ChonkyDrive() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Move to trash (soft delete). deleteFile/deleteFolder both soft-delete server-side.
   const performDelete = async (ids: Set<string>) => {
     try {
       for (const fileId of ids) {
         const entry = files.find((f) => f.id === fileId);
-        if (entry?.isDir) {
-          await api.deleteFolder(fileId);
-        } else {
-          await api.deleteFile(fileId);
-        }
+        if (entry?.isDir) await api.deleteFolder(fileId);
+        else await api.deleteFile(fileId);
       }
       setSelectedFiles(new Set());
       loadContents();
@@ -404,53 +486,93 @@ export function ChonkyDrive() {
     }
   };
 
-  // Handle keyboard delete
+  const performRestore = async (ids: Set<string>) => {
+    try {
+      for (const fileId of ids) await api.restoreFile(fileId);
+      setSelectedFiles(new Set());
+      loadContents();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '還原失敗');
+    }
+  };
+
+  const performPurge = async (ids: Set<string>) => {
+    try {
+      for (const fileId of ids) await api.purgeFile(fileId);
+      setSelectedFiles(new Set());
+      loadContents();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '永久刪除失敗');
+    }
+  };
+
+  const performRename = async (file: FileInfo, newName: string) => {
+    setRenameTarget(null);
+    try {
+      await api.renameFile(file.file_id, newName);
+      loadContents();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '重新命名失敗');
+    }
+  };
+
+  // Empty trash: purge every trashed root, paging until the trash is empty.
+  const emptyTrash = async () => {
+    setEmptyTrashConfirm(false);
+    try {
+      let resp = await api.listFiles(1, 200, undefined, { trashed: true });
+      while (resp.files.length > 0) {
+        for (const f of resp.files) await api.purgeFile(f.file_id);
+        resp = await api.listFiles(1, 200, undefined, { trashed: true });
+      }
+      loadContents();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '清空垃圾桶失敗');
+    }
+  };
+
+  // Handle keyboard delete + F2 rename
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Delete' && selectedFiles.size > 0) {
         event.preventDefault();
+        if (isTrash) { performPurge(new Set(selectedFiles)); return; }
         const hasFolder = files.some((f) => selectedFiles.has(f.id) && f.isDir);
         setDeleteConfirm({ ids: new Set(selectedFiles), hasFolder });
+      } else if (event.key === 'F2' && selectedFiles.size === 1 && !isTrash) {
+        event.preventDefault();
+        const id = Array.from(selectedFiles)[0];
+        const original = originalFilesById.get(id);
+        if (original) setRenameTarget(original);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedFiles, files]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFiles, files, isTrash, originalFilesById]);
 
   const handleNavigateToBreadcrumb = (index: number) => {
-    if (index === 0) {
-      // Navigate to root
-      setCurrentFolderId(null);
-      setBreadcrumb([]);
-    } else {
-      const targetFolder = breadcrumb[index - 1];
-      setCurrentFolderId(targetFolder.id);
-      setBreadcrumb((prev) => prev.slice(0, index));
-    }
+    if (index === 0) onNavigateFolder(null);
+    else onNavigateFolder(breadcrumb[index - 1].id);
   };
 
   const handleBack = () => {
-    if (breadcrumb.length > 0) {
-      const newBreadcrumb = breadcrumb.slice(0, -1);
-      setBreadcrumb(newBreadcrumb);
-      setCurrentFolderId(newBreadcrumb[newBreadcrumb.length - 1]?.id ?? null);
-    }
+    if (breadcrumb.length > 0) onNavigateFolder(breadcrumb[breadcrumb.length - 2]?.id ?? null);
   };
 
-  const handleCreateFolder = async () => {
-    const name = prompt('Enter folder name:');
-    if (name && name.trim()) {
-      try {
-        await api.createFolder(name.trim(), currentFolderId);
-        loadContents();
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to create folder');
-      }
+  const handleCreateFolder = async (name: string) => {
+    setNewFolderOpen(false);
+    try {
+      await api.createFolder(name, currentFolderId);
+      loadContents();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create folder');
     }
   };
 
   const handleDragEnter = useCallback((event: React.DragEvent) => {
+    if (!canModifyRef.current) return;
     event.preventDefault();
     event.stopPropagation();
     dragCounterRef.current += 1;
@@ -714,6 +836,7 @@ export function ChonkyDrive() {
   };
 
   const handleDrop = useCallback(async (event: React.DragEvent) => {
+    if (!canModifyRef.current) return;
     event.preventDefault();
     dragCounterRef.current = 0;
     isDraggingRef.current = false;
@@ -994,6 +1117,61 @@ export function ChonkyDrive() {
   };
 
   // Selection handlers
+  // Images in the current view, in display order — drives the preview gallery.
+  const galleryImages = useMemo(
+    () => originalFiles.filter((f) => !f.isDir && fileKind(f.mime_type, f.filename) === 'image'),
+    [originalFiles],
+  );
+
+  const openPreview = useCallback(async (original: FileInfo) => {
+    setPreviewFile(original);
+    setPreviewUrl(null);
+    setPreviewText(null);
+    const kind = fileKind(original.mime_type, original.filename);
+    setPreviewIndex(kind === 'image' ? galleryImages.findIndex((f) => f.file_id === original.file_id) : null);
+
+    if (kind === 'video') return; // video streams via Service Worker, no blob download
+    try {
+      const cachedUrl = galleryUrlsRef.current.get(original.file_id);
+      const blob = cachedUrl ? null : await fetchFileBlob(original);
+      if (kind === 'text') {
+        if (blob && blob.size > 1024 * 1024) setPreviewText('（檔案過大，無法預覽）');
+        else if (blob) setPreviewText(await blob.text());
+      } else {
+        let url = cachedUrl;
+        if (!url && blob) {
+          url = URL.createObjectURL(blob);
+          if (kind === 'image') {
+            galleryUrlsRef.current.set(original.file_id, url);
+            // keep only the 5 most recent image blob URLs
+            if (galleryUrlsRef.current.size > 5) {
+              const oldest = galleryUrlsRef.current.keys().next().value as string;
+              const u = galleryUrlsRef.current.get(oldest);
+              if (u) URL.revokeObjectURL(u);
+              galleryUrlsRef.current.delete(oldest);
+            }
+          }
+        }
+        setPreviewUrl(url ?? null);
+      }
+    } catch (err) {
+      console.error('[Preview] Failed to download file:', err);
+    }
+  }, [galleryImages]);
+
+  const openItem = useCallback((file: FileData) => {
+    if (file.isDir) { onNavigateFolder(file.id); return; }
+    const original = originalFilesById.get(file.id);
+    if (original) openPreview(original);
+  }, [onNavigateFolder, originalFilesById, openPreview]);
+
+  const stepGallery = useCallback((delta: number) => {
+    if (previewIndex === null) return;
+    const next = previewIndex + delta;
+    if (next < 0 || next >= galleryImages.length) return;
+    openPreview(galleryImages[next]);
+  }, [previewIndex, galleryImages, openPreview]);
+
   const handleFileClick = useCallback((file: FileData, event: React.MouseEvent) => {
     // 若框選拖曳剛結束，此次 click 是拖曳結束而非點擊，跳過
     if (boxSelectActivatedRef.current) {
@@ -1002,6 +1180,12 @@ export function ChonkyDrive() {
     }
 
     const fileId = file.id;
+
+    // Touch: a plain tap with nothing selected opens the item (folder nav / preview).
+    if (isTouch && selectedFiles.size === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+      openItem(file);
+      return;
+    }
 
     if (event.ctrlKey || event.metaKey) {
       // Ctrl+Click: toggle multi-select
@@ -1037,7 +1221,7 @@ export function ChonkyDrive() {
       }
       lastSelectedRef.current = fileId;
     }
-  }, [files, selectedFiles]);
+  }, [files, selectedFiles, openItem]);
 
   // Box select: start on mousedown on empty space (not on a file card)
   const handleGridMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -1124,41 +1308,6 @@ export function ChonkyDrive() {
     }
   }, [selectedFiles, loadContents]);
 
-   // Double-click handler for folder navigation and file preview
-   const handleFileDoubleClick = useCallback(async (file: FileData) => {
-     if (file.isDir) {
-       // Double-click folder to navigate into it
-       setCurrentFolderId(file.id);
-       setBreadcrumb((prev) => [...prev, file]);
-     } else {
-       // Double-click file to preview
-       const original = originalFilesById.get(file.id);
-       if (original) {
-         setPreviewFile(original);
-         setPreviewUrl(null);
-
-         const mimeType = original.mime_type || 'application/octet-stream';
-
-         if (!mimeType.startsWith('video/')) {
-           try {
-             const telegramClient = getTelegramClient();
-             let blob: Blob;
-             if ((original as any).is_split_file && (original as any).split_group_id) {
-               blob = await telegramClient.downloadFileMerge((original as any).split_group_id, mimeType);
-             } else if (original.telegram_message_id) {
-               blob = await telegramClient.downloadFile(original.telegram_message_id, mimeType);
-             } else {
-               return;
-             }
-             setPreviewUrl(URL.createObjectURL(blob));
-           } catch (err) {
-             console.error('[Preview] Failed to download file:', err);
-           }
-         }
-       }
-     }
-   }, [originalFiles]);
-
   const closePreview = useCallback(async () => {
     if (previewFile?.mime_type?.startsWith('video/')) {
       // Signal main.tsx to stop accepting preload chunk requests immediately
@@ -1173,12 +1322,112 @@ export function ChonkyDrive() {
       }
     }
     
-    if (previewUrl) {
-      URL.revokeObjectURL(previewUrl);
-    }
+    const tracked = new Set(galleryUrlsRef.current.values());
+    if (previewUrl && !tracked.has(previewUrl)) URL.revokeObjectURL(previewUrl);
+    galleryUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    galleryUrlsRef.current.clear();
     setPreviewFile(null);
     setPreviewUrl(null);
+    setPreviewText(null);
+    setPreviewIndex(null);
   }, [previewUrl, previewFile]);
+
+  // Preview keyboard: Esc closes, ←/→ steps the image gallery.
+  useEffect(() => {
+    if (!previewFile) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closePreview();
+      else if (e.key === 'ArrowLeft') stepGallery(-1);
+      else if (e.key === 'ArrowRight') stepGallery(1);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [previewFile, closePreview, stepGallery]);
+
+  // Long-press (touch) opens the context menu for the card under the finger.
+  const longPress = useLongPress((x, y) => {
+    const el = (document.elementFromPoint(x, y) as HTMLElement | null)?.closest('[data-file-card]') as HTMLElement | null;
+    const id = el?.getAttribute('data-file-id');
+    if (!id) return;
+    setSelectedFiles(new Set([id]));
+    lastSelectedRef.current = id;
+    setContextMenu({ x, y, targetId: id });
+  });
+
+  const handleCardContextMenu = (file: FileData, e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!selectedFiles.has(file.id)) {
+      setSelectedFiles(new Set([file.id]));
+      lastSelectedRef.current = file.id;
+    }
+    setContextMenu({ x: e.clientX, y: e.clientY, targetId: file.id });
+  };
+
+  const handleEmptyContextMenu = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest('[data-file-card]')) return;
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, targetId: null });
+  };
+
+  const downloadSelection = async (ids: Set<string>) => {
+    for (const id of ids) {
+      const original = originalFilesById.get(id);
+      if (original && !original.isDir) await downloadFileToDisk(original).catch((err) => console.error('[Download]', err));
+    }
+  };
+
+  const buildMenuItems = (): MenuItem[] => {
+    if (!contextMenu) return [];
+    const ids = new Set(selectedFiles);
+
+    if (contextMenu.targetId === null) {
+      if (isTrash) return [{ label: '清空垃圾桶', icon: '🗑️', danger: true, onClick: () => setEmptyTrashConfirm(true) }];
+      if (!canModify) return [];
+      return [
+        { label: '新資料夾', icon: '📁', onClick: () => setNewFolderOpen(true) },
+        { label: '上傳檔案', icon: '↑', onClick: handleUploadClick },
+      ];
+    }
+
+    if (isTrash) {
+      return [
+        { label: '還原', icon: '♻️', onClick: () => performRestore(ids) },
+        { label: '永久刪除', icon: '🗑️', danger: true, onClick: () => performPurge(ids) },
+      ];
+    }
+
+    const single = ids.size === 1;
+    const original = single ? originalFilesById.get(Array.from(ids)[0]) : undefined;
+    const items: MenuItem[] = [];
+    if (single && original && !original.isDir) {
+      items.push({ label: '預覽', icon: '👁', onClick: () => openPreview(original) });
+    }
+    if (original && !original.isDir) items.push({ label: '下載', icon: '↓', onClick: () => downloadSelection(ids) });
+    if (single && original) items.push({ label: '重新命名', icon: '✏️', onClick: () => setRenameTarget(original) });
+    if (single && original) items.push({ label: '詳細資料', icon: 'ℹ️', onClick: () => setDetailsFile(original) });
+    items.push({ label: '移至垃圾桶', icon: '🗑️', danger: true, onClick: () => setDeleteConfirm({ ids, hasFolder: files.some((f) => ids.has(f.id) && f.isDir) }) });
+    return items;
+  };
+
+  // Resolve a file's location (parent folder name) for the details panel.
+  const [detailsLocation, setDetailsLocation] = useState('我的雲端硬碟');
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!detailsFile) return;
+      const pid = detailsFile.parent_id;
+      if (!pid) { setDetailsLocation('我的雲端硬碟'); return; }
+      const cached = folderCacheRef.current.get(pid);
+      if (cached) { setDetailsLocation(cached.filename); return; }
+      try {
+        const f = await api.getFile(pid);
+        folderCacheRef.current.set(pid, f);
+        if (!cancelled) setDetailsLocation(f.filename);
+      } catch { if (!cancelled) setDetailsLocation('—'); }
+    })();
+    return () => { cancelled = true; };
+  }, [detailsFile]);
 
   return (
     <div
@@ -1236,155 +1485,132 @@ export function ChonkyDrive() {
         style={{
           display: 'flex',
           alignItems: 'center',
+          gap: '8px',
           marginBottom: '12px',
           fontSize: '16px',
           fontWeight: 600,
-          color: '#374151',
+          color: 'var(--td-text)',
         }}
       >
-        {breadcrumb.length > 0 && (
-          <button
-            onClick={handleBack}
-            style={{
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              color: '#6b7280',
-              fontSize: '14px',
-              padding: '4px 8px',
-              marginRight: '8px',
-              borderRadius: '4px',
-              display: 'flex',
-              alignItems: 'center',
-            }}
-            title="Go back"
-          >
-            ← Back
-          </button>
-        )}
-        
-        <span
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            flex: 1,
-          }}
-        >
-          {/* Root segment - always visible */}
-          <button
-            onClick={() => handleNavigateToBreadcrumb(0)}
-            onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverBreadcrumbId('__root__'); }}
-            onDragLeave={() => setDragOverBreadcrumbId(null)}
-            onDrop={(e) => handleFolderDrop(null, e)}
-            style={{
-              background: dragOverBreadcrumbId === '__root__' ? '#dbeafe' : 'none',
-              border: dragOverBreadcrumbId === '__root__' ? '2px dashed #3b82f6' : '2px solid transparent',
-              cursor: 'pointer',
-              color: '#3b82f6',
-              fontSize: '16px',
-              padding: '2px 6px',
-              borderRadius: '4px',
-              fontWeight: 600,
-              transition: 'background 0.1s',
-            }}
-          >
-            Root
-          </button>
-
-          {/* Breadcrumb segments */}
-          {breadcrumb.map((folder, index) => (
-            <span key={folder.id} style={{ display: 'flex', alignItems: 'center' }}>
-              <span style={{ color: '#9ca3af', margin: '0 8px' }}>/</span>
+        {selectedFiles.size > 0 ? (
+          /* Contextual toolbar — replaces breadcrumb while items are selected */
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1 }}>
+            <button onClick={() => setSelectedFiles(new Set())} title="清除選取"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--td-text-muted)', fontSize: 18 }}>✕</button>
+            <span style={{ fontSize: 15 }}>{selectedFiles.size} 已選取</span>
+            {isTrash ? (
+              <>
+                <TbBtn onClick={() => performRestore(new Set(selectedFiles))}>♻️ 還原</TbBtn>
+                <TbBtn onClick={() => performPurge(new Set(selectedFiles))} danger>🗑️ 永久刪除</TbBtn>
+              </>
+            ) : (
+              <>
+                <TbBtn onClick={() => downloadSelection(new Set(selectedFiles))}>↓ 下載</TbBtn>
+                {selectedFiles.size === 1 && (
+                  <TbBtn onClick={() => { const o = originalFilesById.get(Array.from(selectedFiles)[0]); if (o) setRenameTarget(o); }}>✏️ 重新命名</TbBtn>
+                )}
+                <TbBtn onClick={() => setDeleteConfirm({ ids: new Set(selectedFiles), hasFolder: files.some((f) => selectedFiles.has(f.id) && f.isDir) })} danger>🗑️ 刪除</TbBtn>
+                {selectedFiles.size === 1 && (
+                  <TbBtn onClick={() => { const o = originalFilesById.get(Array.from(selectedFiles)[0]); if (o) setDetailsFile(o); }}>ℹ️</TbBtn>
+                )}
+              </>
+            )}
+          </span>
+        ) : isTrash ? (
+          <span style={{ flex: 1, color: 'var(--td-text-strong)' }}>🗑️ 垃圾桶</span>
+        ) : isSearch ? (
+          <span style={{ flex: 1, color: 'var(--td-text-strong)' }}>🔍 「{view.query}」的搜尋結果</span>
+        ) : (
+          <>
+            {breadcrumb.length > 0 && (
+              <button onClick={handleBack} title="Go back"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--td-text-muted)', fontSize: '14px', padding: '4px 8px', borderRadius: '4px', display: 'flex', alignItems: 'center' }}>
+                ← 返回
+              </button>
+            )}
+            <span style={{ display: 'flex', alignItems: 'center', flex: 1, flexWrap: 'wrap' }}>
               <button
-                onClick={() => handleNavigateToBreadcrumb(index + 1)}
-                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverBreadcrumbId(folder.id); }}
+                onClick={() => handleNavigateToBreadcrumb(0)}
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverBreadcrumbId('__root__'); }}
                 onDragLeave={() => setDragOverBreadcrumbId(null)}
-                onDrop={(e) => handleFolderDrop(folder.id, e)}
+                onDrop={(e) => handleFolderDrop(null, e)}
                 style={{
-                  background: dragOverBreadcrumbId === folder.id ? '#dbeafe' : 'none',
-                  border: dragOverBreadcrumbId === folder.id ? '2px dashed #3b82f6' : '2px solid transparent',
-                  cursor: 'pointer',
-                  color: index === breadcrumb.length - 1 ? '#374151' : '#3b82f6',
-                  fontSize: '16px',
-                  padding: '2px 6px',
-                  borderRadius: '4px',
-                  fontWeight: index === breadcrumb.length - 1 ? 600 : 400,
-                  transition: 'background 0.1s',
+                  background: dragOverBreadcrumbId === '__root__' ? 'var(--td-accent-soft)' : 'none',
+                  border: dragOverBreadcrumbId === '__root__' ? '2px dashed var(--td-accent)' : '2px solid transparent',
+                  cursor: 'pointer', color: 'var(--td-accent)', fontSize: '16px', padding: '2px 6px', borderRadius: '4px', fontWeight: 600, transition: 'background 0.1s',
                 }}
               >
-                {folder.name}
+                我的雲端硬碟
               </button>
+              {breadcrumb.map((folder, index) => (
+                <span key={folder.id} style={{ display: 'flex', alignItems: 'center' }}>
+                  <span style={{ color: 'var(--td-text-muted)', margin: '0 8px' }}>/</span>
+                  <button
+                    onClick={() => handleNavigateToBreadcrumb(index + 1)}
+                    onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverBreadcrumbId(folder.id); }}
+                    onDragLeave={() => setDragOverBreadcrumbId(null)}
+                    onDrop={(e) => handleFolderDrop(folder.id, e)}
+                    style={{
+                      background: dragOverBreadcrumbId === folder.id ? 'var(--td-accent-soft)' : 'none',
+                      border: dragOverBreadcrumbId === folder.id ? '2px dashed var(--td-accent)' : '2px solid transparent',
+                      cursor: 'pointer',
+                      color: index === breadcrumb.length - 1 ? 'var(--td-text-strong)' : 'var(--td-accent)',
+                      fontSize: '16px', padding: '2px 6px', borderRadius: '4px',
+                      fontWeight: index === breadcrumb.length - 1 ? 600 : 400, transition: 'background 0.1s',
+                    }}
+                  >
+                    {folder.name}
+                  </button>
+                </span>
+              ))}
             </span>
-          ))}
-        </span>
+          </>
+        )}
+
+        {/* Sort dropdown */}
+        <select
+          value={`${sortBy}:${sortOrder}`}
+          onChange={(e) => { const [b, o] = e.target.value.split(':'); onSortChange(b as SortKey, o as SortOrder); }}
+          style={{ fontSize: 13, padding: '7px 8px', borderRadius: 6, border: '1px solid var(--td-border)', background: 'var(--td-surface)', color: 'var(--td-text)', cursor: 'pointer' }}
+          title="排序"
+        >
+          <option value="date:desc">最新</option>
+          <option value="date:asc">最舊</option>
+          <option value="name:asc">名稱 A→Z</option>
+          <option value="name:desc">名稱 Z→A</option>
+          <option value="size:desc">大小 (大→小)</option>
+          <option value="size:asc">大小 (小→大)</option>
+        </select>
 
         <button
           onClick={() => setViewMode((v) => (v === 'grid' ? 'list' : 'grid'))}
-          style={{
-            background: '#3b82f6',
-            border: 'none',
-            cursor: 'pointer',
-            color: 'white',
-            fontSize: '14px',
-            padding: '8px 16px',
-            borderRadius: '6px',
-            marginLeft: '16px',
-            fontWeight: 500,
-          }}
+          style={{ background: 'var(--td-accent)', border: 'none', cursor: 'pointer', color: 'white', fontSize: '14px', padding: '8px 16px', borderRadius: '6px', fontWeight: 500 }}
         >
-          {viewMode === 'grid' ? '☰ List' : '⊞ Grid'}
+          {viewMode === 'grid' ? '☰ 清單' : '⊞ 格狀'}
         </button>
 
-        <button
-          onClick={handleCreateFolder}
-          style={{
-            background: '#3b82f6',
-            border: 'none',
-            cursor: 'pointer',
-            color: 'white',
-            fontSize: '14px',
-            padding: '8px 16px',
-            borderRadius: '6px',
-            marginLeft: '8px',
-            fontWeight: 500,
-          }}
-        >
-          + New Folder
-        </button>
-
-        <button
-          onClick={handleUploadClick}
-          style={{
-            background: '#16a34a',
-            border: 'none',
-            cursor: 'pointer',
-            color: 'white',
-            fontSize: '14px',
-            padding: '8px 16px',
-            borderRadius: '6px',
-            marginLeft: '8px',
-            fontWeight: 500,
-          }}
-        >
-          ↑ Upload Files
-        </button>
-
-        <button
-          onClick={handleUploadFolderClick}
-          style={{
-            background: '#8b5cf6',
-            border: 'none',
-            cursor: 'pointer',
-            color: 'white',
-            fontSize: '14px',
-            padding: '8px 16px',
-            borderRadius: '6px',
-            marginLeft: '8px',
-            fontWeight: 500,
-          }}
-        >
-          ↑ Upload Folder
-        </button>
+        {canModify && (
+          <>
+            <button
+              onClick={() => setNewFolderOpen(true)}
+              style={{ background: 'var(--td-accent)', border: 'none', cursor: 'pointer', color: 'white', fontSize: '14px', padding: '8px 16px', borderRadius: '6px', fontWeight: 500 }}
+            >
+              + 新資料夾
+            </button>
+            <button
+              onClick={handleUploadClick}
+              style={{ background: '#16a34a', border: 'none', cursor: 'pointer', color: 'white', fontSize: '14px', padding: '8px 16px', borderRadius: '6px', fontWeight: 500 }}
+            >
+              ↑ 上傳檔案
+            </button>
+            <button
+              onClick={handleUploadFolderClick}
+              style={{ background: '#8b5cf6', border: 'none', cursor: 'pointer', color: 'white', fontSize: '14px', padding: '8px 16px', borderRadius: '6px', fontWeight: 500 }}
+            >
+              ↑ 上傳資料夾
+            </button>
+          </>
+        )}
 
         <input
           ref={fileInputRef}
@@ -1407,7 +1633,9 @@ export function ChonkyDrive() {
 
       <div
         ref={scrollContainerRef}
-        onMouseDown={viewMode === 'grid' ? handleGridMouseDown : undefined}
+        onMouseDown={viewMode === 'grid' && canModify ? handleGridMouseDown : undefined}
+        onContextMenu={handleEmptyContextMenu}
+        {...longPress}
         style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}
       >
       {error && (
@@ -1436,13 +1664,15 @@ export function ChonkyDrive() {
           style={{
             padding: '40px',
             textAlign: 'center',
-            color: '#6b7280',
-            border: '2px dashed #e5e7eb',
+            color: 'var(--td-text-muted)',
+            border: '2px dashed var(--td-border)',
             borderRadius: '8px',
           }}
         >
-          <p style={{ fontSize: '16px', margin: '0 0 8px 0' }}>This folder is empty</p>
-          <p style={{ fontSize: '13px', margin: 0 }}>Upload files or create folders to get started</p>
+          <p style={{ fontSize: '16px', margin: '0 0 8px 0' }}>
+            {isTrash ? '垃圾桶是空的' : isSearch ? '找不到符合的檔案' : '這個資料夾是空的'}
+          </p>
+          {!isTrash && !isSearch && <p style={{ fontSize: '13px', margin: 0 }}>上傳檔案或建立資料夾以開始使用</p>}
         </div>
       )}
 
@@ -1468,24 +1698,26 @@ export function ChonkyDrive() {
               <div
                 key={file.id}
                 data-file-card="true"
+                data-file-id={file.id}
                 ref={(el) => {
                   if (el) fileCardRefs.current.set(file.id, el);
                   else fileCardRefs.current.delete(file.id);
                 }}
-                draggable={true}
-                onDragStart={(e) => handleFileDragStart(file, e)}
-                onDragEnd={handleFileDragEnd}
+                draggable={canModify}
+                onDragStart={canModify ? (e) => handleFileDragStart(file, e) : undefined}
+                onDragEnd={canModify ? handleFileDragEnd : undefined}
+                onContextMenu={(e) => handleCardContextMenu(file, e)}
                 style={{
                   display: 'flex',
                   alignItems: viewMode === 'grid' ? 'center' : 'center',
                   flexDirection: viewMode === 'grid' ? 'column' : 'row',
                   padding: viewMode === 'grid' ? '12px' : '12px',
-                  background: isSelected ? '#eff6ff' : 'white',
-                  border: isSelected ? '2px solid #3b82f6' : (isDragOver ? '2px dashed #3b82f6' : '1px solid #e5e7eb'),
+                  background: isSelected ? 'var(--td-accent-soft)' : 'var(--td-surface)',
+                  border: isSelected ? '2px solid var(--td-selected-border)' : (isDragOver ? '2px dashed var(--td-accent)' : '1px solid var(--td-border)'),
                   borderRadius: '8px',
                   cursor: file.isDir ? 'pointer' : (isSelected ? 'grab' : 'default'),
                   textAlign: viewMode === 'grid' ? 'center' : 'left',
-                  opacity: !file.isDir && isSelected ? 0.8 : 1,
+                  opacity: isTrash ? 0.6 : (!file.isDir && isSelected ? 0.8 : 1),
                   transition: 'all 0.15s ease',
                   transform: isDragOver ? 'scale(1.02)' : undefined,
                   boxShadow: isSelected ? '0 2px 8px rgba(59, 130, 246, 0.15)' : (isDragOver ? '0 4px 12px rgba(59, 130, 246, 0.2)' : undefined),
@@ -1497,9 +1729,9 @@ export function ChonkyDrive() {
                 onDoubleClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  handleFileDoubleClick(file);
+                  openItem(file);
                 }}
-                {...(file.isDir ? {
+                {...(file.isDir && canModify ? {
                   onDragEnter: (e: React.DragEvent) => handleFolderDragEnter(file.id, e),
                   onDragLeave: handleFolderDragLeave,
                   onDragOver: handleFolderDragOver,
@@ -1519,7 +1751,7 @@ export function ChonkyDrive() {
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    background: (isImage || isVideo) ? '#f3f4f6' : 'transparent',
+                    background: (isImage || isVideo) ? 'var(--td-surface-alt)' : 'transparent',
                     borderRadius: '4px',
                     marginRight: viewMode === 'grid' ? 0 : '12px',
                     marginBottom: viewMode === 'grid' ? '12px' : 0,
@@ -1566,7 +1798,7 @@ export function ChonkyDrive() {
                       title={file.name}
                       style={{
                         fontSize: '14px',
-                        color: '#374151',
+                        color: 'var(--td-text)',
                         ...(viewMode === 'grid'
                           ? isSelected
                             ? { wordBreak: 'break-word', overflowWrap: 'break-word' }
@@ -1584,7 +1816,7 @@ export function ChonkyDrive() {
                       {file.name}
                     </div>
                     {!file.isDir && file.size && viewMode !== 'grid' && (
-                      <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                      <div style={{ fontSize: '12px', color: 'var(--td-text-muted)' }}>
                         {formatFileSize(file.size)}
                       </div>
                     )}
@@ -1597,8 +1829,8 @@ export function ChonkyDrive() {
       )}
 
       {/* Infinite scroll sentinel */}
-      <div ref={sentinelRef} style={{ height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#6b7280', fontSize: '13px' }}>
-        {isLoadingMore && 'Loading more...'}
+      <div ref={sentinelRef} style={{ height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--td-text-muted)', fontSize: '13px' }}>
+        {isLoadingMore && '載入更多...'}
       </div>
 
       </div>
@@ -1621,233 +1853,112 @@ export function ChonkyDrive() {
         />
       )}
 
-      {/* Delete Confirm Modal */}
-      {deleteConfirm && (
-        <div
-          style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0, 0, 0, 0.5)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 2000,
-          }}
-          onClick={() => setDeleteConfirm(null)}
-        >
-          <div
-            style={{
-              background: 'white',
-              borderRadius: '8px',
-              padding: '24px',
-              maxWidth: '360px',
-              boxShadow: '0 10px 40px rgba(0,0,0,0.2)',
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{ fontSize: '15px', color: '#111827', marginBottom: '20px' }}>
-              Delete {deleteConfirm.ids.size} selected item(s)?
-              {deleteConfirm.hasFolder && ' Folders will be deleted with ALL their contents.'}
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-              <button
-                onClick={() => setDeleteConfirm(null)}
-                style={{
-                  padding: '8px 16px',
-                  border: '1px solid #d1d5db',
-                  borderRadius: '6px',
-                  background: 'white',
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  const ids = deleteConfirm.ids;
-                  setDeleteConfirm(null);
-                  performDelete(ids);
-                }}
-                style={{
-                  padding: '8px 16px',
-                  border: 'none',
-                  borderRadius: '6px',
-                  background: '#dc2626',
-                  color: 'white',
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                }}
-              >
-                Delete
-              </button>
-            </div>
-          </div>
-        </div>
+      {contextMenu && (
+        <ContextMenu x={contextMenu.x} y={contextMenu.y} items={buildMenuItems()} onClose={() => setContextMenu(null)} />
       )}
 
-      {/* Preview Modal */}
-      {previewFile && (
+      {deleteConfirm && (
+        <ConfirmDialog
+          message={`確定要將 ${deleteConfirm.ids.size} 個項目移至垃圾桶嗎？${deleteConfirm.hasFolder ? '（資料夾將連同全部內容一起移入）' : ''}`}
+          confirmLabel="移至垃圾桶"
+          danger
+          onConfirm={() => { const ids = deleteConfirm.ids; setDeleteConfirm(null); performDelete(ids); }}
+          onCancel={() => setDeleteConfirm(null)}
+        />
+      )}
+
+      {emptyTrashConfirm && (
+        <ConfirmDialog
+          message="確定要清空垃圾桶嗎？此動作會永久刪除所有項目，無法復原。"
+          confirmLabel="清空垃圾桶"
+          danger
+          onConfirm={emptyTrash}
+          onCancel={() => setEmptyTrashConfirm(false)}
+        />
+      )}
+
+      {newFolderOpen && (
+        <RenameDialog
+          title="新資料夾"
+          initialValue="未命名資料夾"
+          confirmLabel="建立"
+          onSubmit={handleCreateFolder}
+          onCancel={() => setNewFolderOpen(false)}
+        />
+      )}
+
+      {renameTarget && (
+        <RenameDialog
+          title="重新命名"
+          initialValue={renameTarget.filename}
+          selectBaseName={!renameTarget.isDir}
+          onSubmit={(name) => performRename(renameTarget, name)}
+          onCancel={() => setRenameTarget(null)}
+        />
+      )}
+
+      {detailsFile && (
+        <DetailsPanel
+          file={detailsFile}
+          thumbnailUrl={thumbnails[detailsFile.file_id]}
+          locationName={detailsLocation}
+          onClose={() => setDetailsFile(null)}
+        />
+      )}
+
+      {/* Preview Modal — image gallery, video (SW stream), PDF, audio, text */}
+      {previewFile && (() => {
+        const kind = fileKind(previewFile.mime_type, previewFile.filename);
+        return (
         <div
-          style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0, 0, 0, 0.8)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-          }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}
           onClick={closePreview}
         >
+          {kind === 'image' && previewIndex !== null && previewIndex > 0 && (
+            <button onClick={(e) => { e.stopPropagation(); stepGallery(-1); }} style={navArrowStyle('left')}>‹</button>
+          )}
+          {kind === 'image' && previewIndex !== null && previewIndex < galleryImages.length - 1 && (
+            <button onClick={(e) => { e.stopPropagation(); stepGallery(1); }} style={navArrowStyle('right')}>›</button>
+          )}
           <div
-            style={{
-              maxWidth: '90vw',
-              maxHeight: '90vh',
-              background: 'white',
-              borderRadius: '8px',
-              overflow: 'hidden',
-              position: 'relative',
-            }}
+            style={{ maxWidth: '90vw', maxHeight: '90vh', background: 'var(--td-surface)', borderRadius: '8px', overflow: 'hidden', position: 'relative', display: 'flex', flexDirection: 'column' }}
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Close button */}
-            <button
-              onClick={closePreview}
-              style={{
-                position: 'absolute',
-                top: '8px',
-                right: '8px',
-                background: 'rgba(0, 0, 0, 0.5)',
-                color: 'white',
-                border: 'none',
-                borderRadius: '50%',
-                width: '32px',
-                height: '32px',
-                cursor: 'pointer',
-                fontSize: '18px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                zIndex: 1001,
-              }}
-            >
-              ✕
-            </button>
-            
-            {/* Download button */}
-            <button
-              onClick={async () => {
-                // Trigger download with correct filename
-                try {
-                  const telegramClient = getTelegramClient();
-                  const mimeType = previewFile.mime_type || 'application/octet-stream';
-                  let blob: Blob;
-                  
-                  // Check if this is a split file
-                  if ((previewFile as any).is_split_file && (previewFile as any).split_group_id) {
-                    blob = await telegramClient.downloadFileMerge((previewFile as any).split_group_id, mimeType);
-                  } else {
-                    const msgId = previewFile.telegram_message_id;
-                    if (!msgId) {
-                      console.error('[Download] No telegram_message_id for file');
-                      return;
-                    }
-                    blob = await telegramClient.downloadFile(msgId, mimeType);
-                  }
-                  
-                  // Use original_name for split files, otherwise filename
-                  const downloadFilename = (previewFile as any).original_name || previewFile.filename;
-                  
-                  // Create download link and trigger
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url;
-                  a.download = downloadFilename;
-                  document.body.appendChild(a);
-                  a.click();
-                  document.body.removeChild(a);
-                  URL.revokeObjectURL(url);
-                  console.log('[Download] Downloaded file:', downloadFilename);
-                } catch (err) {
-                  console.error('[Download] Error downloading file:', err);
-                }
-              }}
-              style={{
-                position: 'absolute',
-                top: '8px',
-                right: '48px',
-                background: 'rgba(0, 0, 0, 0.5)',
-                color: 'white',
-                border: 'none',
-                borderRadius: '50%',
-                width: '32px',
-                height: '32px',
-                cursor: 'pointer',
-                fontSize: '16px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                zIndex: 1001,
-              }}
-              title="Download"
-            >
-              ↓
-            </button>
-            
-            {/* File name */}
-            <div style={{ 
-              padding: '12px 16px', 
-              borderBottom: '1px solid #e5e7eb',
-              fontSize: '14px',
-              fontWeight: 500,
-              color: '#374151',
-            }}>
+            <button onClick={closePreview} style={previewIconBtn('8px')}>✕</button>
+            <button onClick={() => downloadFileToDisk(previewFile).catch((err) => console.error('[Download]', err))} style={previewIconBtn('48px')} title="下載">↓</button>
+
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--td-border)', fontSize: 14, fontWeight: 500, color: 'var(--td-text)', paddingRight: 90 }}>
               {previewFile.filename}
             </div>
-            
-            {/* Content: Image or Video */}
-            <div style={{ padding: '8px' }}>
-              {previewFile.mime_type?.startsWith('image/') ? (
-                <img
-                  src={previewUrl ?? undefined}
-                  alt={previewFile.filename}
-                  loading="lazy"
-                  decoding="async"
-                  style={{
-                    minWidth: '200px',
-                    minHeight: '200px',
-                    maxWidth: '100%',
-                    maxHeight: 'calc(90vh - 100px)',
-                    objectFit: 'contain',
-                  }}
-                />
-              ) : previewFile.mime_type?.startsWith('video/') ? (
+
+            <div style={{ padding: 8, overflow: 'auto' }}>
+              {kind === 'image' ? (
+                <img src={previewUrl ?? undefined} alt={previewFile.filename} decoding="async"
+                  style={{ minWidth: 200, minHeight: 200, maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', objectFit: 'contain' }} />
+              ) : kind === 'video' ? (
                 <video
-                  src={
-                    (previewFile as any).is_split_file && (previewFile as any).split_group_id
-                      ? `/preview-video/split/${(previewFile as any).split_group_id}`
-                      : `/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}`
-                  }
-                  controls
-                  autoPlay
-                  style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }}
-                />
+                  src={previewFile.is_split_file && previewFile.split_group_id
+                    ? `/preview-video/split/${previewFile.split_group_id}`
+                    : `/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}`}
+                  controls autoPlay style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }} />
+              ) : kind === 'pdf' ? (
+                previewUrl ? <iframe src={previewUrl} title={previewFile.filename} style={{ width: '80vw', height: 'calc(90vh - 100px)', border: 'none' }} />
+                  : <div style={previewLoadingStyle}>載入中...</div>
+              ) : kind === 'audio' ? (
+                previewUrl ? <div style={{ padding: 40 }}><audio src={previewUrl} controls autoPlay style={{ width: 360, maxWidth: '80vw' }} /></div>
+                  : <div style={previewLoadingStyle}>載入中...</div>
+              ) : kind === 'text' ? (
+                previewText !== null
+                  ? <pre style={{ margin: 0, padding: 16, maxWidth: '80vw', maxHeight: 'calc(90vh - 120px)', overflow: 'auto', fontSize: 13, color: 'var(--td-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{previewText}</pre>
+                  : <div style={previewLoadingStyle}>載入中...</div>
               ) : (
-                <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
-                  Preview not available for this file type
-                </div>
+                <div style={{ padding: 40, textAlign: 'center', color: 'var(--td-text-muted)' }}>此檔案類型無法預覽</div>
               )}
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

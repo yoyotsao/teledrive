@@ -1,0 +1,37 @@
+/* Design tokens — light default, dark via [data-theme="dark"] on <html>.
+   Inline styles reference these as var(--td-*), so a single attribute flip
+   re-themes the whole app without touching component code. */
+:root {
+  --td-bg: #f9fafb;
+  --td-surface: #ffffff;
+  --td-surface-alt: #f3f4f6;
+  --td-text: #374151;
+  --td-text-strong: #111827;
+  --td-text-muted: #6b7280;
+  --td-border: #e5e7eb;
+  --td-accent: #3b82f6;
+  --td-accent-soft: #eff6ff;
+  --td-selected-border: #3b82f6;
+  --td-shadow: rgba(0, 0, 0, 0.1);
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --td-bg: #0f1216;
+  --td-surface: #1a1f27;
+  --td-surface-alt: #232a34;
+  --td-text: #d1d5db;
+  --td-text-strong: #f3f4f6;
+  --td-text-muted: #9ca3af;
+  --td-border: #333b47;
+  --td-accent: #60a5fa;
+  --td-accent-soft: #1e293b;
+  --td-selected-border: #60a5fa;
+  --td-shadow: rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
+
+body {
+  background: var(--td-bg);
+  color: var(--td-text);
+}

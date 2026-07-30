@@ -16,7 +16,7 @@ export function SearchBox({ value, onChange }: { value: string; onChange: (q: st
   };
 
   return (
-    <div style={{ position: 'relative', flex: 1, maxWidth: 420 }}>
+    <div style={{ position: 'relative', flex: 1, minWidth: 180, maxWidth: 420 }}>
       <span style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--td-text-muted)', fontSize: 14 }}>🔍</span>
       <input
         value={local}

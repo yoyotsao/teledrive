@@ -7,7 +7,11 @@ export function Sidebar({
   onSelectDrive: () => void;
   onSelectTrash: () => void;
 }) {
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('td-sidebar-collapsed') === '1');
+  // ponytail: default to collapsed on phone-width screens; no resize listener — the toggle covers rotation.
+  const [collapsed, setCollapsed] = useState(() => {
+    const stored = localStorage.getItem('td-sidebar-collapsed');
+    return stored ? stored === '1' : window.innerWidth < 768;
+  });
 
   const toggle = () => setCollapsed((c) => {
     localStorage.setItem('td-sidebar-collapsed', c ? '0' : '1');

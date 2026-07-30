@@ -66,7 +66,7 @@ function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--td-bg)', color: 'var(--td-text)' }}>
-      <header style={{ padding: '12px 16px', borderBottom: '1px solid var(--td-border)', background: 'var(--td-surface)', display: 'flex', alignItems: 'center', gap: 16 }}>
+      <header style={{ padding: '12px 16px', borderBottom: '1px solid var(--td-border)', background: 'var(--td-surface)', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: '22px', fontWeight: 600, color: 'var(--td-text-strong)' }}>TeleDrive</h1>
           <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: 'var(--td-text-muted)' }}>

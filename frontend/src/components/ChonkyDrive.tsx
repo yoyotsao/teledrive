@@ -1538,6 +1538,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
         style={{
           display: 'flex',
           alignItems: 'center',
+          flexWrap: 'wrap',
           gap: '8px',
           marginBottom: '12px',
           fontSize: '16px',
@@ -1591,6 +1592,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   background: dragOverBreadcrumbId === '__root__' ? 'var(--td-accent-soft)' : 'none',
                   border: dragOverBreadcrumbId === '__root__' ? '2px dashed var(--td-accent)' : '2px solid transparent',
                   cursor: 'pointer', color: 'var(--td-accent)', fontSize: '16px', padding: '2px 6px', borderRadius: '4px', fontWeight: 600, transition: 'background 0.1s',
+                  whiteSpace: 'nowrap',
                 }}
               >
                 我的雲端硬碟

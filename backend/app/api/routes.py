@@ -111,14 +111,24 @@ class UpdateFileRequest(BaseModel):
 
 @router.post("/auth/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
-    """Verify GramJS session via Telethon, store per-user client, return JWT."""
+    """Verify a GramJS or Telethon session via Telethon, store per-user client, return JWT."""
     from telethon import TelegramClient
+    from telethon.sessions import StringSession
     from app.services.config import get_settings
 
     settings = get_settings()
     client = None
     try:
-        session = _parse_gramjs_session(request.session_string)
+        # Browsers send a GramJS session string; non-browser clients (e.g. the
+        # WebDAV bridge, generate_session.py) send a Telethon StringSession.
+        try:
+            session = _parse_gramjs_session(request.session_string)
+        except Exception:
+            session = StringSession(request.session_string)
+            # StringSession accepts an empty/garbage string as a *blank* session, which
+            # would otherwise cost a full Telegram handshake before failing on get_me().
+            if not session.auth_key:
+                raise HTTPException(status_code=401, detail="Invalid session")
         client = TelegramClient(session, settings.telegram_api_id, settings.telegram_api_hash)
         await client.connect()
         me = await client.get_me()

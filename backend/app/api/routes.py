@@ -2,7 +2,6 @@ from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, 
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
-from pathlib import Path
 
 from app.models.schemas import FileListResponse, FileInfo, FileType
 from app.services import get_file_service, get_bot_service
@@ -11,99 +10,13 @@ from app.services.database import get_database
 from app.auth import get_current_user, create_jwt
 from app.services.user_sessions import store_user_session, get_user_client
 from loguru import logger
-import os
-import tempfile
 import asyncio
-import subprocess
-import shutil
 import base64
 
-THUMBNAILS_DIR = Path("thumbnails")
-THUMBNAILS_DIR.mkdir(exist_ok=True)
-
-
-def find_ffmpeg() -> Optional[str]:
-    """Find ffmpeg executable, checking PATH and known locations."""
-    # Check PATH first
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path:
-        return ffmpeg_path
-    # Fallback to known Windows installation path
-    known_path = "C:/Program Files/AI ExpertMeet/resources/bindings/FFmpeg/ffmpeg.exe"
-    if os.path.exists(known_path):
-        return known_path
-    return None
-
-
-async def extract_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> None:
-    """Extract thumbnail from video using ffmpeg. Runs in executor to avoid blocking."""
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("FFmpeg not found. Please install FFmpeg.")
-
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i", video_path,
-        "-ss", "00:00:01.000",
-        "-vframes", "1",
-        "-vf", "scale='min(400,iw)':min'(400,ih)':force_original_aspect_ratio=decrease",
-        "-q:v", "2",
-        thumb_path
-    ]
-
-    logger.info(f"Running ffmpeg: {' '.join(cmd)}")
-
-    def run_ffmpeg():
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg failed: {result.stderr}")
-        return result
-
-    await asyncio.to_thread(run_ffmpeg)
-
-async def _download_thumbnail_base64(client, message_id: int) -> Optional[str]:
-    """Download ONLY the embedded thumb PhotoSize of the file's own message.
-
-    Never downloads the document body (could be a 500MB video). Falls back to
-    the full document only for image/* mime types (the image IS the thumbnail
-    source and is small).
-    """
-    try:
-        import io
-        message = await client.get_messages('me', ids=message_id)
-        if not message:
-            logger.error(f"Thumbnail: Message {message_id} not found")
-            return None
-        media = getattr(message, 'media', None)
-        doc = getattr(media, 'document', None) if media else None
-        if doc is None:
-            return None
-
-        if getattr(doc, 'thumbs', None):
-            buf = io.BytesIO()
-            # thumb=-1 → largest embedded PhotoSize; a few KB, never the document
-            await client.download_media(message, file=buf, thumb=-1)
-            data = buf.getvalue()
-            if data:
-                return base64.b64encode(data).decode()
-
-        if (getattr(doc, 'mime_type', '') or '').startswith('image/'):
-            buf = io.BytesIO()
-            await client.download_media(message, file=buf)
-            data = buf.getvalue()
-            if data:
-                return base64.b64encode(data).decode()
-        return None
-    except Exception as e:
-        logger.error(f"_download_thumbnail_base64 failed: {e}")
-        return None
-
+# Thumbnails are served entirely browser-side: the frontend downloads each
+# file's embedded thumb via GramJS and caches it in IndexedDB (see
+# frontend/src/lib/thumbnailCache.ts). The backend keeps no thumbnail cache and
+# never proxies thumbnail bytes.
 
 router = APIRouter(prefix="/api/v1", tags=["files"])
 
@@ -494,62 +407,6 @@ async def get_download_info(file_id: str, current_user: int = Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/thumbnail")
-async def get_file_thumbnail(file_id: str, current_user: int = Depends(get_current_user)):
-    """
-    Get thumbnail for image/video files.
-    Checks disk cache first; downloads from Telegram on cache miss using user's session.
-    """
-    from fastapi.responses import FileResponse, Response
-    try:
-        cache_path = THUMBNAILS_DIR / f"{file_id}.jpg"
-        if cache_path.exists():
-            return FileResponse(str(cache_path), media_type="image/jpeg")
-
-        file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
-
-        if not file_info:
-            raise HTTPException(status_code=404, detail="File not found")
-
-        mime_type = file_info.mime_type or ""
-        if not (mime_type.startswith('image/') or mime_type.startswith('video/')):
-            raise HTTPException(status_code=400, detail="Not an image or video file")
-
-        # Thumbnails are embedded in the file's own message. For videos we must
-        # have an embedded thumb; downloading the document itself is forbidden.
-        is_video = mime_type.startswith('video/')
-        if is_video and not file_info.has_thumbnail:
-            raise HTTPException(status_code=404, detail="No thumbnail available")
-        message_id = file_info.telegram_message_id
-        if not message_id:
-            raise HTTPException(status_code=404, detail="No thumbnail available")
-
-        user_client = get_user_client(current_user)
-        if not user_client:
-            raise HTTPException(status_code=401, detail="User session not found, please re-login")
-
-        if not user_client.is_connected():
-            logger.info(f"Telethon client for user {current_user} disconnected, reconnecting...")
-            await user_client.connect()
-
-        logger.info(f"Thumbnail cache miss for {file_id}, fetching message {message_id}")
-        thumbnail_data = await _download_thumbnail_base64(user_client, message_id)
-
-        if not thumbnail_data:
-            raise HTTPException(status_code=404, detail="No thumbnail available")
-
-        img_bytes = base64.b64decode(thumbnail_data)
-        cache_path.write_bytes(img_bytes)
-        logger.info(f"Thumbnail cached: {cache_path}")
-        return Response(content=img_bytes, media_type="image/jpeg")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Thumbnail error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

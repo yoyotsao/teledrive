@@ -18,6 +18,21 @@ import {
   CHUNK_RATE_INCREASE_INTERVAL_MS,
   CHUNK_RATE_CLEAN_WINDOW_MS,
   CHUNK_RATE_BURST,
+  CHUNK_CEILING_BACKOFF,
+  CHUNK_CEILING_SLOW_ZONE,
+  CHUNK_CEILING_FLOOR,
+  CHUNK_RATE_SLOW_STEP,
+  CHUNK_RATE_SLOW_INTERVAL_MS,
+  CHUNK_PROBE_COOLDOWN_MS,
+  CHUNK_PROBE_COOLDOWN_MAX_MS,
+  CHUNK_PROBE_STEP,
+  CHUNK_PROBE_CONFIRM_MS,
+  CHUNK_FLOOD_ESCALATION_COUNT,
+  CHUNK_FLOOD_ESCALATION_WINDOW_MS,
+  CHUNK_ESCALATED_DECREASE_FACTOR,
+  CHUNK_ESCALATED_CEILING_FACTOR,
+  CHUNK_ESCALATED_CLEAN_WINDOW_MS,
+  CHUNK_ESCALATION_RESET_MS,
 } from "../config";
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
@@ -103,12 +118,32 @@ const chunkPacer = new AdaptiveRateLimiter({
   increaseIntervalMs: CHUNK_RATE_INCREASE_INTERVAL_MS,
   cleanWindowMs: CHUNK_RATE_CLEAN_WINDOW_MS,
   burst: CHUNK_RATE_BURST,
-  storageKey: 'teledrive_chunk_rate_v1',
+  storageKey: 'teledrive_chunk_rate_v2',
   label: 'ChunkRate',
+  // Ceiling memory: remember the flood-triggering rate and converge just below
+  // it, instead of re-probing past the account limit every cycle (the sawtooth
+  // that made FLOOD_WAIT recur ~once a minute). See adaptiveRateLimiter.ts.
+  ceiling: {
+    backoff: CHUNK_CEILING_BACKOFF,
+    slowZone: CHUNK_CEILING_SLOW_ZONE,
+    floor: CHUNK_CEILING_FLOOR,
+    slowStep: CHUNK_RATE_SLOW_STEP,
+    slowIntervalMs: CHUNK_RATE_SLOW_INTERVAL_MS,
+    probeCooldownMs: CHUNK_PROBE_COOLDOWN_MS,
+    probeCooldownMaxMs: CHUNK_PROBE_COOLDOWN_MAX_MS,
+    probeStep: CHUNK_PROBE_STEP,
+    probeConfirmMs: CHUNK_PROBE_CONFIRM_MS,
+    escalationCount: CHUNK_FLOOD_ESCALATION_COUNT,
+    escalationWindowMs: CHUNK_FLOOD_ESCALATION_WINDOW_MS,
+    escalatedDecreaseFactor: CHUNK_ESCALATED_DECREASE_FACTOR,
+    escalatedCeilingFactor: CHUNK_ESCALATED_CEILING_FACTOR,
+    escalatedCleanWindowMs: CHUNK_ESCALATED_CLEAN_WINDOW_MS,
+    escalationResetMs: CHUNK_ESCALATION_RESET_MS,
+  },
 });
 
-/** Exposes the chunk pacer's current rate and flood count for batch-summary logging. */
-export function getChunkRateStats(): { rate: number; floods: number } {
+/** Exposes the chunk pacer's current rate, flood count, and learned ceiling for batch-summary logging. */
+export function getChunkRateStats(): { rate: number; floods: number; ceiling: number | null } {
   return chunkPacer.stats();
 }
 
@@ -321,13 +356,11 @@ export class TelegramClientManager {
       return { message: await this.sendFileLocked(params), hasThumbnail: false };
     }
     const thumbFile = new File([thumb], 'thumb.jpg', { type: thumb.type || 'image/jpeg' });
-    try {
-      const message = await this.sendFileLocked({ ...params, thumb: thumbFile });
-      return { message, hasThumbnail: true };
-    } catch (err) {
-      console.warn('[Thumb] sendFile with thumb failed, retrying without thumb (non-fatal):', err);
-      return { message: await this.sendFileLocked(params), hasThumbnail: false };
-    }
+    // No silent retry-without-thumb: a media file must not land in the drive
+    // without its thumbnail. When a thumb was provided, sending with it MUST
+    // succeed or the whole upload fails (the caller marks the file as errored).
+    const message = await this.sendFileLocked({ ...params, thumb: thumbFile });
+    return { message, hasThumbnail: true };
   }
 
   /**
@@ -651,7 +684,7 @@ export class TelegramClientManager {
       }
       const tThumb = performance.now();
 
-      const uploadedMedia = await client.invoke(new Api.messages.UploadMedia({
+      const uploadMediaReq = new Api.messages.UploadMedia({
         peer: new Api.InputPeerSelf(),
         media: new Api.InputMediaUploadedDocument({
           file: fileHandle,
@@ -660,7 +693,25 @@ export class TelegramClientManager {
           thumb: uploadedThumb as any,
           forceFile: true,
         }),
-      })) as any;
+      });
+      // UploadMedia is a message-class RPC and shares Telegram's message flood
+      // bucket, so pace it through messageRateLimiter (10 per batch would
+      // otherwise fire unthrottled). Retry a few times on FLOOD_WAIT, matching
+      // the SendMultiMedia path.
+      let uploadedMedia: any;
+      for (let attempt = 0; ; attempt++) {
+        await messageRateLimiter.wait();
+        try {
+          uploadedMedia = await client.invoke(uploadMediaReq) as any;
+          break;
+        } catch (err) {
+          if (isFloodError(err) && attempt < CHUNK_RETRY_COUNT - 1) {
+            penalizeForFlood(`UploadMedia(${file.name})`, err);
+            continue;
+          }
+          throw err;
+        }
+      }
       const tMedia = performance.now();
       console.log(`[Perf] prepare ${file.name} (${Math.round(file.size / 1024)}KB): read=${Math.round(tRead - t0)}ms bytes=${Math.round(tBytes - tRead)}ms thumbUp=${Math.round(tThumb - tBytes)}ms uploadMedia=${Math.round(tMedia - tThumb)}ms total=${Math.round(tMedia - t0)}ms`);
 
@@ -818,6 +869,7 @@ export class TelegramClientManager {
     if (messageIds.length === 0) return result;
 
     const messages = await this.client.getMessages("me", { ids: messageIds });
+    const client = this.client;
     const downloadSemaphore = new Semaphore(6);
 
     await Promise.all(
@@ -828,10 +880,34 @@ export class TelegramClientManager {
           const media = msg.media as any;
           const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
           if (!doc?.thumbs?.length) return; // no embedded thumb — nothing to show
+          // Pick the largest real PhotoSize (has a `type`; excludes inline
+          // stripped/cached sizes whose raw bytes aren't a standalone JPEG).
+          const sized = (doc.thumbs as any[]).filter((t) => typeof t.type === 'string' && !t.bytes);
+          const thumb = sized[sized.length - 1];
+          if (!thumb) return;
           try {
-            const buffer = await this.client!.downloadMedia(msg.media, { thumb: doc.thumbs.length - 1 });
-            if (buffer) {
-              result.set(msg.id, new Blob([buffer], { type: 'image/jpeg' }));
+            // Fetch the thumb via GetFile on the MAIN connection with cdnSupported
+            // OFF, instead of downloadMedia — downloadMedia borrows an exported
+            // sender to the file's media DC, and that extra ws-proxied connection
+            // reconnect-loops ("Connection closed while receiving data"). Keeping
+            // thumbnails on the main sender (like the parallel preview path) avoids it.
+            const location = new Api.InputDocumentFileLocation({
+              id: doc.id,
+              accessHash: doc.accessHash,
+              fileReference: doc.fileReference,
+              thumbSize: thumb.type,
+            });
+            const fileResult = await client.invoke(
+              new Api.upload.GetFile({
+                location,
+                offset: BigInt(0) as any,
+                limit: 512 * 1024, // aligned; thumbs are far smaller, EOF truncates
+                precise: false,
+                cdnSupported: false,
+              })
+            ) as any;
+            if (fileResult?.bytes?.length) {
+              result.set(msg.id, new Blob([new Uint8Array(fileResult.bytes)], { type: 'image/jpeg' }));
             }
           } catch (err) {
             console.warn('[Thumb] Batch download failed for message', msg.id, err);
@@ -940,14 +1016,24 @@ export class TelegramClientManager {
       return new Blob([buffer], { type: mimeType });
     }
 
-    // For photos, use downloadMedia directly (Telegram photos don't have direct size property)
+    // Images: download all 512KB chunks in parallel (waitForComplete) instead of
+    // GramJS's sequential 128KB-per-round-trip downloadMedia. Every byte is
+    // relayed through the ws-proxy, so hiding round-trips with pipelined GetFile
+    // requests is the single biggest win for multi-MB previews. Fall back to the
+    // sequential path if the parallel one fails (e.g. a genuine MessageMediaPhoto,
+    // which the chunked path doesn't build a location for).
     if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType.startsWith('image/')) {
-      console.log('[Download] Image file, using downloadMedia...');
-      const buffer = await this.client.downloadMedia(message.media);
-      if (!buffer || buffer.length === 0) {
-        throw new Error("Failed to download file - empty buffer");
+      console.log('[Download] Image file, using parallel chunked download...');
+      try {
+        return await this.downloadFileChunked(message, mimeType, true);
+      } catch (err: any) {
+        console.warn('[Download] Parallel image download failed, falling back to downloadMedia:', err?.message);
+        const buffer = await this.client.downloadMedia(message.media);
+        if (!buffer || buffer.length === 0) {
+          throw new Error("Failed to download file - empty buffer");
+        }
+        return new Blob([buffer], { type: mimeType });
       }
-      return new Blob([buffer], { type: mimeType });
     }
 
     // Try chunked download first (better for large files)
@@ -970,7 +1056,7 @@ export class TelegramClientManager {
   /**
    * Download file using streaming - returns blob immediately for playback while downloading continues.
    */
-  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream'): Promise<Blob> {
+  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream', waitForComplete: boolean = false): Promise<Blob> {
     console.log('[Streaming] Starting streaming download...');
     
     // Extract file location from message media
@@ -1021,12 +1107,16 @@ export class TelegramClientManager {
       thumbSize: "",
     });
 
-    const chunkSemaphore = new Semaphore(4);
+    const chunkSemaphore = new Semaphore(6);
     const client = this.client;
 
     const downloadChunk = async (chunkIndex: number) => {
       const offset = chunkIndex * CHUNK_SIZE;
-      const limit = Math.min(CHUNK_SIZE, fileSize - offset);
+      // upload.GetFile requires `limit` to be 4096-aligned and to divide 1MB, so
+      // the final chunk must NOT be shortened to the exact remaining byte count
+      // (that produced 400 LIMIT_INVALID). Always request a full aligned 512KB —
+      // Telegram returns only the bytes that exist up to EOF.
+      const limit = CHUNK_SIZE;
       const fileResult = await client!.invoke(
         new Api.upload.GetFile({
           location,
@@ -1072,20 +1162,32 @@ export class TelegramClientManager {
       const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // waitForComplete callers (image previews / full downloads) need the
+        // ENTIRE file — returning a partial prefix would be a truncated image,
+        // so surface a timeout error instead and let the caller fall back.
+        if (waitForComplete && !isDownloadComplete) {
+          reject(new Error('Download timeout before completion'));
+          return;
+        }
         console.log('[Streaming] Timeout, returning blob with size:', readyPrefix * CHUNK_SIZE);
         resolve(buildBlob());
-      }, 60000);
+      }, waitForComplete ? 180000 : 60000);
 
       const check = () => {
         if (settled) return;
-        if (downloadError && readyPrefix === 0) {
+        // For full downloads any chunk error is fatal (the blob would have a
+        // hole); for streaming we only bail when nothing at all arrived.
+        if (downloadError && (waitForComplete || readyPrefix === 0)) {
           settled = true;
           clearTimeout(timeoutId);
           reject(downloadError);
           return;
         }
         const readyBytes = Math.min(readyPrefix * CHUNK_SIZE, fileSize);
-        if (readyBytes >= MIN_READY_BYTES || (isDownloadComplete && readyPrefix > 0)) {
+        const ready = waitForComplete
+          ? isDownloadComplete
+          : (readyBytes >= MIN_READY_BYTES || (isDownloadComplete && readyPrefix > 0));
+        if (ready) {
           settled = true;
           clearTimeout(timeoutId);
           console.log('[Streaming] Ready, size:', readyBytes, 'complete:', isDownloadComplete);
@@ -1222,12 +1324,27 @@ export class TelegramClientManager {
       return aIndex - bIndex;
     });
 
-    console.log('[DownloadMerge] Sorted parts:', sortedParts.map(p => ({ idx: (p as any).part_index, msgId: p.telegram_message_id })));
+    // Safety net: a genuine split never reuses a Telegram message across parts,
+    // so collapse any duplicate telegram_message_id down to a single part. This
+    // stops a corrupt split group (e.g. one accidentally registered with the
+    // same message thousands of times) from downloading forever.
+    const seenMessageIds = new Set<number>();
+    const uniqueParts = sortedParts.filter((p) => {
+      const id = p.telegram_message_id;
+      if (id == null || seenMessageIds.has(id)) return false;
+      seenMessageIds.add(id);
+      return true;
+    });
+    if (uniqueParts.length !== sortedParts.length) {
+      console.warn('[DownloadMerge] Dropped', sortedParts.length - uniqueParts.length, 'duplicate-message parts; downloading', uniqueParts.length, 'unique parts');
+    }
+
+    console.log('[DownloadMerge] Sorted parts:', uniqueParts.map(p => ({ idx: (p as any).part_index, msgId: p.telegram_message_id })));
 
     // Download parts with bounded parallelism (order is restored below via the index)
     const partSemaphore = new Semaphore(3);
     const parts: Blob[] = await Promise.all(
-      sortedParts.map((part, i) => partSemaphore.withSlot(async () => {
+      uniqueParts.map((part, i) => partSemaphore.withSlot(async () => {
         const messageId = part.telegram_message_id;
         console.log('[DownloadMerge] Downloading part', i, 'messageId:', messageId);
         if (!messageId) {

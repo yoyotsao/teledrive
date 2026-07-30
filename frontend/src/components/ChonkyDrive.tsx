@@ -7,7 +7,7 @@ import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { MAX_CONCURRENT_FILES, ALBUM_BATCH } from '../config';
-import { planUploads, registerDuplicateParts, hashFileBounded, PlannedFile } from '../lib/uploadPlanner';
+import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, PlannedFile } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { ContextMenu, MenuItem } from './ContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -70,6 +70,17 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+/**
+ * Media eligible for Telegram album grouping (messages.SendMultiMedia).
+ * webp is EXCLUDED: Telegram rejects webp documents in albums with
+ * MEDIA_EMPTY, and the album fallback drops the thumbnail — so every webp sent
+ * this way landed with has_thumbnail=0 (DB-confirmed: 0/84). webp instead takes
+ * the single-file sendFile path, which embeds the thumb reliably.
+ */
+function isAlbumEligibleMedia(file: File): boolean {
+  return isMediaFile(file) && file.type !== 'image/webp';
 }
 
 /**
@@ -155,6 +166,10 @@ function createAlbumPipeline(fileSemaphore: Semaphore) {
         const p = fileSemaphore.withSlot(async () => {
           const tSlot = performance.now();
           const thumb = await captureThumb(file);
+          // The album path only ever handles media files, which MUST carry a
+          // thumbnail — a null capture (even after retries) fails the upload
+          // rather than silently landing a thumbless file in the drive.
+          if (!thumb) throw new Error(`Thumbnail capture failed for ${file.name}`);
           const tThumb = performance.now();
           const prepared = await telegramClient.prepareAlbumFile(file, thumb);
           console.log(`[Perf] enqueue ${file.name}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
@@ -633,14 +648,10 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
         if (hashCheck.found && hashCheck.files.length > 0) {
           console.log('[Upload] Duplicate detected by hash, skipping Telegram upload for:', file.name);
           onProgress?.(100);
-          const asExisting = hashCheck.files.map((f) => ({
-            filesize: f.filesize,
-            mime_type: f.mime_type,
-            telegram_message_id: f.telegram_message_id!,
-            access_hash: f.access_hash,
-            part_index: f.part_index,
-            has_thumbnail: f.has_thumbnail,
-          }));
+          // Collapse to the canonical part set — /check-hash returns every row
+          // sharing the hash (including prior dedup rows), and registering one
+          // new row per returned row doubles the count on each re-upload.
+          const asExisting = canonicalExistingParts(hashCheck.files);
           await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
           console.log('[Upload] Dedup: registered', asExisting.length, 'parts from existing upload');
           return {
@@ -655,6 +666,12 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     }
 
     const thumbBlob = await thumbPromise;
+    // Media files must carry a thumbnail — if capture failed (even after retries)
+    // the upload fails instead of registering a thumbless media file. Non-media
+    // files legitimately have no thumbnail.
+    if (isMediaFile(file) && !thumbBlob) {
+      throw new Error(`Thumbnail capture failed for ${file.name}`);
+    }
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
     const uploadResult = await telegramClient.uploadFileSplit(file, onProgress, thumbBlob);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
@@ -785,7 +802,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     const albumEligible: PlannedFile[] = [];
     const singleFileOnly: PlannedFile[] = [];
     plan.fresh.forEach((p) => {
-      if (isMediaFile(p.file) && p.file.size <= SINGLE_PATH_SIZE_LIMIT) {
+      if (isAlbumEligibleMedia(p.file) && p.file.size <= SINGLE_PATH_SIZE_LIMIT) {
         albumEligible.push(p);
       } else {
         singleFileOnly.push(p);
@@ -829,8 +846,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     await Promise.allSettled([...duplicatePromises, ...singlePromises, ...albumFilePromises, albumPipeline.flush()]);
 
-    const { rate, floods } = getChunkRateStats();
-    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} parts/s`);
+    const { rate, floods, ceiling } = getChunkRateStats();
+    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} ceiling=${ceiling?.toFixed(1) ?? 'none'} parts/s`);
 
     loadContents();
   };
@@ -909,6 +926,32 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       return p;
     };
 
+    // Files already present in a destination folder (keyed by filename → filesize),
+    // fetched at most once per folder path. Lets us skip re-uploading a folder that
+    // already exists without hashing/checking/registering each file — a same
+    // name+size file in the target folder is treated as already uploaded.
+    const folderFilesCache = new Map<string, Promise<Map<string, number>>>();
+    const existingFolderFiles = (path: string): Promise<Map<string, number>> => {
+      if (folderFilesCache.has(path)) return folderFilesCache.get(path)!;
+      const p = (async () => {
+        const map = new Map<string, number>();
+        const folderId = await ensureFolder(path);
+        if (!folderId) return map;
+        const PAGE_SIZE = 1000;
+        for (let page = 1; ; page++) {
+          const res = await api.listFiles(page, PAGE_SIZE, folderId).catch(() => null);
+          if (!res || res.files.length === 0) break;
+          for (const f of res.files) {
+            if (!f.isDir) map.set(f.filename, f.filesize);
+          }
+          if (res.files.length < PAGE_SIZE || page * PAGE_SIZE >= res.total) break;
+        }
+        return map;
+      })();
+      folderFilesCache.set(path, p);
+      return p;
+    };
+
     let discovered = 0;
     let completed = 0;
     let failed = 0;
@@ -943,6 +986,11 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     }> => {
       const telegramClient = getTelegramClient();
       const thumbBlob = await captureThumb(file);
+      // Media files must carry a thumbnail — fail rather than register a
+      // thumbless media file. Non-media files legitimately have none.
+      if (isMediaFile(file) && !thumbBlob) {
+        throw new Error(`Thumbnail capture failed for ${file.name}`);
+      }
       const uploadResult = await telegramClient.uploadFileSplit(file, undefined, thumbBlob);
       return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
     };
@@ -956,7 +1004,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     ): Promise<void> => {
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       await Promise.all(parts.map((part, j) =>
-        api.registerFile({
+        registerFileBounded({
           filename: file.name,
           filesize: part.size,
           mimeType: file.type || undefined,
@@ -1017,20 +1065,25 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
             updateUI();
             const folderPath = basePath.replace(/\/$/, '');
             const discoveryPromise = (async (): Promise<void> => {
+              // Fast path: if a file with the same name+size already lives in the
+              // destination folder, it's already uploaded — skip entirely (no
+              // hash, no check-hash, no register). Makes re-uploading an existing
+              // folder nearly free instead of a per-file request storm.
+              const alreadyThere = await existingFolderFiles(folderPath);
+              if (alreadyThere.get(file.name) === file.size) {
+                completed++;
+                updateVisible(file.name, { progress: 100, status: 'complete' });
+                updateUI();
+                return;
+              }
               const fileHash = await hashFileBounded(file);
               if (fileHash) {
-                const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] as FileInfo[] }));
+                const hashCheck = await checkFileHashBounded(fileHash);
                 if (hashCheck.found && hashCheck.files.length > 0) {
                   console.log('[Upload] Duplicate detected by hash (folder upload):', file.name);
                   const folderId = await ensureFolder(folderPath);
-                  const asExisting = hashCheck.files.map((f) => ({
-                    filesize: f.filesize,
-                    mime_type: f.mime_type,
-                    telegram_message_id: f.telegram_message_id!,
-                    access_hash: f.access_hash,
-                    part_index: f.part_index,
-                    has_thumbnail: f.has_thumbnail,
-                  }));
+                  // Collapse to canonical parts — see the drag/picker dedup path.
+                  const asExisting = canonicalExistingParts(hashCheck.files);
                   await registerDuplicateParts(file, fileHash, asExisting, folderId);
                   completed++;
                   updateVisible(file.name, { progress: 100, status: 'complete' });
@@ -1038,7 +1091,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   return;
                 }
               }
-              if (isMediaFile(file) && file.size <= SMALL_FILE_LIMIT) {
+              if (isAlbumEligibleMedia(file) && file.size <= SMALL_FILE_LIMIT) {
                 const folderId = await ensureFolder(folderPath);
                 const uploadPromise = albumPipeline.enqueue(file, fileHash, folderId, (pct) => { updateVisible(file.name, { progress: pct }); updateUI(); })
                   .then((res) => {
@@ -1097,8 +1150,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     await albumPipeline.flush();
     await Promise.allSettled(uploadPromises);
 
-    const { rate, floods } = getChunkRateStats();
-    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} parts/s`);
+    const { rate, floods, ceiling } = getChunkRateStats();
+    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} ceiling=${ceiling?.toFixed(1) ?? 'none'} parts/s`);
 
     updateUI();
     loadContents();

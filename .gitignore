@@ -91,9 +91,6 @@ playwright-report/
 .session_string.txt
 *.session
 
-# Thumbnail cache (generated at runtime by backend)
-backend/thumbnails/
-
 # Test/debug upload binaries
 *.bin
 

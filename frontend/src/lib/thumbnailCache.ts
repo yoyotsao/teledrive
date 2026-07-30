@@ -1,7 +1,11 @@
 const DB_NAME = 'teledrive-thumbnails';
 const STORE_NAME = 'thumbs';
-const MAX_ENTRIES = 500;
-const EVICT_COUNT = 100;
+// A single folder can hold thousands of images; at 500 the cache thrashed —
+// scrolling evicted thumbnails faster than they were viewed, so previously-seen
+// tiles kept re-downloading (and intermittently failing to reappear). Thumbs are
+// a few KB each, so 5000 entries is only tens of MB of IndexedDB.
+const MAX_ENTRIES = 5000;
+const EVICT_COUNT = 500;
 
 // Reuse a single connection instead of opening/closing IndexedDB on every get/set —
 // matters now that thumbnail loading fans out several parallel requests per folder.

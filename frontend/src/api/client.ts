@@ -110,14 +110,6 @@ export const api = {
     return response.data;
   },
 
-  getThumbnail: async (fileId: string): Promise<string | null> => {
-    const response = await client.get<{ thumbnail: string; mime_type: string }>(`/files/${fileId}/thumbnail`);
-    if (response.data && response.data.thumbnail) {
-      return `data:${response.data.mime_type};base64,${response.data.thumbnail}`;
-    }
-    return null;
-  },
-
   moveFile: async (fileId: string, newParentId: string | null): Promise<FileInfo> => {
     const response = await client.patch<FileInfo>(`/files/${fileId}`, {
       parent_id: newParentId,

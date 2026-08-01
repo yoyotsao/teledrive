@@ -10,8 +10,10 @@ FastAPI application for:
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
 import sys
@@ -143,10 +145,35 @@ async def root():
 
 
 # Exception handlers
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler_with_logging(
+    request: Request, exc: StarletteHTTPException
+):
+    """Log every 5xx HTTPException with the traceback of what actually failed.
+
+    Routes report internal errors as `raise HTTPException(500, str(e))` from inside an
+    `except` block. That strips the traceback from the response but Python still keeps
+    the original exception on `__context__`, so we can recover it here instead of
+    adding a logger call to all 14 raise sites (and every future one).
+
+    Without this, a 500 leaves nothing behind but a uvicorn access line: 199 of them on
+    2026-08-01 turned out to be a dead `./backend` bind mount, and the only trace of
+    `unable to open database file` was in the response body sent to the browser.
+    """
+    if exc.status_code >= 500:
+        original = exc.__cause__ or exc.__context__
+        logger.opt(exception=original or exc).error(
+            f"{exc.status_code} on {request.method} {request.url.path}: {exc.detail}"
+        )
+    return await http_exception_handler(request, exc)
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler."""
-    logger.error(f"Unhandled exception: {exc}")
+    logger.opt(exception=exc).error(
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}"
+    )
     return JSONResponse(
         status_code=500, content={"error": "Internal server error", "detail": str(exc)}
     )

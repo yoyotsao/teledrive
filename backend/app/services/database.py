@@ -4,13 +4,23 @@ SQLite database module for persistent file metadata storage.
 
 import aiosqlite
 import json
+import os
 from datetime import datetime
 from typing import Optional, List, Tuple
 from pathlib import Path
 from loguru import logger
 
-# Database path (stored in backend folder)
-DB_PATH = Path(__file__).parent.parent.parent / "teledrive.db"
+# Database path. Under Docker this MUST point at a named volume (see
+# TELEDRIVE_DB_PATH in docker-compose.yml), never at the ./backend bind mount:
+# SQLite on Docker Desktop's Windows→Linux file-sharing layer dies with
+# `sqlite3.OperationalError: disk I/O error` during bulk-upload write bursts,
+# taking every DB-backed endpoint down until Docker Desktop is restarted.
+# The fallback keeps host-side tooling (generate_session.py, backend/scripts/)
+# working unchanged.
+DB_PATH = Path(
+    os.environ.get("TELEDRIVE_DB_PATH")
+    or Path(__file__).parent.parent.parent / "teledrive.db"
+)
 
 # Whitelist mapping API sort keys → SQL columns. NEVER interpolate user input
 # into SQL; only values from this dict reach the query string.

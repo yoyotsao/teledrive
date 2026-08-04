@@ -241,14 +241,28 @@ class FileService:
         file_type = self._detect_file_type(mime_type, filename)
         created_at = datetime.utcnow()
 
-        # Replace existing file with same name+parent (non-split only; split parts are each unique).
-        # find_file_by_name_and_parent excludes trashed rows, so a same-named file sitting in the
-        # trash is left alone here and stays restorable.
-        if not is_split_file:
-            existing = await db.find_file_by_name_and_parent(filename, parent_id, telegram_user_id=telegram_user_id)
-            if existing:
-                logger.info(f"Replacing existing file: {filename}, old file_id: {existing['file_id']}")
-                await db.delete_file(existing['file_id'])
+        # Replace any live file with the same name+parent — split uploads included.
+        # Split files used to be skipped here, which is how one folder accumulated the
+        # same multi-GB video five or six times: every re-upload appended a whole new
+        # part group instead of replacing the old one. The incoming group is excluded so
+        # sibling parts don't delete each other, and only the first part runs the sweep
+        # (one query per upload instead of one per part; the result is the same either way).
+        # find_files_by_name_and_parent excludes trashed rows, so a same-named file sitting
+        # in the trash is left alone here and stays restorable.
+        if part_index in (None, 0):
+            stale = await db.find_files_by_name_and_parent(
+                filename,
+                parent_id,
+                telegram_user_id=telegram_user_id,
+                exclude_split_group_id=split_group_id,
+            )
+            if stale:
+                old_groups = sorted({r.get('split_group_id') or r['file_id'] for r in stale})
+                logger.info(
+                    f"Replacing existing file: {filename}, {len(stale)} row(s) "
+                    f"in {len(old_groups)} group(s): {old_groups}"
+                )
+                await db.delete_files_by_ids([r['file_id'] for r in stale])
 
         file_info = FileInfo(
             file_id=file_id,

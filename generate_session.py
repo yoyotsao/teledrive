@@ -82,7 +82,7 @@ def main():
     
     # Import and run telethon
     from telethon import TelegramClient
-    from telethon.session import StringSession
+    from telethon.sessions import StringSession
     
     # Create session without connecting - just need phone to initialize
     client = TelegramClient(

@@ -277,6 +277,41 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
+    async def find_files_by_name_and_parent(
+        self,
+        filename: str,
+        parent_id: Optional[str],
+        telegram_user_id: int = 0,
+        exclude_split_group_id: Optional[str] = None,
+    ) -> List[dict]:
+        """Find EVERY live non-directory row with this filename+parent (for replace-on-duplicate).
+
+        Unlike find_file_by_name_and_parent this returns all matches, because a split
+        upload occupies one row per part and replacing it means removing the whole group.
+        `exclude_split_group_id` keeps the caller's own in-flight group out of the result —
+        without it, part 2 of an upload would delete part 1. Rows with a NULL
+        split_group_id are never excluded; they always belong to an earlier upload.
+        """
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+
+        clauses = ["filename = ?", "isDir = 0", "telegram_user_id = ?", "trashed_at IS NULL"]
+        params: List[object] = [filename, telegram_user_id]
+        if parent_id is None:
+            clauses.append("parent_id IS NULL")
+        else:
+            clauses.append("parent_id = ?")
+            params.append(parent_id)
+        if exclude_split_group_id is not None:
+            clauses.append("(split_group_id IS NULL OR split_group_id != ?)")
+            params.append(exclude_split_group_id)
+
+        cursor = await self._conn.execute(
+            f"SELECT * FROM files WHERE {' AND '.join(clauses)}", params
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def find_folder_by_name_and_parent(self, name: str, parent_id: Optional[str], telegram_user_id: int = 0) -> Optional[dict]:
         """Find a folder by name and parent_id (for reuse-on-duplicate logic)."""
         if not self._conn:

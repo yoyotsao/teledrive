@@ -7,7 +7,7 @@ import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { MAX_CONCURRENT_FILES, ALBUM_BATCH } from '../config';
-import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, PlannedFile } from '../lib/uploadPlanner';
+import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, PlannedFile, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { ContextMenu, MenuItem } from './ContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -1033,6 +1033,15 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
     const albumPipeline = createAlbumPipeline(fileSemaphore);
 
+    // Batch-scoped content dedup. The folder walk streams files, so planUploads'
+    // upfront hash grouping can't be used here: two identical files both miss
+    // /check-hash (neither is registered yet) and each uploads its own copy —
+    // that is how a single folder ended up holding 110 physical copies of the
+    // same 324KB image under 110 different names. The first file to claim a hash
+    // uploads for real and publishes its parts here; every later file with that
+    // hash registers against those parts instead of re-uploading.
+    const claimedHashes = new Map<string, Promise<RegisterableExistingPart[] | null>>();
+
     // Discovery promises track routing decisions (hash check, dedup, enqueue)
     // for every discovered file — settling means no more files will be added
     // to albumPipeline or uploadPromises. Upload promises track the actual
@@ -1091,39 +1100,102 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   return;
                 }
               }
-              if (isAlbumEligibleMedia(file) && file.size <= SMALL_FILE_LIMIT) {
-                const folderId = await ensureFolder(folderPath);
-                const uploadPromise = albumPipeline.enqueue(file, fileHash, folderId, (pct) => { updateVisible(file.name, { progress: pct }); updateUI(); })
-                  .then((res) => {
-                    if (res) {
-                      completed++;
-                      updateVisible(file.name, { progress: 100, status: 'complete' });
-                    } else {
+              // Claim this hash for the batch, or fall in behind whoever claimed it
+              // first. The get/set pair stays synchronous so two concurrent
+              // discoveries of the same content can never both claim.
+              const claim: { publish: (parts: RegisterableExistingPart[] | null) => void } = { publish: () => {} };
+              if (fileHash) {
+                const claimed = claimedHashes.get(fileHash);
+                if (claimed) {
+                  console.log('[Upload] Duplicate detected within batch (folder upload):', file.name);
+                  const folderId = await ensureFolder(folderPath);
+                  // Queued as an upload promise instead of awaited here: waiting on
+                  // the claim inside a discovery promise would deadlock the album
+                  // pipeline, whose tail batch is only flushed once discovery settles.
+                  uploadPromises.push((async () => {
+                    const parts = await claimed;
+                    if (!parts || parts.length === 0) {
+                      failed++;
+                      updateVisible(file.name, { progress: 0, status: 'error', error: '來源檔案上傳失敗' });
+                      updateUI();
+                      return;
+                    }
+                    await registerDuplicateParts(file, fileHash, parts, folderId);
+                    completed++;
+                    updateVisible(file.name, { progress: 100, status: 'complete' });
+                    updateUI();
+                  })().catch(() => {
+                    failed++;
+                    updateVisible(file.name, { progress: 0, status: 'error', error: '註冊失敗' });
+                    updateUI();
+                  }));
+                  return;
+                }
+                claimedHashes.set(
+                  fileHash,
+                  new Promise<RegisterableExistingPart[] | null>((resolve) => { claim.publish = resolve; }),
+                );
+              }
+
+              // Past the claim, every path must settle it — files queued behind an
+              // unresolved claim would wait forever.
+              try {
+                if (isAlbumEligibleMedia(file) && file.size <= SMALL_FILE_LIMIT) {
+                  const folderId = await ensureFolder(folderPath);
+                  const uploadPromise = albumPipeline.enqueue(file, fileHash, folderId, (pct) => { updateVisible(file.name, { progress: pct }); updateUI(); })
+                    .then((res) => {
+                      if (res) {
+                        claim.publish([{
+                          filesize: file.size,
+                          mime_type: file.type || null,
+                          telegram_message_id: res.message_id,
+                          access_hash: res.access_hash,
+                          part_index: 0,
+                          has_thumbnail: res.has_thumbnail,
+                        }]);
+                        completed++;
+                        updateVisible(file.name, { progress: 100, status: 'complete' });
+                      } else {
+                        claim.publish(null);
+                        failed++;
+                        updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
+                      }
+                      updateUI();
+                    }).catch(() => {
+                      claim.publish(null);
                       failed++;
                       updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-                    }
+                      updateUI();
+                    });
+                  uploadPromises.push(uploadPromise);
+                  return;
+                }
+                const folderId = await ensureFolder(folderPath);
+                const uploadPromise = fileSemaphore.withSlot(() => uploadFileEntryFresh(file))
+                  .then(async (result) => {
+                    await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
+                    claim.publish(result.parts.map((part, j) => ({
+                      filesize: part.size,
+                      mime_type: file.type || null,
+                      telegram_message_id: part.message_id,
+                      access_hash: part.access_hash,
+                      part_index: j,
+                      has_thumbnail: j === 0 && result.hasThumbnail,
+                    })));
+                    completed++;
+                    updateVisible(file.name, { progress: 100, status: 'complete' });
                     updateUI();
                   }).catch(() => {
+                    claim.publish(null);
                     failed++;
                     updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
                     updateUI();
                   });
                 uploadPromises.push(uploadPromise);
-                return;
+              } catch (err) {
+                claim.publish(null);
+                throw err;
               }
-              const folderId = await ensureFolder(folderPath);
-              const uploadPromise = fileSemaphore.withSlot(() => uploadFileEntryFresh(file))
-                .then(async (result) => {
-                  await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
-                  completed++;
-                  updateVisible(file.name, { progress: 100, status: 'complete' });
-                  updateUI();
-                }).catch(() => {
-                  failed++;
-                  updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-                  updateUI();
-                });
-              uploadPromises.push(uploadPromise);
             })();
             discoveryPromises.push(discoveryPromise);
             resolve();

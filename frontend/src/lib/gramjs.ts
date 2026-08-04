@@ -87,9 +87,24 @@ const messageRateLimiter = new RateLimiter(MESSAGE_SENDS_PER_SECOND, MESSAGE_SEN
 // requests onto the flood.
 const FLOOD_PENALTY_MS = 10_000;
 
-function isFloodError(err: unknown): boolean {
+function floodText(err: unknown): string {
   const e = err as { errorMessage?: string; message?: string } | null;
-  return `${e?.errorMessage ?? ''} ${e?.message ?? ''}`.includes('FLOOD');
+  return `${e?.errorMessage ?? ''} ${e?.message ?? ''}`;
+}
+
+function isFloodError(err: unknown): boolean {
+  return floodText(err).includes('FLOOD');
+}
+
+/**
+ * FLOOD_PREMIUM_WAIT means "this account's upload tier is capped" — not
+ * "you are sending too fast". Slowing down does not reduce it (verified: it
+ * still fires thousands of times at the 0.5 parts/s floor, and the official
+ * Telegram Desktop client hits the same wall), so it must not drive the
+ * pacer's rate cut or ceiling memory — only a wait.
+ */
+function isPremiumFloodError(err: unknown): boolean {
+  return floodText(err).includes('PREMIUM');
 }
 
 function penalizeForFlood(label: string, err: unknown): void {
@@ -173,8 +188,13 @@ async function sendFilePartGated(
       if (isFloodError(err)) {
         if (++floodRetries > 10) throw err;
         const seconds = (err as { seconds?: number } | null)?.seconds;
-        console.warn(`[GramJS] ${label} hit FLOOD_WAIT`);
-        chunkPacer.reportFlood(seconds);
+        console.warn(`[GramJS] ${label} flood: ${floodText(err).trim()} (seconds=${seconds})`);
+        if (isPremiumFloodError(err)) {
+          // Account-tier cap — wait it out at full rate, don't self-throttle.
+          chunkPacer.pause(seconds);
+        } else {
+          chunkPacer.reportFlood(seconds);
+        }
         continue;
       }
       if (sender && sender.isConnected && !sender.isConnected()) {

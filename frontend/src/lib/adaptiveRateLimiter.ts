@@ -126,25 +126,6 @@ export class AdaptiveRateLimiter {
             return rate;
           }
         }
-        // Migration: fall back to the legacy v1 key (rate only, no ceiling) so
-        // users don't all reset to the aggressive default and flood once.
-        if (storageKey.endsWith('_v2')) {
-          const legacyRaw = window.localStorage.getItem(storageKey.replace(/_v2$/, '_v1'));
-          if (legacyRaw) {
-            const legacy = JSON.parse(legacyRaw) as { rate?: number; updatedAt?: number };
-            if (
-              typeof legacy.rate === 'number' &&
-              typeof legacy.updatedAt === 'number' &&
-              Date.now() - legacy.updatedAt < PERSIST_MAX_AGE_MS
-            ) {
-              const rate = clampRate(legacy.rate * PERSIST_LOAD_DISCOUNT);
-              console.log(
-                `[Perf][${label ?? 'RateLimiter'}] init rate=${rate.toFixed(1)} parts/s ceiling=none (source=storage-v1)`,
-              );
-              return rate;
-            }
-          }
-        }
       } catch {
         // ignore malformed/inaccessible storage, fall through to default
       }
@@ -186,6 +167,27 @@ export class AdaptiveRateLimiter {
     if (delay > 0) {
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
+  }
+
+  /**
+   * Halt the feed for `seconds` without touching rate, ceiling, or lastFloodAt.
+   *
+   * For server-side limits that are NOT "you are sending too fast" — chiefly
+   * FLOOD_PREMIUM_WAIT, an account-tier upload cap. Cutting the rate cannot
+   * make those go away (observed: thousands of them at the 0.5 parts/s floor),
+   * so reacting with a rate cut only compounds Telegram's throttle with our
+   * own, and — because the cut is persisted — keeps us slow for hours after
+   * Telegram has stopped throttling. Waiting out the window at full rate is
+   * the only response that helps.
+   */
+  pause(seconds?: number): void {
+    const waitSeconds = typeof seconds === 'number' && seconds > 0 ? seconds : 10;
+    this.pauseUntil(Date.now() + waitSeconds * 1000 + 1000);
+  }
+
+  private pauseUntil(until: number): void {
+    this.penaltyUntil = Math.max(this.penaltyUntil, until);
+    this.nextSlotAt = Math.max(this.nextSlotAt, this.penaltyUntil);
   }
 
   /** Multiplicative decrease + halt feed until the penalty window elapses. */
@@ -241,8 +243,7 @@ export class AdaptiveRateLimiter {
       }
       this.persist(true);
     }
-    this.penaltyUntil = Math.max(this.penaltyUntil, now + waitSeconds * 1000 + 1000);
-    this.nextSlotAt = Math.max(this.nextSlotAt, this.penaltyUntil);
+    this.pauseUntil(now + waitSeconds * 1000 + 1000);
   }
 
   /** Additive increase, gated by a clean window since the last flood. */

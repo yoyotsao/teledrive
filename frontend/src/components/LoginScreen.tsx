@@ -14,9 +14,38 @@ type PhoneStep = 'phone' | 'code' | 'password';
 const API_ID = parseInt(import.meta.env.VITE_TELEGRAM_API_ID || '0');
 const API_HASH = import.meta.env.VITE_TELEGRAM_API_HASH || '';
 
-export default function LoginScreen({ onLogin }: Props) {
+/**
+ * Just the QR/phone tabs, no page chrome. Exported so the settings dialog can
+ * reuse the exact same session-acquisition flow when linking a second account
+ * instead of keeping a second copy of the QR logic.
+ */
+export function SessionTabs({ onLogin }: Props) {
   const [tab, setTab] = useState<Tab>('qr');
 
+  return (
+    <>
+      <div style={{ display: 'flex', gap: 0, marginBottom: 28, borderBottom: '1px solid #e5e7eb' }}>
+        {(['qr', 'phone'] as Tab[]).map((t) => (
+          <button key={t} onClick={() => setTab(t)} style={{
+            flex: 1, padding: '8px 0', border: 'none', background: 'none',
+            fontWeight: tab === t ? 600 : 400,
+            color: tab === t ? '#2563eb' : '#6b7280',
+            borderBottom: tab === t ? '2px solid #2563eb' : '2px solid transparent',
+            cursor: 'pointer', fontSize: 14,
+          }}>
+            {t === 'qr' ? '掃描 QR Code' : '手機號碼'}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'qr'
+        ? <QRTab onLogin={onLogin} apiId={API_ID} apiHash={API_HASH} />
+        : <PhoneTab onLogin={onLogin} apiId={API_ID} apiHash={API_HASH} />}
+    </>
+  );
+}
+
+export default function LoginScreen({ onLogin }: Props) {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -30,24 +59,7 @@ export default function LoginScreen({ onLogin }: Props) {
         <p style={{ margin: '0 0 28px', color: '#6b7280', fontSize: 13 }}>
           使用 Telegram 帳號登入
         </p>
-
-        <div style={{ display: 'flex', gap: 0, marginBottom: 28, borderBottom: '1px solid #e5e7eb' }}>
-          {(['qr', 'phone'] as Tab[]).map((t) => (
-            <button key={t} onClick={() => setTab(t)} style={{
-              flex: 1, padding: '8px 0', border: 'none', background: 'none',
-              fontWeight: tab === t ? 600 : 400,
-              color: tab === t ? '#2563eb' : '#6b7280',
-              borderBottom: tab === t ? '2px solid #2563eb' : '2px solid transparent',
-              cursor: 'pointer', fontSize: 14,
-            }}>
-              {t === 'qr' ? '掃描 QR Code' : '手機號碼'}
-            </button>
-          ))}
-        </div>
-
-        {tab === 'qr'
-          ? <QRTab onLogin={onLogin} apiId={API_ID} apiHash={API_HASH} />
-          : <PhoneTab onLogin={onLogin} apiId={API_ID} apiHash={API_HASH} />}
+        <SessionTabs onLogin={onLogin} />
       </div>
     </div>
   );

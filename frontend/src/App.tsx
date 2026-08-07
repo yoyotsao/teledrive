@@ -3,6 +3,7 @@ import './theme.css';
 import { ChonkyDrive } from './components/ChonkyDrive';
 import SessionConfig from './components/SessionConfig';
 import LoginScreen from './components/LoginScreen';
+import SettingsDialog from './components/SettingsDialog';
 import { Sidebar } from './components/Sidebar';
 import { SearchBox } from './components/SearchBox';
 import { useUrlState } from './hooks/useUrlState';
@@ -21,6 +22,7 @@ const API_HASH = import.meta.env.VITE_TELEGRAM_API_HASH || '';
 function App() {
   const [authState, setAuthState] = useState<AuthState>('loading');
   const [userName, setUserName] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
   const url = useUrlState();
   const { theme, toggleTheme } = useTheme();
 
@@ -112,6 +114,12 @@ function App() {
           }}>
             {theme === 'dark' ? '☀️' : '🌙'}
           </button>
+          <button onClick={() => setShowSettings(true)} title="設定 / Telegram 帳號" style={{
+            padding: '6px 10px', border: '1px solid var(--td-border)', borderRadius: 6,
+            background: 'var(--td-surface)', fontSize: 16, cursor: 'pointer', color: 'var(--td-text)',
+          }}>
+            ⚙️
+          </button>
           {userName && <span style={{ fontSize: 13, color: 'var(--td-text)' }}>{userName}</span>}
           <button onClick={handleLogout} style={{
             padding: '6px 14px', border: '1px solid var(--td-border)', borderRadius: 6,
@@ -121,6 +129,8 @@ function App() {
           </button>
         </div>
       </header>
+
+      {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
 
       <SessionConfig />
 

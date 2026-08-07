@@ -37,6 +37,13 @@ async function withTimeoutRetry<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+export interface LinkedAccount {
+  telegram_user_id: number;
+  label: string | null;
+  is_primary: number;
+  file_count: number;
+}
+
 export interface ChallengeResponse {
   nonce: string;
   bot_username: string;
@@ -53,6 +60,26 @@ export const api = {
   verifyChallenge: async (nonce: string): Promise<LoginResponse | null> => {
     const response = await client.post<LoginResponse>('/auth/verify', { nonce });
     return response.status === 202 ? null : response.data;
+  },
+
+  listAccounts: async (): Promise<LinkedAccount[]> => {
+    const response = await client.get<{ accounts: LinkedAccount[] }>('/accounts');
+    return response.data.accounts;
+  },
+
+  requestAccountChallenge: async (): Promise<ChallengeResponse> => {
+    const response = await client.post<ChallengeResponse>('/accounts/challenge');
+    return response.data;
+  },
+
+  /** Returns null while the backend hasn't seen the nonce arrive at the bot yet. */
+  verifyAccount: async (nonce: string): Promise<LinkedAccount | null> => {
+    const response = await client.post<LinkedAccount>('/accounts/verify', { nonce });
+    return response.status === 202 ? null : response.data;
+  },
+
+  unlinkAccount: async (telegramUserId: number): Promise<void> => {
+    await client.delete(`/accounts/${telegramUserId}`);
   },
   listFiles: async (
     page: number = 1,

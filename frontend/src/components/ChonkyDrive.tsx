@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
-import { getTelegramClient, getChunkRateStats, PreparedAlbumFile, AlbumFileResult } from '../lib/gramjs';
+import { getPrimaryClient, getAllClients, PreparedAlbumFile, AlbumFileResult } from '../lib/gramjs';
 import { captureThumb, isMediaFile } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
@@ -72,6 +72,14 @@ function formatFileSize(bytes: number): string {
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
+/** One line per account — each learns its own ceiling, so a shared number would hide which one is throttled. */
+function logChunkRates(what: string): void {
+  for (const client of getAllClients()) {
+    const { rate, floods, ceiling } = client.getChunkRateStats();
+    console.log(`[Perf] ${what} account=${client.accountId}: floods=${floods} finalRate=${rate.toFixed(1)} ceiling=${ceiling?.toFixed(1) ?? 'none'} parts/s`);
+  }
+}
+
 /**
  * Media eligible for Telegram album grouping (messages.SendMultiMedia).
  * webp is EXCLUDED: Telegram rejects webp documents in albums with
@@ -94,7 +102,7 @@ function isAlbumEligibleMedia(file: File): boolean {
  * instead of idling on message sends or backend registration round trips.
  */
 function createAlbumPipeline(fileSemaphore: Semaphore) {
-  const telegramClient = getTelegramClient();
+  const telegramClient = getPrimaryClient();
 
   type PendingEntry = {
     prepared: PreparedAlbumFile;
@@ -297,7 +305,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     // 2. Cache misses → one getMessages round trip for the whole batch, then parallel downloadMedia
     const messageIdToFile = new Map(misses.map((f) => [f.telegram_message_id!, f]));
     try {
-      const blobs = await getTelegramClient().downloadThumbnails(Array.from(messageIdToFile.keys()));
+      const blobs = await getPrimaryClient().downloadThumbnails(Array.from(messageIdToFile.keys()));
       for (const [messageId, blob] of blobs) {
         const file = messageIdToFile.get(messageId);
         if (!file || signal?.aborted) continue;
@@ -633,7 +641,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     fileHash: string | null;
     alreadyRegistered: boolean;
   }> => {
-    const telegramClient = getTelegramClient();
+    const telegramClient = getPrimaryClient();
 
     // Start thumbnail capture NOW from the local file so it runs concurrently with
     // the dedup check. Capturing a frame from a local file takes < 1 second
@@ -846,8 +854,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     await Promise.allSettled([...duplicatePromises, ...singlePromises, ...albumFilePromises, albumPipeline.flush()]);
 
-    const { rate, floods, ceiling } = getChunkRateStats();
-    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} ceiling=${ceiling?.toFixed(1) ?? 'none'} parts/s`);
+    logChunkRates('batch done');
 
     loadContents();
   };
@@ -984,7 +991,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>;
       hasThumbnail: boolean;
     }> => {
-      const telegramClient = getTelegramClient();
+      const telegramClient = getPrimaryClient();
       const thumbBlob = await captureThumb(file);
       // Media files must carry a thumbnail — fail rather than register a
       // thumbless media file. Non-media files legitimately have none.
@@ -1222,8 +1229,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     await albumPipeline.flush();
     await Promise.allSettled(uploadPromises);
 
-    const { rate, floods, ceiling } = getChunkRateStats();
-    console.log(`[Perf] batch done: floods=${floods} finalRate=${rate.toFixed(1)} ceiling=${ceiling?.toFixed(1) ?? 'none'} parts/s`);
+    logChunkRates('batch done');
 
     updateUI();
     loadContents();

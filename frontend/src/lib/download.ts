@@ -1,9 +1,9 @@
-import { getTelegramClient } from './gramjs';
+import { getPrimaryClient } from './gramjs';
 import { FileInfo } from '../types';
 
 // Fetch a file's full bytes from Telegram (handles split files).
 export async function fetchFileBlob(file: FileInfo): Promise<Blob> {
-  const telegramClient = getTelegramClient();
+  const telegramClient = getPrimaryClient();
   const mimeType = file.mime_type || 'application/octet-stream';
   if (file.is_split_file && file.split_group_id) {
     return telegramClient.downloadFileMerge(file.split_group_id, mimeType);

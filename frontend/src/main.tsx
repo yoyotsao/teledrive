@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import { getTelegramClient } from './lib/gramjs';
+import { getPrimaryClient } from './lib/gramjs';
 
 // Global state for keepalive mechanism
 let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
@@ -26,7 +26,7 @@ async function ensureTelegramConnected(): Promise<boolean> {
   }
 
   console.log('[App] === ensureTelegramConnected START ===');
-  const telegramClient = getTelegramClient();
+  const telegramClient = getPrimaryClient();
 
   // Instead of just checking isConnected(), actually try a ping
   // to verify the connection is truly alive
@@ -89,7 +89,7 @@ function startKeepalive() {
   keepaliveInterval = setInterval(async () => {
     console.log('[App] ===== KEEPALIVE TICK =====');
 
-    const telegramClient = getTelegramClient();
+    const telegramClient = getPrimaryClient();
     
     // Instead of just checking isConnected(), actually try to make an API call
     // to verify the connection is truly alive
@@ -184,7 +184,7 @@ async function handleCheckConnection(event: MessageEvent) {
   const port = event.ports[0];
   
   try {
-    const telegramClient = getTelegramClient();
+    const telegramClient = getPrimaryClient();
     const connected = telegramClient?.isConnected() === true;
     port?.postMessage({ type: 'CONNECTION_STATUS', requestId, connected });
   } catch (error) {
@@ -203,7 +203,7 @@ async function handleReconnectTelegram(event: MessageEvent) {
   
   try {
     console.log('[App] Reconnecting Telegram due to SW request...');
-    const telegramClient = getTelegramClient();
+    const telegramClient = getPrimaryClient();
     if (telegramClient) {
       const wasConnected = telegramClient.isConnected() === true;
       if (wasConnected) {
@@ -258,7 +258,7 @@ async function handleGetFileChunk(event: MessageEvent) {
       return;
     }
     
-    const telegramClient = getTelegramClient();
+    const telegramClient = getPrimaryClient();
 
     console.log('[App] Getting chunk - messageId:', messageId, 'offset:', offset, 'limit:', limit, 'fileSize:', fileSize);
     
@@ -293,7 +293,7 @@ async function handleGetFileMetadata(event: MessageEvent) {
   const port = event.ports[0];
   
   try {
-    const telegramClient = getTelegramClient();
+    const telegramClient = getPrimaryClient();
     
     if (!telegramClient.isConnected()) {
       port?.postMessage({ requestId, error: 'Telegram client not connected' });

@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
-import { getTelegramClient } from '../lib/gramjs';
+import { TelegramClientManager } from '../lib/gramjs';
 
 type Props = {
-  onLogin: (sessionString: string) => Promise<void>;
+  // The client carries the freshly-authenticated session; the caller decides
+  // whether it becomes the drive's login or an extra linked account.
+  onLogin: (sessionString: string, client: TelegramClientManager) => Promise<void>;
 };
 
 type Tab = 'qr' | 'phone';
@@ -51,7 +53,7 @@ export default function LoginScreen({ onLogin }: Props) {
   );
 }
 
-function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<void>; apiId: number; apiHash: string }) {
+function QRTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: string }) {
   const [qrUrl, setQrUrl] = useState<string>('');
   const [status, setStatus] = useState<string>('正在生成 QR Code...');
   const [passwordHint, setPasswordHint] = useState('');
@@ -66,7 +68,8 @@ function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<vo
     setError('');
     setAwaitingPassword(false);
 
-    const client = getTelegramClient();
+    // A brand-new manager: this session isn't in the pool until it's identified.
+    const client = new TelegramClientManager();
     client.startQRLogin(
       apiId,
       apiHash,
@@ -80,7 +83,7 @@ function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<vo
       },
     ).then(async (sessionString) => {
       setStatus('Telegram 驗證中...');
-      await onLogin(sessionString);
+      await onLogin(sessionString, client);
       setStatus('登入成功！');
     }).catch((err) => {
       setError('QR 登入失敗：' + (err?.message ?? err));
@@ -132,7 +135,7 @@ function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<vo
   );
 }
 
-function PhoneTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<void>; apiId: number; apiHash: string }) {
+function PhoneTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: string }) {
   const [step, setStep] = useState<PhoneStep>('phone');
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
@@ -149,7 +152,7 @@ function PhoneTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise
   const startPhoneLogin = () => {
     setError('');
     setLoading(true);
-    const client = getTelegramClient();
+    const client = new TelegramClientManager();
     const controls = client.startPhoneLogin(
       apiId, apiHash, phone,
       () => { setStep('code'); setLoading(false); },
@@ -157,7 +160,7 @@ function PhoneTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise
     );
     setLoginControls(controls);
     controls.waitForLogin
-      .then((sessionString) => onLogin(sessionString))
+      .then((sessionString) => onLogin(sessionString, client))
       .catch((err) => { setError('登入失敗：' + (err?.message ?? err)); setLoading(false); });
   };
 

@@ -8,7 +8,10 @@ import { SearchBox } from './components/SearchBox';
 import { useUrlState } from './hooks/useUrlState';
 import { useTheme } from './hooks/useTheme';
 import { api } from './api/client';
-import { getTelegramClient, resetTelegramClient, saveCredentialsToStorage, loadCredentialsFromStorage, clearCredentialsFromStorage } from './lib/gramjs';
+import {
+  TelegramClientManager, adoptClient, getClientFor, resetAllClients,
+  loadAccounts, saveAccount, loadJwt, saveJwt, clearCredentialsFromStorage,
+} from './lib/gramjs';
 
 type AuthState = 'loading' | 'unauthenticated' | 'authenticated';
 
@@ -22,8 +25,8 @@ function App() {
   const { theme, toggleTheme } = useTheme();
 
   useEffect(() => {
-    const { sessionString, jwt } = loadCredentialsFromStorage();
-    if (!sessionString || !jwt) {
+    const accounts = loadAccounts();
+    if (accounts.length === 0 || !loadJwt()) {
       setAuthState('unauthenticated');
       return;
     }
@@ -31,18 +34,31 @@ function App() {
     // The Telegram MTProto handshake runs in the background; GramJS-dependent actions
     // (thumbnails, upload, download, preview) await client.waitUntilReady() internally.
     setAuthState('authenticated');
-    getTelegramClient().initialize(API_ID, API_HASH, sessionString)
-      .catch(() => {
-        clearCredentialsFromStorage();
-        setAuthState('unauthenticated');
-      });
+    for (const account of accounts) {
+      const client = getClientFor(account.id);
+      client.initialize(API_ID, API_HASH, account.session)
+        .then(() => {
+          // Sessions migrated from the single-account era arrive with a
+          // placeholder id; initialize() resolves the real one via getMe().
+          if (client.accountId !== account.id) {
+            adoptClient(client.accountId, client);
+            saveAccount({ ...account, id: client.accountId });
+          }
+        })
+        // One account failing must not log the whole drive out — the others
+        // still work, and the settings dialog shows which one is offline.
+        .catch((err) => {
+          console.warn('[App] Account', account.id, 'failed to connect:', err);
+          client.offline = true;
+        });
+    }
   }, []);
 
   // Prove our identity to the backend by DMing a one-time nonce to its bot —
   // Telegram reports who sent it, so the session string stays in this browser.
-  const handleLogin = async (sessionString: string) => {
+  const handleLogin = async (sessionString: string, client: TelegramClientManager) => {
     const { nonce, bot_username } = await api.requestChallenge();
-    const messageId = await getTelegramClient().sendAuthChallenge(bot_username, nonce);
+    const messageId = await client.sendAuthChallenge(bot_username, nonce);
 
     let loginResp = null;
     for (let i = 0; i < 60 && !loginResp; i++) {
@@ -51,15 +67,18 @@ function App() {
     }
     if (!loginResp) throw new Error('Telegram 驗證逾時，請重試');
 
-    getTelegramClient().deleteAuthChallenge(bot_username, messageId);
-    saveCredentialsToStorage(sessionString, loginResp.token);
+    client.deleteAuthChallenge(bot_username, messageId);
+    const label = loginResp.username || loginResp.first_name || String(loginResp.user_id);
+    adoptClient(loginResp.user_id, client);
+    saveAccount({ id: loginResp.user_id, label, session: sessionString });
+    saveJwt(loginResp.token);
     setUserName(loginResp.first_name || loginResp.username || String(loginResp.user_id));
     setAuthState('authenticated');
   };
 
   const handleLogout = () => {
     clearCredentialsFromStorage();
-    resetTelegramClient();
+    resetAllClients();
     setUserName('');
     setAuthState('unauthenticated');
   };

@@ -74,16 +74,8 @@ function installTelegramWsProxy(): void {
 const MAX_PARTS = 1000;
 const PART_SIZE = 512 * 1024; // 512KB
 
-// Module-level semaphore shared across all file uploads
-const uploadSemaphore = new Semaphore(MAX_CONCURRENT_CHUNKS);
-
-// Throttles Telegram message-creating RPCs (sendFile / SendMultiMedia) to avoid
-// FLOOD_WAIT. Does NOT gate chunk uploads (SaveBigFilePart) — those stay bounded
-// by uploadSemaphore only, so large-file throughput is unaffected.
-const messageRateLimiter = new RateLimiter(MESSAGE_SENDS_PER_SECOND, MESSAGE_SEND_BURST);
-
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
-// the shared limiter so all pending sends slow down instead of piling more
+// that account's limiter so its pending sends slow down instead of piling more
 // requests onto the flood.
 const FLOOD_PENALTY_MS = 10_000;
 
@@ -107,24 +99,23 @@ function isPremiumFloodError(err: unknown): boolean {
   return floodText(err).includes('PREMIUM');
 }
 
-function penalizeForFlood(label: string, err: unknown): void {
-  const seconds = (err as { seconds?: number } | null)?.seconds;
-  const waitMs = (typeof seconds === 'number' && seconds > 0 ? seconds : FLOOD_PENALTY_MS / 1000) * 1000;
-  console.warn(`[GramJS] ${label} hit FLOOD_WAIT — pausing message sends for ${waitMs}ms`);
-  messageRateLimiter.penalize(waitMs);
-}
-
-// Adaptive pacer for chunk uploads (SaveFilePart / SaveBigFilePart). Telegram
-// rate-limits upload parts per account, and this is shared by small files,
-// thumbnails, and large-file splits alike — they all hit the same bucket.
-// Unsynchronized per-request retries (GramJS's built-in behavior) would keep
-// hammering the server during a FLOOD_WAIT penalty and make it escalate
-// (observed 5s → 15s on this account), so every part is paced through a
-// single AIMD limiter: multiplicative rate cut on FLOOD_WAIT, additive
-// ramp-up once clean. Deliberately not cross-penalized with
-// messageRateLimiter — Telegram tracks SaveFilePart and message-send RPCs as
-// separate buckets, so coupling them would only slow down the healthy side.
-const chunkPacer = new AdaptiveRateLimiter({
+/**
+ * Adaptive pacer for chunk uploads (SaveFilePart / SaveBigFilePart). Telegram
+ * rate-limits upload parts PER ACCOUNT, and within one account this bucket is
+ * shared by small files, thumbnails, and large-file splits alike.
+ * Unsynchronized per-request retries (GramJS's built-in behavior) would keep
+ * hammering the server during a FLOOD_WAIT penalty and make it escalate
+ * (observed 5s → 15s on this account), so every part is paced through an AIMD
+ * limiter: multiplicative rate cut on FLOOD_WAIT, additive ramp-up once clean.
+ * Deliberately not cross-penalized with messageRateLimiter — Telegram tracks
+ * SaveFilePart and message-send RPCs as separate buckets, so coupling them
+ * would only slow down the healthy side.
+ *
+ * One pacer per account, and the learned ceiling is stored per account too: a
+ * premium account's ceiling must not be dragged down by a free one's.
+ */
+function createChunkPacer(accountId: number): AdaptiveRateLimiter {
+  return new AdaptiveRateLimiter({
   initialRate: CHUNK_RATE_INIT,
   minRate: CHUNK_RATE_MIN,
   maxRate: CHUNK_RATE_MAX,
@@ -133,8 +124,8 @@ const chunkPacer = new AdaptiveRateLimiter({
   increaseIntervalMs: CHUNK_RATE_INCREASE_INTERVAL_MS,
   cleanWindowMs: CHUNK_RATE_CLEAN_WINDOW_MS,
   burst: CHUNK_RATE_BURST,
-  storageKey: 'teledrive_chunk_rate_v2',
-  label: 'ChunkRate',
+  storageKey: `teledrive_chunk_rate_v2_${accountId}`,
+  label: `ChunkRate:${accountId}`,
   // Ceiling memory: remember the flood-triggering rate and converge just below
   // it, instead of re-probing past the account limit every cycle (the sawtooth
   // that made FLOOD_WAIT recur ~once a minute). See adaptiveRateLimiter.ts.
@@ -155,55 +146,7 @@ const chunkPacer = new AdaptiveRateLimiter({
     escalatedCleanWindowMs: CHUNK_ESCALATED_CLEAN_WINDOW_MS,
     escalationResetMs: CHUNK_ESCALATION_RESET_MS,
   },
-});
-
-/** Exposes the chunk pacer's current rate, flood count, and learned ceiling for batch-summary logging. */
-export function getChunkRateStats(): { rate: number; floods: number; ceiling: number | null } {
-  return chunkPacer.stats();
-}
-
-/**
- * Send one SaveFilePart/SaveBigFilePart directly on the upload sender,
- * paced through the shared chunkPacer. Bypasses client.invoke on purpose:
- * invoke's floodSleepThreshold auto-sleep is per-request and silent, so
- * concurrent parts each sleep and retry on their own schedule — exactly the
- * herd behavior the pacer's virtual-time scheduling avoids.
- * Non-flood errors are thrown to the caller (which has its own retry loop).
- */
-async function sendFilePartGated(
-  client: TelegramClient,
-  request: InstanceType<typeof Api.upload.SaveFilePart> | InstanceType<typeof Api.upload.SaveBigFilePart>,
-  label: string,
-): Promise<void> {
-  let floodRetries = 0;
-  for (;;) {
-    await chunkPacer.wait();
-    let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
-    try {
-      sender = await (client as any).getSender((client.session as any).dcId);
-      await sender!.send(request);
-      chunkPacer.reportSuccess();
-      return;
-    } catch (err) {
-      if (isFloodError(err)) {
-        if (++floodRetries > 10) throw err;
-        const seconds = (err as { seconds?: number } | null)?.seconds;
-        console.warn(`[GramJS] ${label} flood: ${floodText(err).trim()} (seconds=${seconds})`);
-        if (isPremiumFloodError(err)) {
-          // Account-tier cap — wait it out at full rate, don't self-throttle.
-          chunkPacer.pause(seconds);
-        } else {
-          chunkPacer.reportFlood(seconds);
-        }
-        continue;
-      }
-      if (sender && sender.isConnected && !sender.isConnected()) {
-        await new Promise((r) => setTimeout(r, 1000));
-        continue;
-      }
-      throw err;
-    }
-  }
+  });
 }
 
 /** Rejects with a timeout error if `promise` doesn't settle within `ms`. */
@@ -247,6 +190,86 @@ export class TelegramClientManager {
   private session: StringSession | null = null;
   // Limit concurrent sendFile calls — parallel sendFile before "me" entity is cached causes ID 0 errors
   private readonly sendFileSemaphore = new Semaphore(3);
+
+  // Every rate limit Telegram enforces is per account, so each account gets its
+  // own full budget: one account's FLOOD_WAIT must only slow that account down.
+  private readonly uploadSemaphore = new Semaphore(MAX_CONCURRENT_CHUNKS);
+  // Throttles message-creating RPCs (sendFile / SendMultiMedia / UploadMedia).
+  // Does NOT gate chunk uploads — those are bounded by uploadSemaphore + chunkPacer.
+  private readonly messageRateLimiter = new RateLimiter(MESSAGE_SENDS_PER_SECOND, MESSAGE_SEND_BURST);
+  // Lazy: the pacer reads its learned ceiling from a localStorage key that
+  // includes accountId, which isn't known until initialize() resolves getMe().
+  private _chunkPacer: AdaptiveRateLimiter | null = null;
+
+  /** Telegram account this client acts as. 0 until initialize()/login identifies it. */
+  accountId: number;
+  /** Set when the MTProto handshake failed — the pool skips it for uploads. */
+  offline = false;
+
+  constructor(accountId = 0) {
+    this.accountId = accountId;
+  }
+
+  private get chunkPacer(): AdaptiveRateLimiter {
+    if (!this._chunkPacer) this._chunkPacer = createChunkPacer(this.accountId);
+    return this._chunkPacer;
+  }
+
+  /** Current rate, flood count, and learned ceiling — for batch-summary logging. */
+  getChunkRateStats(): { rate: number; floods: number; ceiling: number | null } {
+    return this.chunkPacer.stats();
+  }
+
+  private penalizeForFlood(label: string, err: unknown): void {
+    const seconds = (err as { seconds?: number } | null)?.seconds;
+    const waitMs = (typeof seconds === 'number' && seconds > 0 ? seconds : FLOOD_PENALTY_MS / 1000) * 1000;
+    console.warn(`[GramJS:${this.accountId}] ${label} hit FLOOD_WAIT — pausing message sends for ${waitMs}ms`);
+    this.messageRateLimiter.penalize(waitMs);
+  }
+
+  /**
+   * Send one SaveFilePart/SaveBigFilePart directly on the upload sender, paced
+   * through this account's chunkPacer. Bypasses client.invoke on purpose:
+   * invoke's floodSleepThreshold auto-sleep is per-request and silent, so
+   * concurrent parts each sleep and retry on their own schedule — exactly the
+   * herd behavior the pacer's virtual-time scheduling avoids.
+   * Non-flood errors are thrown to the caller (which has its own retry loop).
+   */
+  private async sendFilePartGated(
+    request: InstanceType<typeof Api.upload.SaveFilePart> | InstanceType<typeof Api.upload.SaveBigFilePart>,
+    label: string,
+  ): Promise<void> {
+    const client = this.client!;
+    let floodRetries = 0;
+    for (;;) {
+      await this.chunkPacer.wait();
+      let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
+      try {
+        sender = await (client as any).getSender((client.session as any).dcId);
+        await sender!.send(request);
+        this.chunkPacer.reportSuccess();
+        return;
+      } catch (err) {
+        if (isFloodError(err)) {
+          if (++floodRetries > 10) throw err;
+          const seconds = (err as { seconds?: number } | null)?.seconds;
+          console.warn(`[GramJS:${this.accountId}] ${label} flood: ${floodText(err).trim()} (seconds=${seconds})`);
+          if (isPremiumFloodError(err)) {
+            // Account-tier cap — wait it out at full rate, don't self-throttle.
+            this.chunkPacer.pause(seconds);
+          } else {
+            this.chunkPacer.reportFlood(seconds);
+          }
+          continue;
+        }
+        if (sender && sender.isConnected && !sender.isConnected()) {
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
   // Tracks the in-flight/most recent initialize() call so operations issued while
   // the UI has already mounted (App no longer blocks on the MTProto handshake) can wait for it.
   private initPromise: Promise<void> | null = null;
@@ -318,11 +341,14 @@ export class TelegramClientManager {
 
     // Connect to Telegram
     await this.client.connect();
-    
+
     // Check if session is valid by trying to get the current user
     try {
-      const myself = await this.client.getMe() as { username?: string; firstName?: string };
-      console.log('[GramJS] Connected as:', myself.username || myself.firstName);
+      const myself = await this.client.getMe() as { id?: unknown; username?: string; firstName?: string };
+      // Self-identify: sessions migrated from the single-account era arrive with
+      // accountId 0, and the pool is keyed by it.
+      if (myself.id != null) this.accountId = Number(myself.id);
+      console.log(`[GramJS:${this.accountId}] Connected as:`, myself.username || myself.firstName);
     } catch (err) {
       console.warn('[GramJS] Session might need re-authentication:', err);
     }
@@ -338,7 +364,7 @@ export class TelegramClientManager {
     return this.sendFileSemaphore.withSlot(async () => {
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-          await messageRateLimiter.wait();
+          await this.messageRateLimiter.wait();
           return await this.client!.sendFile("me", params);
         } catch (err: any) {
           const isEntityZero = err?.message?.includes('ID 0') || err?.message?.includes('Entity');
@@ -348,7 +374,7 @@ export class TelegramClientManager {
             continue;
           }
           if (isFloodError(err) && attempt < maxRetries - 1) {
-            penalizeForFlood('sendFile', err);
+            this.penalizeForFlood('sendFile', err);
             continue;
           }
           throw err;
@@ -381,68 +407,6 @@ export class TelegramClientManager {
     // succeed or the whole upload fails (the caller marks the file as errored).
     const message = await this.sendFileLocked({ ...params, thumb: thumbFile });
     return { message, hasThumbnail: true };
-  }
-
-  /**
-   * Upload a file to Telegram Saved Messages.
-   * @param file - The file to upload (Browser File object)
-   * @returns Promise with upload result containing message_id, file_id, and access_hash
-   */
-  async uploadFile(file: File): Promise<{
-    message_id: number;
-    file_id: string;
-    access_hash?: string;
-  }> {
-    await this.waitUntilReady();
-    if (!this.client) {
-      throw new Error("Client not initialized. Call initialize() first.");
-    }
-
-    // For browser File objects, convert to array buffer then to Buffer (polyfilled)
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-
-    // Create a CustomFile with buffer for browser environment
-    // Signature: CustomFile(name: string, size: number, path: string, buffer?: Buffer)
-    const customFile = new CustomFile(file.name, file.size, "", buffer);
-
-    // Send file to "me" (Saved Messages)
-    const message = await this.client.sendFile("me", {
-      file: customFile,
-      workers: 4, // Use multiple workers for faster upload
-    });
-
-    // Extract media info from Api.Message
-    const msg = message as Api.Message;
-    const media = msg.media;
-
-    // Get file_id and access_hash from document or photo
-    let fileId = "";
-    let accessHash: string | undefined;
-
-    if (media) {
-      // Use constructor name to identify media type
-      const mediaConstructor = (media as { className?: string }).className;
-      if (mediaConstructor === "MessageMediaDocument") {
-        const doc = media as unknown as { document: { id: bigint; accessHash?: bigint } };
-        fileId = String(doc.document.id);
-        accessHash = doc.document.accessHash
-          ? String(doc.document.accessHash)
-          : undefined;
-      } else if (mediaConstructor === "MessageMediaPhoto") {
-        const photo = media as unknown as { photo: { id: bigint; accessHash?: bigint } };
-        fileId = String(photo.photo.id);
-        accessHash = photo.photo.accessHash
-          ? String(photo.photo.accessHash)
-          : undefined;
-      }
-    }
-
-    return {
-      message_id: msg.id,
-      file_id: fileId,
-      access_hash: accessHash,
-    };
   }
 
   /**
@@ -516,8 +480,6 @@ export class TelegramClientManager {
 
     console.log('[SplitUpload] Large file - total parts:', totalChunks);
 
-    const client = this.client;
-
     while (remainingSize > 0) {
       const partsInSegment = Math.min(MAX_PARTS, Math.ceil(remainingSize / PART_SIZE));
       const isBoundarySegment = partsInSegment === MAX_PARTS;
@@ -533,14 +495,14 @@ export class TelegramClientManager {
         const offset = segmentStartOffset + i * PART_SIZE;
         
         chunkPromises.push(
-          uploadSemaphore.withSlot(async () => {
+          this.uploadSemaphore.withSlot(async () => {
             const chunk = file.slice(offset, Math.min(offset + PART_SIZE, file.size));
             const arrayBuffer = await chunk.arrayBuffer();
             const bytes = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
             
             for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
               try {
-                await sendFilePartGated(client!, new Api.upload.SaveBigFilePart({
+                await this.sendFilePartGated(new Api.upload.SaveBigFilePart({
                   fileId: fileId,
                   filePart: partIdx,
                   fileTotalParts: partsInSegment,
@@ -629,20 +591,19 @@ export class TelegramClientManager {
    * under 100MB (Utils.getAppropriatedPartSize) — 4× the RPC count per MB,
    * which trips Telegram's per-account part-rate limit much sooner — and
    * (b) swallows FLOOD_WAIT with a silent per-request sleep, invisible to our
-   * global backoff. Chunks are bounded by the shared uploadSemaphore and every
-   * part send goes through the global chunk flood gate.
+   * global backoff. Chunks are bounded by this account's uploadSemaphore and
+   * every part send goes through its chunk pacer.
    */
   private async uploadFilePartsPaced(buf: { length: number; subarray(start: number, end: number): unknown }, fileName: string): Promise<Api.InputFile> {
-    const client = this.client!;
     const fileId = generateRandomBigInt();
     const partCount = Math.max(1, Math.ceil(buf.length / PART_SIZE));
 
     await Promise.all(Array.from({ length: partCount }, (_, partIdx) =>
-      uploadSemaphore.withSlot(async () => {
+      this.uploadSemaphore.withSlot(async () => {
         const bytes = (buf as any).subarray(partIdx * PART_SIZE, Math.min((partIdx + 1) * PART_SIZE, buf.length));
         for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
           try {
-            await sendFilePartGated(client, new Api.upload.SaveFilePart({
+            await this.sendFilePartGated(new Api.upload.SaveFilePart({
               fileId: fileId as any,
               filePart: partIdx,
               bytes,
@@ -720,13 +681,13 @@ export class TelegramClientManager {
       // the SendMultiMedia path.
       let uploadedMedia: any;
       for (let attempt = 0; ; attempt++) {
-        await messageRateLimiter.wait();
+        await this.messageRateLimiter.wait();
         try {
           uploadedMedia = await client.invoke(uploadMediaReq) as any;
           break;
         } catch (err) {
           if (isFloodError(err) && attempt < CHUNK_RETRY_COUNT - 1) {
-            penalizeForFlood(`UploadMedia(${file.name})`, err);
+            this.penalizeForFlood(`UploadMedia(${file.name})`, err);
             continue;
           }
           throw err;
@@ -781,7 +742,7 @@ export class TelegramClientManager {
     let sendSucceeded = false;
     try {
       const t0 = performance.now();
-      await messageRateLimiter.wait();
+      await this.messageRateLimiter.wait();
       const tLimiter = performance.now();
       const multiMedia = prepared.map((p) => new Api.InputSingleMedia({
         media: p.media,
@@ -808,7 +769,7 @@ export class TelegramClientManager {
       });
       sendSucceeded = true;
     } catch (err) {
-      if (isFloodError(err)) penalizeForFlood('SendMultiMedia', err);
+      if (isFloodError(err)) this.penalizeForFlood('SendMultiMedia', err);
       console.warn('[Album] SendMultiMedia failed/timed out, falling back to per-file sendFile:', err);
     }
 
@@ -831,43 +792,6 @@ export class TelegramClientManager {
     }
 
     return results;
-  }
-
-  /**
-   * Download the embedded thumb PhotoSize of a file's own message by message_id.
-   * Never downloads the document body (could be a 500MB video).
-   * @param messageId - The Telegram message ID of the file (NOT a separate thumbnail message)
-   * @returns Promise with Blob of the thumbnail image
-   */
-  async downloadThumbnail(messageId: number): Promise<Blob> {
-    await this.waitUntilReady();
-    if (!this.client) {
-      throw new Error("Client not initialized. Call initialize() first.");
-    }
-
-    // Get the message from Saved Messages
-    const messages = await this.client.getMessages("me", { ids: [messageId] });
-    const message = messages[0] as Api.Message;
-
-    if (!message || !message.media) {
-      throw new Error("Message not found or has no media");
-    }
-
-    const media = message.media as any;
-    const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
-    if (!doc?.thumbs?.length) {
-      throw new Error("No embedded thumbnail");
-    }
-
-    // Download ONLY the embedded thumb PhotoSize — never the document itself
-    const buffer = await this.client.downloadMedia(message.media, { thumb: doc.thumbs.length - 1 });
-
-    if (!buffer) {
-      throw new Error("Failed to download thumbnail");
-    }
-
-    // Convert Uint8Array to Blob
-    return new Blob([buffer], { type: 'image/jpeg' });
   }
 
   /**
@@ -1555,42 +1479,94 @@ export class TelegramClientManager {
   }
 }
 
-// Singleton instance for app-wide use
-let clientInstance: TelegramClientManager | null = null;
+// ── Client pool ────────────────────────────────────────────────────────────
+// One drive can hold several Telegram accounts. Each gets its own manager (and
+// with it its own concurrency budget, pacer, and file-location cache), because
+// every limit Telegram enforces — and every access_hash it issues — is scoped
+// to one account.
 
-/**
- * Get or create the singleton Telegram client instance.
- */
-export function getTelegramClient(): TelegramClientManager {
-  if (!clientInstance) {
-    clientInstance = new TelegramClientManager();
+const clients = new Map<number, TelegramClientManager>();
+
+/** The manager for a specific account, created on demand. */
+export function getClientFor(accountId: number): TelegramClientManager {
+  let c = clients.get(accountId);
+  if (!c) {
+    c = new TelegramClientManager(accountId);
+    clients.set(accountId, c);
   }
-  return clientInstance;
+  return c;
 }
 
-/**
- * Reset the singleton client instance (useful for logout).
- */
-export function resetTelegramClient(): void {
-  if (clientInstance) {
-    clientInstance.disconnect();
-    clientInstance = null;
-  }
+/** Register a manager built outside the pool (the login flow, which only learns its account id afterwards). */
+export function adoptClient(accountId: number, manager: TelegramClientManager): void {
+  manager.accountId = accountId;
+  clients.set(accountId, manager);
 }
 
-export function saveCredentialsToStorage(sessionString: string, jwt: string): void {
-  localStorage.setItem('tg_session', sessionString);
+/** Primary account's client — login and every non-upload path that doesn't care which account. */
+export function getPrimaryClient(): TelegramClientManager {
+  const accounts = loadAccounts();
+  return getClientFor(accounts[0]?.id ?? 0);
+}
+
+/** Every account currently usable for uploads (handshake succeeded). */
+export function getAllClients(): TelegramClientManager[] {
+  return [...clients.values()].filter((c) => !c.offline);
+}
+
+/** Disconnect and forget every client (logout). */
+export function resetAllClients(): void {
+  for (const c of clients.values()) c.disconnect();
+  clients.clear();
+}
+
+// ── Account credential storage ─────────────────────────────────────────────
+// 'tg_accounts': the sessions, one per linked account. 'tg_jwt': one per drive.
+
+export type StoredAccount = { id: number; label: string; session: string };
+
+export function loadAccounts(): StoredAccount[] {
+  const raw = localStorage.getItem('tg_accounts');
+  if (raw) {
+    try {
+      return JSON.parse(raw) as StoredAccount[];
+    } catch {
+      return [];
+    }
+  }
+  // Migrate the single-account era in place. id 0 is a placeholder — the real
+  // one is filled in by initialize()'s getMe() and re-saved.
+  const legacy = localStorage.getItem('tg_session');
+  if (!legacy) return [];
+  const migrated: StoredAccount[] = [{ id: 0, label: '', session: legacy }];
+  localStorage.setItem('tg_accounts', JSON.stringify(migrated));
+  localStorage.removeItem('tg_session');
+  return migrated;
+}
+
+/** Insert or update one account, keyed by id. */
+export function saveAccount(account: StoredAccount): void {
+  const accounts = loadAccounts().filter((a) => a.id !== account.id);
+  accounts.push(account);
+  localStorage.setItem('tg_accounts', JSON.stringify(accounts));
+}
+
+export function removeAccount(id: number): void {
+  localStorage.setItem('tg_accounts', JSON.stringify(loadAccounts().filter((a) => a.id !== id)));
+  clients.get(id)?.disconnect();
+  clients.delete(id);
+}
+
+export function saveJwt(jwt: string): void {
   localStorage.setItem('tg_jwt', jwt);
 }
 
-export function loadCredentialsFromStorage(): { sessionString: string | null; jwt: string | null } {
-  return {
-    sessionString: localStorage.getItem('tg_session'),
-    jwt: localStorage.getItem('tg_jwt'),
-  };
+export function loadJwt(): string | null {
+  return localStorage.getItem('tg_jwt');
 }
 
 export function clearCredentialsFromStorage(): void {
+  localStorage.removeItem('tg_accounts');
   localStorage.removeItem('tg_session');
   localStorage.removeItem('tg_jwt');
 }

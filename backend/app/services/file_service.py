@@ -54,6 +54,9 @@ class FileService:
             split_group_id=row.get('split_group_id'),
             part_index=row.get('part_index'),
             file_hash=row.get('file_hash'),
+            # Which linked account stores this message — the frontend picks its
+            # GramJS client by this field. access_hash is only valid for that account.
+            telegram_user_id=row.get('telegram_user_id') or 0,
             trashed_at=(
                 datetime.fromisoformat(row['trashed_at'])
                 if row.get('trashed_at') else None
@@ -230,6 +233,7 @@ class FileService:
         split_group_id: Optional[str] = None,
         telegram_user_id: int = 0,
         file_hash: Optional[str] = None,
+        owner_id: int = 0,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -253,7 +257,7 @@ class FileService:
             stale = await db.find_files_by_name_and_parent(
                 filename,
                 parent_id,
-                telegram_user_id=telegram_user_id,
+                owner_id=owner_id,
                 exclude_split_group_id=split_group_id,
             )
             if stale:
@@ -314,9 +318,13 @@ class FileService:
             split_group_id=split_group_id,
             telegram_user_id=telegram_user_id,
             file_hash=file_hash,
+            owner_id=owner_id,
         )
 
-        logger.info(f"Registered MTProto upload: {filename}, file_id: {file_id}, has_thumbnail: {has_thumbnail}")
+        logger.info(
+            f"Registered MTProto upload: {filename}, file_id: {file_id}, "
+            f"has_thumbnail: {has_thumbnail}, stored on account {telegram_user_id}"
+        )
         
         return file_info
     
@@ -376,10 +384,10 @@ class FileService:
         
         return file_info
     
-    async def get_file_info(self, file_id: str, telegram_user_id: Optional[int] = None) -> Optional[FileInfo]:
-        """Get file metadata, optionally scoped to a specific user."""
+    async def get_file_info(self, file_id: str, owner_id: Optional[int] = None) -> Optional[FileInfo]:
+        """Get file metadata, optionally scoped to a drive."""
         db = await self._get_db()
-        row = await db.get_file(file_id, telegram_user_id=telegram_user_id)
+        row = await db.get_file(file_id, owner_id=owner_id)
         if row:
             return self._row_to_file_info(row)
         return None
@@ -390,7 +398,7 @@ class FileService:
         page_size: int = 50,
         parent_id: Optional[str] = None,
         split_group_id: Optional[str] = None,
-        telegram_user_id: int = 0,
+        owner_id: int = 0,
         sort_by: str = "date",
         sort_order: str = "desc",
         search: Optional[str] = None,
@@ -404,7 +412,7 @@ class FileService:
             parent_id=parent_id,
             is_dir=False,
             split_group_id=split_group_id,
-            telegram_user_id=telegram_user_id,
+            owner_id=owner_id,
             sort_by=sort_by,
             sort_order=sort_order,
             search=search,
@@ -416,16 +424,16 @@ class FileService:
             files.sort(key=lambda f: getattr(f, 'part_index', 0) or 0)
         return files, total
 
-    async def find_by_hash(self, file_hash: str, telegram_user_id: int) -> List[FileInfo]:
-        """Return all file records matching this SHA-256 hash for the given user."""
+    async def find_by_hash(self, file_hash: str, owner_id: int) -> List[FileInfo]:
+        """Return all file records matching this SHA-256 hash in the drive."""
         db = await self._get_db()
-        rows = await db.find_by_hash(file_hash, telegram_user_id)
+        rows = await db.find_by_hash(file_hash, owner_id)
         return [self._row_to_file_info(r) for r in rows]
 
-    async def find_by_hashes(self, hashes: List[str], telegram_user_id: int) -> Dict[str, List[FileInfo]]:
+    async def find_by_hashes(self, hashes: List[str], owner_id: int) -> Dict[str, List[FileInfo]]:
         """Return file records for multiple SHA-256 hashes at once, grouped by hash."""
         db = await self._get_db()
-        rows_by_hash = await db.find_by_hashes(hashes, telegram_user_id)
+        rows_by_hash = await db.find_by_hashes(hashes, owner_id)
         return {
             file_hash: [self._row_to_file_info(r) for r in rows]
             for file_hash, rows in rows_by_hash.items()
@@ -434,7 +442,7 @@ class FileService:
     async def list_folders(
         self,
         parent_id: Optional[str] = None,
-        telegram_user_id: int = 0,
+        owner_id: int = 0,
         sort_by: str = "date",
         sort_order: str = "desc",
     ) -> List[FileInfo]:
@@ -445,20 +453,20 @@ class FileService:
             page_size=10000,
             parent_id=parent_id,
             is_dir=True,
-            telegram_user_id=telegram_user_id,
+            owner_id=owner_id,
             sort_by=sort_by,
             sort_order=sort_order,
         )
         folders = [self._row_to_file_info(row) for row in rows]
         return folders
 
-    async def create_folder(self, name: str, parent_id: Optional[str] = None, telegram_user_id: int = 0) -> FileInfo:
+    async def create_folder(self, name: str, parent_id: Optional[str] = None, owner_id: int = 0) -> FileInfo:
         """Create a folder entry in the database, reusing existing record if same name+parent already exists."""
         logger.info(f"create_folder called: name={name}, parent_id={parent_id}")
         db = await self._get_db()
         logger.info(f"Got database: {db.db_path}")
 
-        existing = await db.find_folder_by_name_and_parent(name, parent_id, telegram_user_id=telegram_user_id)
+        existing = await db.find_folder_by_name_and_parent(name, parent_id, owner_id=owner_id)
         if existing:
             logger.info(f"Folder already exists, reusing: {existing['file_id']}")
             return self._row_to_file_info(existing)
@@ -494,7 +502,9 @@ class FileService:
             access_hash=folder_info.access_hash,
             parent_id=folder_info.parent_id,
             is_dir=folder_info.isDir,
-            telegram_user_id=telegram_user_id,
+            # A folder is metadata only — no Telegram message, so no storage account.
+            telegram_user_id=0,
+            owner_id=owner_id,
         )
         logger.info(f"Folder inserted: {name}, id: {file_id}")
         
@@ -530,65 +540,65 @@ class FileService:
         logger.info(f"Folder deleted recursively: {folder_id} ({deleted} records)")
         return deleted, message_ids
 
-    async def _collect_subtree_rows(self, root_id: str, telegram_user_id: int) -> List[dict]:
+    async def _collect_subtree_rows(self, root_id: str, owner_id: int) -> List[dict]:
         """Root row + all descendants, with every split part expanded in."""
         db = await self._get_db()
         rows = await db.get_subtree(root_id)
         seen = {r['file_id'] for r in rows}
         group_ids = {r.get('split_group_id') for r in rows if r.get('split_group_id')}
         for gid in group_ids:
-            for part in await db.get_files_by_split_group(gid, telegram_user_id=telegram_user_id):
+            for part in await db.get_files_by_split_group(gid, owner_id=owner_id):
                 if part['file_id'] not in seen:
                     seen.add(part['file_id'])
                     rows.append(part)
         return rows
 
-    async def trash_file(self, file_id: str, telegram_user_id: int) -> int:
+    async def trash_file(self, file_id: str, owner_id: int) -> int:
         """Soft-delete an item and its whole subtree. Telegram messages untouched (restore is free)."""
         db = await self._get_db()
-        rows = await self._collect_subtree_rows(file_id, telegram_user_id)
+        rows = await self._collect_subtree_rows(file_id, owner_id)
         ids = [r['file_id'] for r in rows]
         await db.set_trashed(ids, datetime.utcnow().isoformat())
         logger.info(f"Trashed {len(ids)} item(s) under {file_id}")
         return len(ids)
 
-    async def restore_file(self, file_id: str, telegram_user_id: int) -> Optional[FileInfo]:
+    async def restore_file(self, file_id: str, owner_id: int) -> Optional[FileInfo]:
         """Restore a trashed subtree. If the original parent is gone/trashed, restore to the drive root."""
         db = await self._get_db()
-        row = await db.get_file(file_id, telegram_user_id=telegram_user_id)
+        row = await db.get_file(file_id, owner_id=owner_id)
         if not row:
             return None
         if not row.get('trashed_at'):
             raise ValueError("Item is not in the trash")
 
-        rows = await self._collect_subtree_rows(file_id, telegram_user_id)
+        rows = await self._collect_subtree_rows(file_id, owner_id)
         await db.set_trashed([r['file_id'] for r in rows], None)
 
         parent_id = row.get('parent_id')
         if parent_id:
-            parent = await db.get_file(parent_id, telegram_user_id=telegram_user_id)
+            parent = await db.get_file(parent_id, owner_id=owner_id)
             if not parent or parent.get('trashed_at'):
                 await db.update_file(file_id, parent_id=None, set_parent_id=True)
 
-        restored = await db.get_file(file_id, telegram_user_id=telegram_user_id)
+        restored = await db.get_file(file_id, owner_id=owner_id)
         logger.info(f"Restored {len(rows)} item(s) under {file_id}")
         return self._row_to_file_info(restored)
 
-    async def purge_file(self, file_id: str, telegram_user_id: int) -> tuple[int, List[int]]:
+    async def purge_file(self, file_id: str, owner_id: int) -> tuple[int, List[int]]:
         """Permanently delete a subtree. Returns (records_deleted, telegram_message_ids) for cleanup."""
         db = await self._get_db()
-        rows = await self._collect_subtree_rows(file_id, telegram_user_id)
+        rows = await self._collect_subtree_rows(file_id, owner_id)
         ids = [r['file_id'] for r in rows]
         message_ids = [r['telegram_message_id'] for r in rows if r.get('telegram_message_id')]
         deleted = await db.delete_files_by_ids(ids)
         logger.info(f"Purged {deleted} record(s) under {file_id}")
         return deleted, message_ids
 
-    async def delete_all(self, telegram_user_id: int = 0) -> int:
-        """Delete all files and folders for the given user (or all if 0)."""
+    async def delete_all(self, owner_id: int = 0) -> int:
+        """Delete every file and folder in the drive (or all drives if 0)."""
         db = await self._get_db()
-        if telegram_user_id:
-            count = await db.delete_user_files(telegram_user_id)
+        if owner_id:
+            count = await db.delete_user_files(owner_id)
         else:
             count = await db.delete_all_files()
         logger.info(f"All files deleted: {count} items")

@@ -6,7 +6,6 @@ from datetime import datetime
 
 from app.models.schemas import FileListResponse, FileInfo, FileType
 from app.services import get_file_service, get_bot_service
-from app.services import get_telethon_service
 from app.services.database import get_database
 from app.auth import get_current_user, create_jwt
 from app.services import bot_challenge
@@ -47,6 +46,7 @@ class RegisterFileRequest(BaseModel):
     total_parts: Optional[int] = None
     split_group_id: Optional[str] = None
     file_hash: Optional[str] = None
+    telegram_user_id: Optional[int] = None  # which linked account stores the message
 
 
 class CreateFolderRequest(BaseModel):
@@ -93,13 +93,89 @@ async def auth_verify(request: VerifyRequest):
             return JSONResponse(status_code=202, content={"status": "waiting"})
         raise HTTPException(status_code=401, detail="Invalid or expired challenge")
 
-    logger.info(f"User {entry['user_id']} ({entry['username']}) logged in via bot challenge")
+    tg_user_id = entry["user_id"]
+    db = await get_database()
+    owner_id = await db.get_owner_of(tg_user_id)
+    if owner_id is None:
+        # First time we see this account — it becomes its own drive's primary.
+        await db.link_account(tg_user_id, tg_user_id, is_primary=True,
+                              label=entry["username"] or entry["first_name"])
+        owner_id = tg_user_id
+
+    logger.info(f"Account {tg_user_id} ({entry['username']}) logged in to drive {owner_id}")
     return LoginResponse(
-        token=create_jwt(entry["user_id"]),
-        user_id=entry["user_id"],
+        token=create_jwt(owner_id, acting_account_id=tg_user_id),
+        user_id=tg_user_id,
         username=entry["username"],
         first_name=entry["first_name"],
     )
+
+
+@router.get("/accounts")
+async def list_accounts(current_user: int = Depends(get_current_user)):
+    """Telegram accounts linked to this drive."""
+    db = await get_database()
+    return {"accounts": await db.list_linked_accounts(current_user)}
+
+
+@router.post("/accounts/challenge", response_model=ChallengeResponse)
+async def account_challenge(current_user: int = Depends(get_current_user)):
+    """Same one-time nonce flow as login — the account to be linked DMs it to the bot."""
+    if not bot_challenge.bot_username:
+        raise HTTPException(status_code=503, detail="Bot linking unavailable — set TELEGRAM_BOT_TOKEN in .env")
+    return ChallengeResponse(
+        nonce=bot_challenge.new_challenge(),
+        bot_username=bot_challenge.bot_username,
+        expires_in=bot_challenge.TTL_SECONDS,
+    )
+
+
+@router.post("/accounts/verify")
+async def account_verify(request: VerifyRequest, current_user: int = Depends(get_current_user)):
+    """Link the account that answered this nonce to the caller's drive. 202 = keep polling."""
+    entry = bot_challenge.take_verified(request.nonce)
+    if entry is None:
+        if bot_challenge.is_pending(request.nonce):
+            return JSONResponse(status_code=202, content={"status": "waiting"})
+        raise HTTPException(status_code=401, detail="Invalid or expired challenge")
+
+    tg_user_id = entry["user_id"]
+    db = await get_database()
+    existing_owner = await db.get_owner_of(tg_user_id)
+    if existing_owner == current_user:
+        raise HTTPException(status_code=409, detail="This account is already linked to your drive")
+    if existing_owner is not None:
+        # One account, one drive — otherwise linking would expose the other drive's files.
+        raise HTTPException(status_code=409, detail="This Telegram account already belongs to another drive")
+
+    label = entry["username"] or entry["first_name"] or str(tg_user_id)
+    if not await db.link_account(current_user, tg_user_id, is_primary=False, label=label):
+        raise HTTPException(status_code=409, detail="This Telegram account already belongs to another drive")
+
+    logger.info(f"Linked account {tg_user_id} ({label}) to drive {current_user}")
+    return {"telegram_user_id": tg_user_id, "label": label, "is_primary": 0, "file_count": 0}
+
+
+@router.delete("/accounts/{tg_user_id}")
+async def unlink_account(tg_user_id: int, current_user: int = Depends(get_current_user)):
+    """Unlink a storage account. Refused while it still holds files — access_hash is
+    account-scoped, so unlinking would make those files permanently undownloadable."""
+    db = await get_database()
+    account = await db.get_linked_account(current_user, tg_user_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not linked to this drive")
+    if account["is_primary"]:
+        raise HTTPException(status_code=409, detail="Cannot unlink the primary account")
+
+    file_count = await db.count_files_on_account(current_user, tg_user_id)
+    if file_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This account still stores {file_count} file(s); they would become undownloadable",
+        )
+
+    await db.unlink_account(current_user, tg_user_id)
+    return {"message": "Account unlinked", "telegram_user_id": tg_user_id}
 
 
 @router.get("/files/check-hash")
@@ -135,6 +211,14 @@ async def register_file(
     Register a file uploaded directly via MTProto.
     Frontend uploads to Telegram, then registers metadata here.
     """
+    # Trust boundary: the client names the storage account, so verify it is actually
+    # linked to this drive — otherwise a caller could attribute files to a stranger.
+    storage_account = request.telegram_user_id or current_user
+    if storage_account != current_user:
+        db = await get_database()
+        if not await db.get_linked_account(current_user, storage_account):
+            raise HTTPException(status_code=403, detail="Account not linked to this drive")
+
     try:
         file_service = get_file_service()
         file_info = await file_service.register_uploaded_file(
@@ -151,7 +235,8 @@ async def register_file(
             part_index=request.part_index,
             total_parts=request.total_parts,
             split_group_id=request.split_group_id,
-            telegram_user_id=current_user,
+            owner_id=current_user,
+            telegram_user_id=storage_account,
             file_hash=request.file_hash,
         )
         return file_info
@@ -194,7 +279,7 @@ async def list_files(
             page_size,
             parent_id=parent_id,
             split_group_id=split_group_id,
-            telegram_user_id=current_user,
+            owner_id=current_user,
             sort_by=sort_by,
             sort_order=sort_order,
             search=search,
@@ -214,7 +299,7 @@ async def list_files(
 async def get_file_info(file_id: str, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+        file_info = await file_service.get_file_info(file_id, owner_id=current_user)
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
         return file_info
@@ -240,7 +325,7 @@ async def delete_file(file_id: str, current_user: int = Depends(get_current_user
     """Move a file or folder (and its whole subtree) to the trash. Telegram messages are kept."""
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+        file_info = await file_service.get_file_info(file_id, owner_id=current_user)
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
 
@@ -275,7 +360,7 @@ async def purge_file(file_id: str, current_user: int = Depends(get_current_user)
     """Permanently delete a trashed item (and its subtree), including its Telegram messages."""
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+        file_info = await file_service.get_file_info(file_id, owner_id=current_user)
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
 
@@ -293,7 +378,7 @@ async def delete_all_files(current_user: int = Depends(get_current_user)):
     """Delete all files and folders belonging to the authenticated user."""
     try:
         file_service = get_file_service()
-        count = await file_service.delete_all(telegram_user_id=current_user)
+        count = await file_service.delete_all(owner_id=current_user)
         return {"message": "All files deleted", "count": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -307,7 +392,7 @@ async def update_file(file_id: str, request: UpdateFileRequest, current_user: in
     try:
         logger.info(f"Update file request: file_id={file_id}, parent_id={request.parent_id}")
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+        file_info = await file_service.get_file_info(file_id, owner_id=current_user)
 
         if not file_info:
             logger.error(f"File not found: {file_id}")
@@ -346,7 +431,7 @@ async def get_download_info(file_id: str, current_user: int = Depends(get_curren
     """
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
+        file_info = await file_service.get_file_info(file_id, owner_id=current_user)
         
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
@@ -365,177 +450,11 @@ async def get_download_info(file_id: str, current_user: int = Depends(get_curren
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/files/{file_id}/stream")
-async def stream_file(file_id: str, request: Request, current_user: int = Depends(get_current_user)):
-    """
-    Stream file content from Telegram with Range header support.
-    Returns file bytes with proper content-type for display/playback.
-    Supports HTTP Range requests for partial content (206) and full content (200).
-    """
-    from loguru import logger
-    from fastapi.responses import StreamingResponse
-    from starlette.status import HTTP_416_RANGE_NOT_SATISFIABLE
-    import re
-    import traceback
-    
-    logger.info(f"Stream endpoint called with file_id: {file_id}")
-    
-    def parse_range(range_header: str, file_size: int) -> tuple[int, int] | None:
-        """Parse Range header and return (start, end) tuple or None if invalid."""
-        if not range_header:
-            return None
-        
-        # Only support bytes range (no multi-range)
-        if ',' in range_header:
-            return None
-        
-        # Match bytes=start-end or bytes=start- format
-        match = re.match(r'^bytes=(\d+)-(\d*)$', range_header)
-        if not match:
-            return None
-        
-        start_str, end_str = match.groups()
-        
-        # Validate start is a non-negative integer
-        try:
-            start = int(start_str)
-            if start < 0:
-                return None
-        except ValueError:
-            return None
-        
-        # Parse end (empty string means to EOF)
-        if end_str:
-            try:
-                end = int(end_str)
-                if end < 0:
-                    return None
-                # end must be >= start
-                if end < start:
-                    return None
-            except ValueError:
-                return None
-            return (start, end)
-        else:
-            # bytes=start- means from start to EOF
-            return (start, file_size - 1)
-    
-    try:
-        file_service = get_file_service()
-        file_info = await file_service.get_file_info(file_id, telegram_user_id=current_user)
-
-        if not file_info:
-            raise HTTPException(status_code=404, detail="File not found")
-
-        message_id = file_info.telegram_message_id
-        
-        if not message_id:
-            raise HTTPException(status_code=400, detail="No Telegram message ID")
-        
-        file_size = file_info.filesize
-        mime_type = file_info.mime_type or "application/octet-stream"
-        
-        # Parse Range header
-        range_header = request.headers.get("range", "")
-        range_result = parse_range(range_header, file_size)
-        
-        # If Range header is present but invalid format, return 416
-        if range_header and range_result is None:
-            logger.info(f"Invalid Range header: {range_header}")
-            from fastapi.responses import Response
-            return Response(
-                status_code=HTTP_416_RANGE_NOT_SATISFIABLE,
-                headers={
-                    "Content-Range": f"bytes */{file_size}",
-                    "Accept-Ranges": "bytes"
-                }
-            )
-        
-        mtproto_service = await get_telethon_service()
-        
-        if range_result is not None:
-            # Range request
-            start, end = range_result
-            
-            # Check if start is beyond file size
-            if start >= file_size:
-                logger.info(f"Range not satisfiable: start={start} >= file_size={file_size}")
-                from fastapi.responses import Response
-                return Response(
-                    status_code=HTTP_416_RANGE_NOT_SATISFIABLE,
-                    headers={
-                        "Content-Range": f"bytes */{file_size}",
-                        "Accept-Ranges": "bytes"
-                    }
-                )
-            
-            # Clamp end to file size
-            actual_end = min(end, file_size - 1)
-            content_length = actual_end - start + 1
-            
-            logger.info(f"Streaming range: {file_id}, bytes {start}-{actual_end}/{file_size}")
-            
-            async def generate_range():
-                # Range request - download only the requested range
-                try:
-                    chunk = await mtproto_service.download_file(
-                        message_id=message_id,
-                        offset=start,
-                        limit=content_length
-                    )
-                    if chunk:
-                        yield chunk
-                except Exception as chunk_err:
-                    logger.error(f"Range download error: {chunk_err}")
-            
-            return StreamingResponse(
-                generate_range(),
-                status_code=206,
-                media_type=mime_type,
-                headers={
-                    "Content-Range": f"bytes {start}-{actual_end}/{file_size}",
-                    "Accept-Ranges": "bytes"
-                }
-            )
-        else:
-            # Full file request (no Range header)
-            logger.info(f"Streaming full file: {file_id}, size={file_size}")
-            
-            async def generate_full():
-                # For full file download, get everything in one request (or few large chunks)
-                # Telegram requires minimum 512KB limit, so we request the full file at once
-                try:
-                    chunk = await mtproto_service.download_file(
-                        message_id=message_id,
-                        offset=0,
-                        limit=file_size  # Request full file
-                    )
-                    if chunk:
-                        yield chunk
-                except Exception as chunk_err:
-                    logger.error(f"Download error: {chunk_err}")
-            
-            return StreamingResponse(
-                generate_full(),
-                status_code=200,
-                media_type=mime_type,
-                headers={
-                    "Accept-Ranges": "bytes"
-                }
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Stream error: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
 @router.post("/folders", response_model=FileInfo)
 async def create_folder(request: CreateFolderRequest, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        folder = await file_service.create_folder(request.name, request.parent_id, telegram_user_id=current_user)
+        folder = await file_service.create_folder(request.name, request.parent_id, owner_id=current_user)
         return folder
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -554,7 +473,7 @@ async def list_folders(
         file_service = get_file_service()
         folders = await file_service.list_folders(
             parent_id=parent_id,
-            telegram_user_id=current_user,
+            owner_id=current_user,
             sort_by=sort_by,
             sort_order=sort_order,
         )
@@ -572,7 +491,7 @@ async def list_folders(
 async def delete_folder(folder_id: str, current_user: int = Depends(get_current_user)):
     try:
         file_service = get_file_service()
-        file_info = await file_service.get_file_info(folder_id, telegram_user_id=current_user)
+        file_info = await file_service.get_file_info(folder_id, owner_id=current_user)
 
         if not file_info:
             raise HTTPException(status_code=404, detail="Folder not found")
@@ -646,7 +565,7 @@ async def get_files_by_split_group(split_group_id: str, current_user: int = Depe
     """
     try:
         db = await get_database()
-        rows = await db.get_files_by_split_group(split_group_id, telegram_user_id=current_user)
+        rows = await db.get_files_by_split_group(split_group_id, owner_id=current_user)
 
         if not rows:
             raise HTTPException(status_code=404, detail="No files found for this split group")

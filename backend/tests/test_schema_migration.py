@@ -70,3 +70,44 @@ def test_upload_still_works_on_a_database_from_before_has_thumbnail():
 
     row = asyncio.run(run())
     assert row["has_thumbnail"] == 1
+
+
+def test_multi_account_migration_keeps_existing_files_visible():
+    """owner_id splits off from telegram_user_id — an upgrade must not orphan files.
+
+    Tenant filtering moved from telegram_user_id to owner_id. If the backfill
+    misses, every pre-upgrade file silently vanishes from its owner's drive.
+    """
+    db_path = os.path.join(tempfile.mkdtemp(), "single_account.db")
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(PRE_MIGRATION_SCHEMA)
+    legacy.execute("ALTER TABLE files ADD COLUMN telegram_user_id INTEGER NOT NULL DEFAULT 0")
+    for file_id, user in (("f1", 111), ("f2", 111), ("f3", 222)):
+        legacy.execute(
+            "INSERT INTO files (file_id, filename, filesize, file_type, created_at, isDir, telegram_user_id) "
+            "VALUES (?, ?, 1, 'other', '2026-01-01T00:00:00', 0, ?)",
+            (file_id, file_id, user),
+        )
+    legacy.commit()
+    legacy.close()
+
+    async def run():
+        db = Database(db_path)
+        await db.connect()
+        try:
+            await db.init_schema()
+            rows = await db.get_all_files()
+            accounts = await db.list_linked_accounts(111)
+            # Run it twice: init_schema runs on every boot and must not re-backfill
+            # over owner_id once accounts have diverged from storage accounts.
+            await db.init_schema()
+            return rows, accounts, await db.get_owner_of(222)
+        finally:
+            await db.close()
+
+    rows, accounts, owner_of_222 = asyncio.run(run())
+
+    assert {r["file_id"]: r["owner_id"] for r in rows} == {"f1": 111, "f2": 111, "f3": 222}
+    # Each pre-existing account becomes its own drive's primary.
+    assert [(a["telegram_user_id"], a["is_primary"], a["file_count"]) for a in accounts] == [(111, 1, 2)]
+    assert owner_of_222 == 222

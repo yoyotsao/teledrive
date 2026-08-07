@@ -22,6 +22,7 @@ async def _insert(db, file_id, filename=None, parent_id=None, is_dir=False, msg_
         parent_id=parent_id,
         is_dir=is_dir,
         telegram_user_id=USER_ID,
+        owner_id=USER_ID,
     )
 
 
@@ -47,17 +48,17 @@ def test_trash_restore_purge_subtree(tmp_path):
         # Trash the folder → whole subtree gone from live listings, outside_file survives.
         n = await fs.trash_file("root_folder", USER_ID)
         assert n == 4
-        live, total = await db.get_files_paginated(parent_id=None, is_dir=False, telegram_user_id=USER_ID)
+        live, total = await db.get_files_paginated(parent_id=None, is_dir=False, owner_id=USER_ID)
         assert {r["file_id"] for r in live} == {"outside_file"}
 
         # Trash listing shows only the root, not its contents.
-        trash, _ = await db.get_files_paginated(telegram_user_id=USER_ID, trashed=True)
+        trash, _ = await db.get_files_paginated(owner_id=USER_ID, trashed=True)
         assert {r["file_id"] for r in trash} == {"root_folder"}
 
         # Restore brings the whole subtree back.
         restored = await fs.restore_file("root_folder", USER_ID)
         assert restored is not None and restored.trashed_at is None
-        live_folders, _ = await db.get_files_paginated(parent_id=None, is_dir=True, telegram_user_id=USER_ID)
+        live_folders, _ = await db.get_files_paginated(parent_id=None, is_dir=True, owner_id=USER_ID)
         assert "root_folder" in {r["file_id"] for r in live_folders}
 
         # Purge removes rows and reports Telegram message ids.
@@ -108,7 +109,7 @@ def test_search_escapes_like_metacharacters(tmp_path):
         await _insert(db, "id1", filename="50% off.txt")
         await _insert(db, "id2", filename="5000 off.txt")  # would match if % were a wildcard
 
-        rows, _ = await db.get_files_paginated(telegram_user_id=USER_ID, search="50%")
+        rows, _ = await db.get_files_paginated(owner_id=USER_ID, search="50%")
         assert {r["file_id"] for r in rows} == {"id1"}
         await db.close()
 
@@ -123,7 +124,7 @@ def test_sort_by_name_asc(tmp_path):
         await _insert(db, "id3", filename="cherry")
 
         rows, _ = await db.get_files_paginated(
-            parent_id=None, is_dir=False, telegram_user_id=USER_ID,
+            parent_id=None, is_dir=False, owner_id=USER_ID,
             sort_by="name", sort_order="asc",
         )
         assert [r["filename"] for r in rows] == ["Apple", "banana", "cherry"]

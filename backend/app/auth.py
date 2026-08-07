@@ -11,9 +11,13 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
 
 
-def create_jwt(telegram_user_id: int) -> str:
+def create_jwt(owner_id: int, acting_account_id: Optional[int] = None) -> str:
+    """user_id is the drive (owner). acting_account_id records which linked
+    Telegram account actually logged in — for logs and the settings UI only;
+    it grants nothing on its own."""
     payload = {
-        "user_id": telegram_user_id,
+        "user_id": owner_id,
+        "acting_account_id": acting_account_id if acting_account_id is not None else owner_id,
         "exp": datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -28,7 +32,7 @@ def decode_jwt(token: str) -> int:
 
 
 async def get_current_user(authorization: Optional[str] = Header(None)) -> int:
-    """FastAPI dependency: extracts telegram_user_id from Bearer token."""
+    """FastAPI dependency: extracts the drive's owner_id from the Bearer token."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authentication required")
     token = authorization.removeprefix("Bearer ")

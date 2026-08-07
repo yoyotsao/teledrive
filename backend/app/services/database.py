@@ -115,6 +115,16 @@ class Database:
         except aiosqlite.OperationalError:
             pass
 
+        # owner_id = whose drive this belongs to (tenant key).
+        # telegram_user_id = which Telegram account's Saved Messages holds the message.
+        # They were one and the same before multi-account, hence the backfill — which
+        # only runs on the migration pass, never again (the ALTER raises after that).
+        try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0")
+            await self._conn.execute("UPDATE files SET owner_id = telegram_user_id")
+        except aiosqlite.OperationalError:
+            pass
+
         try:
             await self._conn.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
         except aiosqlite.OperationalError:
@@ -127,17 +137,44 @@ class Database:
             pass
 
         # Indexes for the query patterns in get_files_paginated / find_by_hash /
-        # find_file_by_name_and_parent (avoids full table scans as row count grows)
+        # find_file_by_name_and_parent (avoids full table scans as row count grows).
+        # The old telegram_user_id-keyed pair is dropped: tenant filtering moved to owner_id.
+        await self._conn.execute("DROP INDEX IF EXISTS idx_files_user_parent")
+        await self._conn.execute("DROP INDEX IF EXISTS idx_files_hash")
         await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_user_parent ON files(telegram_user_id, isDir, parent_id)"
+            "CREATE INDEX IF NOT EXISTS idx_files_owner_parent ON files(owner_id, isDir, parent_id)"
         )
-        # find_by_hash/find_by_hashes always filter by (file_hash, telegram_user_id) together
+        # find_by_hash/find_by_hashes always filter by (file_hash, owner_id) together,
+        # so dedup now spans every account linked to the drive.
         await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash, telegram_user_id)"
+            "CREATE INDEX IF NOT EXISTS idx_files_hash_owner ON files(file_hash, owner_id)"
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_files_split_group ON files(split_group_id)"
         )
+
+        # One drive, many Telegram accounts. The UNIQUE index on telegram_user_id is a
+        # security boundary, not a perf tweak: without it A could link B's account into
+        # A's drive and read B's file listing.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS linked_accounts (
+                owner_id          INTEGER NOT NULL,
+                telegram_user_id  INTEGER NOT NULL,
+                label             TEXT,
+                is_primary        INTEGER NOT NULL DEFAULT 0,
+                added_at          TEXT NOT NULL,
+                PRIMARY KEY (owner_id, telegram_user_id)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_unique ON linked_accounts(telegram_user_id)"
+        )
+        # Backfill: pre-multi-account, every distinct account was its own drive's primary.
+        await self._conn.execute("""
+            INSERT OR IGNORE INTO linked_accounts (owner_id, telegram_user_id, is_primary, added_at)
+            SELECT DISTINCT telegram_user_id, telegram_user_id, 1, datetime('now')
+            FROM files WHERE telegram_user_id != 0
+        """)
 
         # Upload sessions table
         await self._conn.execute("""
@@ -188,8 +225,13 @@ class Database:
         split_group_id: Optional[str] = None,
         telegram_user_id: int = 0,
         file_hash: Optional[str] = None,
+        owner_id: Optional[int] = None,
     ) -> None:
-        """Insert a new file record."""
+        """Insert a new file record.
+
+        owner_id is the drive; telegram_user_id is the account storing the message.
+        Callers that predate multi-account pass only the latter — same value for both.
+        """
         if not self._conn:
             raise RuntimeError("Database not connected")
 
@@ -199,29 +241,30 @@ class Database:
                 telegram_message_id, has_thumbnail,
                 created_at, direct_url, access_hash, parent_id, isDir,
                 is_split_file, original_name, part_index, total_parts, split_group_id,
-                telegram_user_id, file_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                telegram_user_id, file_hash, owner_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_id, filename, filesize, mime_type, file_type,
             telegram_message_id, 1 if has_thumbnail else 0,
             created_at, direct_url, access_hash, parent_id, 1 if is_dir else 0,
             1 if is_split_file else 0, original_name, part_index, total_parts, split_group_id,
             telegram_user_id, file_hash,
+            telegram_user_id if owner_id is None else owner_id,
         ))
         await self._conn.commit()
 
-    async def find_by_hash(self, file_hash: str, telegram_user_id: int) -> List[dict]:
-        """Find all file records with the given SHA-256 hash for this user."""
+    async def find_by_hash(self, file_hash: str, owner_id: int) -> List[dict]:
+        """Find all file records with the given SHA-256 hash in this drive."""
         if not self._conn:
             raise RuntimeError("Database not connected")
         cursor = await self._conn.execute(
-            "SELECT * FROM files WHERE file_hash = ? AND telegram_user_id = ? AND isDir = 0 AND trashed_at IS NULL ORDER BY part_index ASC",
-            (file_hash, telegram_user_id),
+            "SELECT * FROM files WHERE file_hash = ? AND owner_id = ? AND isDir = 0 AND trashed_at IS NULL ORDER BY part_index ASC",
+            (file_hash, owner_id),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def find_by_hashes(self, hashes: List[str], telegram_user_id: int) -> dict[str, List[dict]]:
+    async def find_by_hashes(self, hashes: List[str], owner_id: int) -> dict[str, List[dict]]:
         """Find file records for multiple SHA-256 hashes at once, grouped by hash."""
         if not self._conn:
             raise RuntimeError("Database not connected")
@@ -236,8 +279,8 @@ class Database:
             placeholders = ",".join("?" for _ in chunk)
             cursor = await self._conn.execute(
                 f"SELECT * FROM files WHERE file_hash IN ({placeholders}) "
-                f"AND telegram_user_id = ? AND isDir = 0 AND trashed_at IS NULL ORDER BY file_hash, part_index ASC",
-                (*chunk, telegram_user_id),
+                f"AND owner_id = ? AND isDir = 0 AND trashed_at IS NULL ORDER BY file_hash, part_index ASC",
+                (*chunk, owner_id),
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -245,15 +288,15 @@ class Database:
                 result.setdefault(d["file_hash"], []).append(d)
         return result
     
-    async def get_file(self, file_id: str, telegram_user_id: Optional[int] = None) -> Optional[dict]:
-        """Get a file by ID, optionally filtered by telegram_user_id."""
+    async def get_file(self, file_id: str, owner_id: Optional[int] = None) -> Optional[dict]:
+        """Get a file by ID, optionally scoped to a drive."""
         if not self._conn:
             raise RuntimeError("Database not connected")
 
-        if telegram_user_id is not None:
+        if owner_id is not None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE file_id = ? AND telegram_user_id = ?",
-                (file_id, telegram_user_id)
+                "SELECT * FROM files WHERE file_id = ? AND owner_id = ?",
+                (file_id, owner_id)
             )
         else:
             cursor = await self._conn.execute(
@@ -265,19 +308,23 @@ class Database:
             return dict(row)
         return None
     
-    async def find_file_by_name_and_parent(self, filename: str, parent_id: Optional[str], telegram_user_id: int = 0) -> Optional[dict]:
-        """Find a non-directory file by filename and parent_id (for replace-on-duplicate logic)."""
+    async def find_file_by_name_and_parent(self, filename: str, parent_id: Optional[str], owner_id: int = 0) -> Optional[dict]:
+        """Find a non-directory file by filename and parent_id (for replace-on-duplicate logic).
+
+        Drive-scoped, not account-scoped: the same name in the same folder is one
+        logical file no matter which linked account happens to store it.
+        """
         if not self._conn:
             raise RuntimeError("Database not connected")
         if parent_id is None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
-                (filename, telegram_user_id)
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 0 AND owner_id = ? AND trashed_at IS NULL LIMIT 1",
+                (filename, owner_id)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
-                (filename, parent_id, telegram_user_id)
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 0 AND owner_id = ? AND trashed_at IS NULL LIMIT 1",
+                (filename, parent_id, owner_id)
             )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -286,7 +333,7 @@ class Database:
         self,
         filename: str,
         parent_id: Optional[str],
-        telegram_user_id: int = 0,
+        owner_id: int = 0,
         exclude_split_group_id: Optional[str] = None,
     ) -> List[dict]:
         """Find EVERY live non-directory row with this filename+parent (for replace-on-duplicate).
@@ -300,8 +347,8 @@ class Database:
         if not self._conn:
             raise RuntimeError("Database not connected")
 
-        clauses = ["filename = ?", "isDir = 0", "telegram_user_id = ?", "trashed_at IS NULL"]
-        params: List[object] = [filename, telegram_user_id]
+        clauses = ["filename = ?", "isDir = 0", "owner_id = ?", "trashed_at IS NULL"]
+        params: List[object] = [filename, owner_id]
         if parent_id is None:
             clauses.append("parent_id IS NULL")
         else:
@@ -317,19 +364,19 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def find_folder_by_name_and_parent(self, name: str, parent_id: Optional[str], telegram_user_id: int = 0) -> Optional[dict]:
+    async def find_folder_by_name_and_parent(self, name: str, parent_id: Optional[str], owner_id: int = 0) -> Optional[dict]:
         """Find a folder by name and parent_id (for reuse-on-duplicate logic)."""
         if not self._conn:
             raise RuntimeError("Database not connected")
         if parent_id is None:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
-                (name, telegram_user_id)
+                "SELECT * FROM files WHERE filename = ? AND parent_id IS NULL AND isDir = 1 AND owner_id = ? AND trashed_at IS NULL LIMIT 1",
+                (name, owner_id)
             )
         else:
             cursor = await self._conn.execute(
-                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 AND telegram_user_id = ? AND trashed_at IS NULL LIMIT 1",
-                (name, parent_id, telegram_user_id)
+                "SELECT * FROM files WHERE filename = ? AND parent_id = ? AND isDir = 1 AND owner_id = ? AND trashed_at IS NULL LIMIT 1",
+                (name, parent_id, owner_id)
             )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -350,7 +397,7 @@ class Database:
         parent_id: Optional[str] = None,
         is_dir: bool = False,
         split_group_id: Optional[str] = None,
-        telegram_user_id: int = 0,
+        owner_id: int = 0,
         sort_by: str = "date",
         sort_order: str = "desc",
         search: Optional[str] = None,
@@ -365,8 +412,8 @@ class Database:
         if not self._conn:
             raise RuntimeError("Database not connected")
 
-        where_clauses = ["telegram_user_id = ?"]
-        params: list = [telegram_user_id]
+        where_clauses = ["owner_id = ?"]
+        params: list = [owner_id]
 
         # "spanning" modes (search / trash) ignore parent_id + isDir and return
         # both files and folders in one result set.
@@ -378,9 +425,9 @@ class Database:
             # trashed folder's contents don't flood the trash listing.
             where_clauses.append(
                 "(parent_id IS NULL OR parent_id NOT IN "
-                "(SELECT file_id FROM files WHERE trashed_at IS NOT NULL AND telegram_user_id = ?))"
+                "(SELECT file_id FROM files WHERE trashed_at IS NOT NULL AND owner_id = ?))"
             )
-            params.append(telegram_user_id)
+            params.append(owner_id)
         else:
             where_clauses.append("trashed_at IS NULL")
 
@@ -495,16 +542,16 @@ class Database:
         await self._conn.commit()
         return count
 
-    async def delete_user_files(self, telegram_user_id: int) -> int:
-        """Delete all files belonging to a specific user."""
+    async def delete_user_files(self, owner_id: int) -> int:
+        """Delete every file in a drive, across all its linked accounts."""
         if not self._conn:
             raise RuntimeError("Database not connected")
         cursor = await self._conn.execute(
-            "SELECT COUNT(*) FROM files WHERE telegram_user_id = ?", (telegram_user_id,)
+            "SELECT COUNT(*) FROM files WHERE owner_id = ?", (owner_id,)
         )
         row = await cursor.fetchone()
         count = row[0] if row else 0
-        await self._conn.execute("DELETE FROM files WHERE telegram_user_id = ?", (telegram_user_id,))
+        await self._conn.execute("DELETE FROM files WHERE owner_id = ?", (owner_id,))
         await self._conn.commit()
         return count
     
@@ -618,17 +665,101 @@ class Database:
         await self._conn.commit()
         return deleted
 
-    async def get_files_by_split_group(self, split_group_id: str, telegram_user_id: int = 0) -> List[dict]:
-        """Get all files belonging to a split group, sorted by part_index."""
+    async def get_files_by_split_group(self, split_group_id: str, owner_id: int = 0) -> List[dict]:
+        """Get all parts of a split group, sorted by part_index.
+
+        Drive-scoped: a split file's parts may live in different linked accounts.
+        """
         if not self._conn:
             raise RuntimeError("Database not connected")
 
         cursor = await self._conn.execute(
-            "SELECT * FROM files WHERE split_group_id = ? AND telegram_user_id = ? ORDER BY part_index ASC",
-            (split_group_id, telegram_user_id)
+            "SELECT * FROM files WHERE split_group_id = ? AND owner_id = ? ORDER BY part_index ASC",
+            (split_group_id, owner_id)
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ==================== Linked Account Operations ====================
+
+    async def get_owner_of(self, telegram_user_id: int) -> Optional[int]:
+        """Which drive owns this Telegram account? None = not linked anywhere."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "SELECT owner_id FROM linked_accounts WHERE telegram_user_id = ?", (telegram_user_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def link_account(
+        self,
+        owner_id: int,
+        telegram_user_id: int,
+        is_primary: bool = False,
+        label: Optional[str] = None,
+    ) -> bool:
+        """Link an account to a drive. False if it already belongs to some drive."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        try:
+            await self._conn.execute(
+                "INSERT INTO linked_accounts (owner_id, telegram_user_id, label, is_primary, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (owner_id, telegram_user_id, label, 1 if is_primary else 0,
+                 datetime.utcnow().isoformat()),
+            )
+        except aiosqlite.IntegrityError:
+            return False  # idx_linked_unique — already claimed by a drive
+        await self._conn.commit()
+        return True
+
+    async def list_linked_accounts(self, owner_id: int) -> List[dict]:
+        """Accounts in this drive, each with how many live files it stores."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute("""
+            SELECT la.telegram_user_id, la.label, la.is_primary, la.added_at,
+                   (SELECT COUNT(*) FROM files f
+                    WHERE f.telegram_user_id = la.telegram_user_id
+                      AND f.owner_id = la.owner_id AND f.isDir = 0) AS file_count
+            FROM linked_accounts la
+            WHERE la.owner_id = ?
+            ORDER BY la.is_primary DESC, la.added_at ASC
+        """, (owner_id,))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_linked_account(self, owner_id: int, telegram_user_id: int) -> Optional[dict]:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "SELECT * FROM linked_accounts WHERE owner_id = ? AND telegram_user_id = ?",
+            (owner_id, telegram_user_id),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def count_files_on_account(self, owner_id: int, telegram_user_id: int) -> int:
+        """How many file records (incl. trashed) still point at this account's messages."""
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM files WHERE owner_id = ? AND telegram_user_id = ? AND isDir = 0",
+            (owner_id, telegram_user_id),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def unlink_account(self, owner_id: int, telegram_user_id: int) -> bool:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        cursor = await self._conn.execute(
+            "DELETE FROM linked_accounts WHERE owner_id = ? AND telegram_user_id = ?",
+            (owner_id, telegram_user_id),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
 
 
 # Singleton instance

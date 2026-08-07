@@ -26,6 +26,8 @@ function preloadKey(fileId: string, messageId: string, offset: number): string {
 // Split file parts cache (keyed by splitGroupId)
 interface SplitPartInfo {
   messageId: number;
+  /** Linked account holding this part's message — access_hash is account-scoped. */
+  accountId: number;
   size: number;
   startOffset: number;
 }
@@ -176,15 +178,19 @@ function getRangeHeader(request: Request): string | null {
 }
 
 /**
- * Parse URL to extract fileId and messageId
- * URL format: /preview-video/{fileId}/{messageId}
+ * Parse URL to extract fileId, messageId and the account that stores it.
+ * URL format: /preview-video/{fileId}/{messageId}/{accountId}
+ * accountId is what lets the main app pick the right GramJS client; without it
+ * a getMessages against the wrong account can silently return a DIFFERENT
+ * message that happens to share the id.
  */
-function parseVideoUrl(pathname: string): { fileId: string; messageId: string } | null {
+function parseVideoUrl(pathname: string): { fileId: string; messageId: string; accountId: string } | null {
   const parts = pathname.replace(VIDEO_PREVIEW_PATH, '').split('/');
   if (parts.length >= 2 && parts[0] && parts[1]) {
     return {
       fileId: parts[0],
       messageId: parts[1],
+      accountId: parts[2] || '0',
     };
   }
   return null;
@@ -197,6 +203,7 @@ function parseVideoUrl(pathname: string): { fileId: string; messageId: string } 
 async function requestChunkFromApp(
   fileId: string,
   messageId: string,
+  accountId: string,
   offset: number,
   limit: number,
   fileSize?: number,
@@ -207,7 +214,7 @@ async function requestChunkFromApp(
   
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      return await requestChunkOnce(fileId, messageId, offset, limit, fileSize);
+      return await requestChunkOnce(fileId, messageId, accountId, offset, limit, fileSize);
     } catch (err: any) {
       lastError = err;
       
@@ -235,6 +242,7 @@ async function requestChunkFromApp(
 function requestChunkOnce(
   fileId: string,
   messageId: string,
+  accountId: string,
   offset: number,
   limit: number,
   fileSize?: number
@@ -269,6 +277,7 @@ function requestChunkOnce(
           requestId,
           fileId,
           messageId: parseInt(messageId, 10),
+          accountId: parseInt(accountId, 10),
           offset,
           limit,
           fileSize,
@@ -287,7 +296,7 @@ function requestChunkOnce(
 /**
  * Get file metadata (size and mimeType) from main app
  */
-async function requestFileMetadata(fileId: string, messageId: string): Promise<{ size: number; mimeType: string }> {
+async function requestFileMetadata(fileId: string, messageId: string, accountId: string): Promise<{ size: number; mimeType: string }> {
   return new Promise((resolve, reject) => {
     const requestId = `meta_${Date.now()}`;
     const channel = new MessageChannel();
@@ -317,6 +326,7 @@ async function requestFileMetadata(fileId: string, messageId: string): Promise<{
           requestId,
           fileId,
           messageId: parseInt(messageId, 10),
+          accountId: parseInt(accountId, 10),
         }, [channel.port2]);
       }
       
@@ -337,6 +347,7 @@ async function requestFileMetadata(fileId: string, messageId: string): Promise<{
 function preloadAhead(
   fileId: string,
   messageId: string,
+  accountId: string,
   currentOffset: number,
   chunkSize: number,
   fileSize: number
@@ -362,7 +373,7 @@ function preloadAhead(
     const entry: PreloadEntry = { data: null, inProgress: true };
     preloadCache.set(key, entry);
 
-    requestChunkFromApp(fileId, messageId, nextOffset, chunkSize, fileSize)
+    requestChunkFromApp(fileId, messageId, accountId, nextOffset, chunkSize, fileSize)
       .then((data) => {
         const e = preloadCache.get(key);
         if (e) { e.data = data; e.inProgress = false; }
@@ -445,16 +456,19 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         const bytesLeftInPart = part.size - partOffset;
         const effectiveLimit = Math.min(limit, bytesLeftInPart);
 
+        // Parts of one split file can live on different accounts (they were
+        // uploaded in parallel), so each part carries its own.
         const chunkData = await requestChunkFromApp(
           splitGroupId,
           String(part.messageId),
+          String(part.accountId ?? 0),
           partOffset,
           effectiveLimit,
           part.size
         );
 
         // Preload next PRELOAD_AHEAD chunks within the same part
-        preloadAhead(splitGroupId, String(part.messageId), partOffset, effectiveLimit, part.size);
+        preloadAhead(splitGroupId, String(part.messageId), String(part.accountId ?? 0), partOffset, effectiveLimit, part.size);
 
         const responseEndByte = rawRange.offset + chunkData.byteLength - 1;
         return new Response(chunkData, {
@@ -487,7 +501,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
     event.respondWith(
       new Response(null, {
         status: 400,
-        statusText: 'Bad Request - URL should be /preview-video/{fileId}/{messageId}',
+        statusText: 'Bad Request - URL should be /preview-video/{fileId}/{messageId}/{accountId}',
       })
     );
     return;
@@ -520,7 +534,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
       try {
         // Get file metadata
         console.log('[ServiceWorker] Requesting file metadata...');
-        const metadata = await requestFileMetadata(urlParams.fileId, urlParams.messageId);
+        const metadata = await requestFileMetadata(urlParams.fileId, urlParams.messageId, urlParams.accountId);
         console.log('[ServiceWorker] Got metadata - size:', metadata.size, 'mimeType:', metadata.mimeType);
 
         // Parse Range header with actual file size
@@ -562,6 +576,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
           chunkData = await requestChunkFromApp(
             urlParams.fileId,
             urlParams.messageId,
+            urlParams.accountId,
             rawRange.offset,
             limit,
             metadata.size
@@ -570,7 +585,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         }
 
         // Immediately kick off preloading the next PRELOAD_AHEAD chunks in parallel
-        preloadAhead(urlParams.fileId, urlParams.messageId, rawRange.offset, limit, metadata.size);
+        preloadAhead(urlParams.fileId, urlParams.messageId, urlParams.accountId, rawRange.offset, limit, metadata.size);
 
         const responseEndByte = rawRange.offset + chunkData.byteLength - 1;
         

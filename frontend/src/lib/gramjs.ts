@@ -3,7 +3,6 @@ import { StringSession } from "telegram/sessions";
 import { CustomFile } from "telegram/client/uploads";
 import { Api } from "telegram/tl";
 import bigInt from "big-integer";
-import { api } from "../api/client";
 import {
   MAX_CONCURRENT_CHUNKS,
   CHUNK_RETRY_COUNT,
@@ -33,6 +32,7 @@ import {
   CHUNK_ESCALATED_CEILING_FACTOR,
   CHUNK_ESCALATED_CLEAN_WINDOW_MS,
   CHUNK_ESCALATION_RESET_MS,
+  CHUNK_SIZE as PART_SIZE,
 } from "../config";
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
@@ -70,9 +70,6 @@ function installTelegramWsProxy(): void {
   (window as any).WebSocket = TelegramProxiedWebSocket;
 }
 
-// Constants for split upload
-const MAX_PARTS = 1000;
-const PART_SIZE = 512 * 1024; // 512KB
 
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
@@ -164,6 +161,17 @@ function invokeWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * Generate a random BigInteger for fileId in SaveBigFilePart operations.
  * Uses big-integer library for compatibility with GramJS API.
  */
+/** One Telegram message's worth of a (possibly split) file. `index` is the segment order. */
+export type SegmentResult = {
+  index: number;
+  message_id: number;
+  file_id: string;
+  access_hash?: string;
+  size: number;
+  /** Account holding this message — access_hash is only valid against it. */
+  account_id: number;
+};
+
 export type PreparedAlbumFile = { file: File; media: Api.InputMediaDocument; docId: unknown; hasThumbnail: boolean };
 export type AlbumFileResult = { message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean };
 
@@ -283,7 +291,8 @@ export class TelegramClientManager {
    */
   private async getFileLocation(
     messageId: number,
-    forceRefresh = false
+    forceRefresh = false,
+    expectedFileId?: string,
   ): Promise<{ docId: bigint; accessHash: bigint; fileReference?: Uint8Array }> {
     if (!forceRefresh) {
       const cached = this.fileLocationCache.get(messageId);
@@ -297,6 +306,14 @@ export class TelegramClientManager {
       throw new Error('Unsupported media type: ' + media?.className);
     }
     const doc = media.document;
+    if (expectedFileId && String(doc.id) !== expectedFileId) {
+      // Message ids are only unique within one account. If we ever ask the
+      // wrong client, this is what turns "silently downloaded someone else's
+      // file" into a loud failure.
+      throw new Error(
+        `Message ${messageId} on account ${this.accountId} holds document ${doc.id}, expected ${expectedFileId}`
+      );
+    }
     const location = { docId: doc.id as bigint, accessHash: doc.accessHash as bigint, fileReference: doc.fileReference as Uint8Array | undefined };
     this.fileLocationCache.set(messageId, location);
     return location;
@@ -410,177 +427,115 @@ export class TelegramClientManager {
   }
 
   /**
-   * Upload a large file to Telegram using SaveBigFilePart API.
-   * Automatically splits file into 512KB chunks and switches to new file
-   * when partIndex reaches MAX_PARTS (3900 parts = 2GB).
-   * 
-   * @param file - The file to upload (Browser File object)
-   * @returns Promise with upload results containing message_id, file_id, access_hash, and size for each part
+   * Upload a whole file that fits in one Telegram message via GramJS's own
+   * sendFile (≤10MB path — CustomFile, not SaveBigFilePart).
    */
-  async uploadFileSplit(file: File, onProgress?: (pct: number) => void, thumb?: Blob | null): Promise<{
-    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>;
-    originalName: string;
-    totalParts: number;
-    hasThumbnail: boolean;
-  }> {
+  async uploadSmallFile(file: File, thumb?: Blob | null): Promise<SegmentResult & { hasThumbnail: boolean }> {
     await this.waitUntilReady();
-    if (!this.client) {
-      throw new Error("Client not initialized. Call initialize() first.");
+    if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
+
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+    const customFile = new CustomFile(file.name, file.size, "", buffer);
+
+    const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
+      file: customFile,
+      workers: 4,
+      forceDocument: true,
+    }, thumb);
+
+    const msg = message as Api.Message;
+    let fileId = "";
+    let accessHash: string | undefined;
+
+    if (msg.media) {
+      const mediaConstructor = (msg.media as { className?: string }).className;
+      if (mediaConstructor === "MessageMediaDocument") {
+        const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
+        fileId = String(doc.document.id);
+        accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
+      } else if (mediaConstructor === "MessageMediaPhoto") {
+        const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
+        fileId = String(photo.photo.id);
+        accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
+      }
     }
 
-    const useBigFile = file.size > 10 * 1024 * 1024;
-    console.log('[SplitUpload] File:', file.name, 'Size:', file.size, 'bytes, useBigFile:', useBigFile);
+    console.log('[SplitUpload] Small file uploaded, message_id:', msg.id);
+    return { index: 0, message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, account_id: this.accountId, hasThumbnail };
+  }
 
-    if (!useBigFile) {
-      console.log('[SplitUpload] Small file - using CustomFile approach');
-      const arrayBuffer = await file.arrayBuffer();
-      const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-      const customFile = new CustomFile(file.name, file.size, "", buffer);
+  /**
+   * Upload ONE segment of a large file (up to MAX_PARTS 512KB parts) and turn it
+   * into a single Telegram message. Everything here — the chunk semaphore, the
+   * pacer, the resulting access_hash — belongs to this account alone, which is
+   * what lets sibling segments run on other accounts concurrently.
+   *
+   * The returned index is the caller's segment index: message ids are only
+   * monotonic WITHIN an account, so they cannot order parts that were spread
+   * across accounts. See splitUpload.ts.
+   */
+  async uploadSegment(
+    file: File,
+    segment: { index: number; offset: number; parts: number; size: number },
+    thumb?: Blob | null,
+    onChunkDone?: () => void,
+  ): Promise<SegmentResult & { hasThumbnail: boolean }> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
 
-      const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
-        file: customFile,
-        workers: 4,
-        forceDocument: true,
-      }, thumb);
+    const fileId = generateRandomBigInt();
+    console.log(`[SplitUpload:${this.accountId}] segment ${segment.index}: ${segment.parts} parts at offset ${segment.offset}`);
 
-      const msg = message as Api.Message;
-      let fileId = "";
-      let accessHash: string | undefined;
+    await Promise.all(Array.from({ length: segment.parts }, (_, partIdx) =>
+      this.uploadSemaphore.withSlot(async () => {
+        const offset = segment.offset + partIdx * PART_SIZE;
+        const chunk = file.slice(offset, Math.min(offset + PART_SIZE, file.size));
+        const bytes = (globalThis as any).Buffer.from(new Uint8Array(await chunk.arrayBuffer()));
 
-      if (msg.media) {
-        const mediaConstructor = (msg.media as { className?: string }).className;
-        if (mediaConstructor === "MessageMediaDocument") {
-          const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
-          fileId = String(doc.document.id);
-          accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
-        } else if (mediaConstructor === "MessageMediaPhoto") {
-          const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
-          fileId = String(photo.photo.id);
-          accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
-        }
-      }
-
-      console.log('[SplitUpload] Small file uploaded, message_id:', msg.id);
-      onProgress?.(100);
-      return {
-        parts: [{ message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size }],
-        originalName: file.name,
-        totalParts: 1,
-        hasThumbnail,
-      };
-    }
-
-    const uploadedParts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }> = [];
-    let fileId = generateRandomBigInt();
-    let segmentStartOffset = 0;
-    let remainingSize = file.size;
-    const totalChunks = Math.ceil(file.size / PART_SIZE);
-    let completedChunks = 0;
-    let thumbAttached = false;
-
-    console.log('[SplitUpload] Large file - total parts:', totalChunks);
-
-    while (remainingSize > 0) {
-      const partsInSegment = Math.min(MAX_PARTS, Math.ceil(remainingSize / PART_SIZE));
-      const isBoundarySegment = partsInSegment === MAX_PARTS;
-      const segmentSize = partsInSegment * PART_SIZE;
-      
-      console.log('[SplitUpload] Starting segment with', partsInSegment, 'parts, offset:', segmentStartOffset);
-      
-      // Upload all chunks in this segment in parallel (bounded by semaphore)
-      const chunkPromises: Promise<void>[] = [];
-      
-      for (let i = 0; i < partsInSegment; i++) {
-        const partIdx = i;
-        const offset = segmentStartOffset + i * PART_SIZE;
-        
-        chunkPromises.push(
-          this.uploadSemaphore.withSlot(async () => {
-            const chunk = file.slice(offset, Math.min(offset + PART_SIZE, file.size));
-            const arrayBuffer = await chunk.arrayBuffer();
-            const bytes = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-            
-            for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
-              try {
-                await this.sendFilePartGated(new Api.upload.SaveBigFilePart({
-                  fileId: fileId,
-                  filePart: partIdx,
-                  fileTotalParts: partsInSegment,
-                  bytes: bytes,
-                }), 'SaveBigFilePart');
-                completedChunks++;
-                onProgress?.(Math.min(99, Math.round((completedChunks / totalChunks) * 100)));
-                console.log('[SplitUpload] Part', partIdx, 'uploaded successfully');
-                return;
-              } catch (err: any) {
-                console.error('[SplitUpload] Part', partIdx, 'attempt', retry + 1, 'FAILED:', err?.message || err);
-                if (retry === CHUNK_RETRY_COUNT - 1) {
-                  throw err;
-                }
-                // Exponential backoff (1s/2s/4s...) — FLOOD_WAIT is handled inside
-                // sendFilePartGated (global pause), this covers other transient failures.
-                await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
-              }
-            }
-          })
-        );
-      }
-      
-      await Promise.all(chunkPromises);
-      
-      // Serial: send InputFileBig for this segment
-      console.log('[SplitUpload] All chunks uploaded, sending file with', partsInSegment, 'parts...');
-      
-      const inputFileBig = new Api.InputFileBig({
-        id: fileId,
-        parts: partsInSegment,
-        name: file.name,
-      });
-
-      try {
-        const { message, hasThumbnail: segmentHasThumbnail } = await this.sendFileWithOptionalThumb({
-          file: inputFileBig,
-          forceDocument: true,
-        }, segmentStartOffset === 0 ? thumb : undefined);
-        if (segmentHasThumbnail) thumbAttached = true;
-        const msg = message as Api.Message;
-        console.log('[SplitUpload] File sent successfully, message_id:', msg?.id);
-        const media = msg.media;
-
-        let accessHash: string | undefined;
-        if (media) {
-          const mediaConstructor = (media as { className?: string }).className;
-          if (mediaConstructor === "MessageMediaDocument") {
-            const doc = media as unknown as { document: { id: bigint; accessHash?: bigint } };
-            accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
+        for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
+          try {
+            await this.sendFilePartGated(new Api.upload.SaveBigFilePart({
+              fileId,
+              filePart: partIdx,
+              fileTotalParts: segment.parts,
+              bytes,
+            }), 'SaveBigFilePart');
+            onChunkDone?.();
+            return;
+          } catch (err: any) {
+            console.error(`[SplitUpload:${this.accountId}] part ${partIdx} attempt ${retry + 1} FAILED:`, err?.message || err);
+            if (retry === CHUNK_RETRY_COUNT - 1) throw err;
+            // Exponential backoff (1s/2s/4s...) — FLOOD_WAIT is handled inside
+            // sendFilePartGated (rate cut + wait), this covers other transient failures.
+            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
           }
         }
+      })
+    ));
 
-        uploadedParts.push({
-          message_id: msg.id,
-          file_id: String(fileId),
-          access_hash: accessHash,
-          size: isBoundarySegment ? Math.min(segmentSize, file.size) : segmentSize,
-        });
-        console.log('[SplitUpload] Segment registered, parts:', partsInSegment, 'size:', isBoundarySegment ? Math.min(segmentSize, file.size) : segmentSize, 'bytes');
-      } catch (err: any) {
-        console.error('[SplitUpload] SendFile FAILED:', err?.message || err);
-        throw err;
-      }
+    const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
+      file: new Api.InputFileBig({ id: fileId, parts: segment.parts, name: file.name }),
+      forceDocument: true,
+    }, thumb);
 
-      fileId = generateRandomBigInt();
-      segmentStartOffset += segmentSize;
-      remainingSize -= segmentSize;
+    const msg = message as Api.Message;
+    const media = msg.media as { className?: string } | undefined;
+    let accessHash: string | undefined;
+    if (media?.className === "MessageMediaDocument") {
+      const doc = media as unknown as { document: { accessHash?: bigint } };
+      accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
     }
 
-    // Sort uploadedParts by segment order after parallel chunk collection
-    uploadedParts.sort((a, b) => a.message_id - b.message_id);
-
+    console.log(`[SplitUpload:${this.accountId}] segment ${segment.index} sent, message_id:`, msg.id);
     return {
-      parts: uploadedParts,
-      originalName: file.name,
-      totalParts: uploadedParts.reduce((sum, p) => sum + Math.ceil(p.size / PART_SIZE), 0),
-      hasThumbnail: thumbAttached,
+      index: segment.index,
+      message_id: msg.id,
+      file_id: String(fileId),
+      access_hash: accessHash,
+      size: segment.size,
+      account_id: this.accountId,
+      hasThumbnail,
     };
   }
 
@@ -1143,7 +1098,12 @@ export class TelegramClientManager {
     });
   }
 
-  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number, fileSize?: number): Promise<Blob> {
+  /**
+   * @param expectedFileId - the document id this message is supposed to hold.
+   *   Checked against what Telegram returns so a wrong-account lookup fails
+   *   loudly instead of streaming a same-numbered message's contents.
+   */
+  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number, fileSize?: number, expectedFileId?: string): Promise<Blob> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized");
@@ -1188,7 +1148,7 @@ export class TelegramClientManager {
 
     // Cached after the first chunk of a given message — subsequent chunks skip getMessages entirely.
     const invokeGetFile = async (off: number, lim: number): Promise<any> => {
-      const loc = await this.getFileLocation(messageId);
+      const loc = await this.getFileLocation(messageId, false, expectedFileId);
       try {
         return await this.client!.invoke(
           new Api.upload.GetFile({ location: toLocation(loc), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
@@ -1196,7 +1156,7 @@ export class TelegramClientManager {
       } catch (err: any) {
         if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {
           console.warn('[ChunkByOffset] File reference expired, refreshing for message', messageId);
-          const fresh = await this.getFileLocation(messageId, true);
+          const fresh = await this.getFileLocation(messageId, true, expectedFileId);
           return await this.client!.invoke(
             new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
           );
@@ -1242,69 +1202,6 @@ export class TelegramClientManager {
     // Discard prefix bytes so caller gets exactly offset..offset+limit
     const sliced = bytes.slice(prefix, prefix + limit);
     return new Blob([sliced], { type: 'video/mp4' });
-  }
-
-  /**
-   * Download and merge split file parts from Telegram.
-   * @param splitGroupId - The split group ID to identify all parts
-   * @param mimeType - The MIME type of the merged file (for Blob type)
-   * @returns Promise with merged Blob of the complete file
-   */
-  async downloadFileMerge(splitGroupId: string, mimeType: string = 'application/octet-stream'): Promise<Blob> {
-    console.log('[DownloadMerge] Starting for split_group_id:', splitGroupId);
-    // Query backend for all parts in this split group
-    const filePartsResponse = await api.getSplitGroupFiles(splitGroupId);
-    const fileParts = filePartsResponse.files;
-    console.log('[DownloadMerge] Found parts:', fileParts.length);
-
-    if (!fileParts || fileParts.length === 0) {
-      throw new Error("No files found for split group: " + splitGroupId);
-    }
-
-    // Sort by part_index and download sequentially
-    const sortedParts = fileParts.sort((a, b) => {
-      const aIndex = (a as unknown as { part_index?: number }).part_index ?? 0;
-      const bIndex = (b as unknown as { part_index?: number }).part_index ?? 0;
-      return aIndex - bIndex;
-    });
-
-    // Safety net: a genuine split never reuses a Telegram message across parts,
-    // so collapse any duplicate telegram_message_id down to a single part. This
-    // stops a corrupt split group (e.g. one accidentally registered with the
-    // same message thousands of times) from downloading forever.
-    const seenMessageIds = new Set<number>();
-    const uniqueParts = sortedParts.filter((p) => {
-      const id = p.telegram_message_id;
-      if (id == null || seenMessageIds.has(id)) return false;
-      seenMessageIds.add(id);
-      return true;
-    });
-    if (uniqueParts.length !== sortedParts.length) {
-      console.warn('[DownloadMerge] Dropped', sortedParts.length - uniqueParts.length, 'duplicate-message parts; downloading', uniqueParts.length, 'unique parts');
-    }
-
-    console.log('[DownloadMerge] Sorted parts:', uniqueParts.map(p => ({ idx: (p as any).part_index, msgId: p.telegram_message_id })));
-
-    // Download parts with bounded parallelism (order is restored below via the index)
-    const partSemaphore = new Semaphore(3);
-    const parts: Blob[] = await Promise.all(
-      uniqueParts.map((part, i) => partSemaphore.withSlot(async () => {
-        const messageId = part.telegram_message_id;
-        console.log('[DownloadMerge] Downloading part', i, 'messageId:', messageId);
-        if (!messageId) {
-          throw new Error(`Missing telegram_message_id for part: ${part.file_id}`);
-        }
-        const blob = await this.downloadFile(messageId, mimeType);
-        console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
-        return blob;
-      }))
-    );
-
-    console.log('[DownloadMerge] All parts downloaded, merging...');
-    // Merge all parts using Blob
-    const merged = new Blob(parts, { type: mimeType });
-    console.log('[DownloadMerge] Merged size:', merged.size);
-    return merged;
   }
 
   /**

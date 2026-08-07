@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
-import { getPrimaryClient, getAllClients, PreparedAlbumFile, AlbumFileResult } from '../lib/gramjs';
+import { getPrimaryClient, getClientFor, getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
+import { uploadFileSpread } from '../lib/splitUpload';
+import { withSlotOn, nextAccount } from '../lib/accountPool';
 import { captureThumb, isMediaFile } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
-import { MAX_CONCURRENT_FILES, ALBUM_BATCH } from '../config';
+import { ALBUM_BATCH } from '../config';
 import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, PlannedFile, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { ContextMenu, MenuItem } from './ContextMenu';
@@ -101,9 +103,7 @@ function isAlbumEligibleMedia(file: File): boolean {
  * This keeps the concurrency slots permanently busy with byte uploads
  * instead of idling on message sends or backend registration round trips.
  */
-function createAlbumPipeline(fileSemaphore: Semaphore) {
-  const telegramClient = getPrimaryClient();
-
+function createAlbumPipeline() {
   type PendingEntry = {
     prepared: PreparedAlbumFile;
     hash: string | null;
@@ -112,18 +112,27 @@ function createAlbumPipeline(fileSemaphore: Semaphore) {
     resolve: (result: AlbumFileResult | null) => void;
   };
 
-  const pending: PendingEntry[] = [];
+  // One queue per account. A prepared file's bytes live on the account that
+  // uploaded them, and SendMultiMedia can only group media from that same
+  // account — so batches are never mixed.
+  const pending = new Map<TelegramClientManager, PendingEntry[]>();
   const preparePromises: Promise<void>[] = [];
   const sendPromises: Promise<void>[] = [];
 
-  const dispatchBatch = () => {
-    const batch = pending.splice(0, ALBUM_BATCH);
+  const queueFor = (client: TelegramClientManager): PendingEntry[] => {
+    let q = pending.get(client);
+    if (!q) { q = []; pending.set(client, q); }
+    return q;
+  };
+
+  const dispatchBatch = (client: TelegramClientManager) => {
+    const batch = queueFor(client).splice(0, ALBUM_BATCH);
     if (batch.length === 0) return;
     sendPromises.push((async () => {
       const t0 = performance.now();
       let results: AlbumFileResult[];
       try {
-        results = await telegramClient.sendAlbum(batch.map((e) => e.prepared));
+        results = await client.sendAlbum(batch.map((e) => e.prepared));
       } catch (err) {
         console.error('[AlbumPipeline] sendAlbum failed:', err);
         batch.forEach((e) => { e.onProgress?.(100); e.resolve(null); });
@@ -154,24 +163,28 @@ function createAlbumPipeline(fileSemaphore: Semaphore) {
           totalParts: undefined,
           originalName: file.name,
           fileHash: entry.hash ?? undefined,
+          telegramUserId: client.accountId,
         }).then(
           () => { entry.onProgress?.(100); entry.resolve({ message_id: res.message_id, file_id: res.file_id, access_hash: res.access_hash, size: res.size, has_thumbnail: res.has_thumbnail }); },
           (err) => { console.error('[AlbumPipeline] registerFile failed:', err); entry.onProgress?.(100); entry.resolve(null); },
         );
       }));
-      console.log(`[Perf] dispatchBatch x${batch.length}: sendAlbum=${Math.round(tSend - t0)}ms register=${Math.round(performance.now() - tSend)}ms`);
+      console.log(`[Perf] dispatchBatch x${batch.length} on account ${client.accountId}: sendAlbum=${Math.round(tSend - t0)}ms register=${Math.round(performance.now() - tSend)}ms`);
     })());
   };
 
   return {
-    /** Prepare one file under fileSemaphore, releasing the slot the instant
+    /** Prepare one file under an account slot, releasing the slot the instant
      * bytes are on Telegram's servers. Resolves once the file's batch has
      * been sent and registered (which may happen well after this call returns
      * — the caller awaits the returned promise to know the final outcome). */
     enqueue(file: File, hash: string | null, parentId: string | null, onProgress?: (pct: number) => void): Promise<AlbumFileResult | null> {
       return new Promise((resolve) => {
         const tQueued = performance.now();
-        const p = fileSemaphore.withSlot(async () => {
+        // The account is chosen here and stays with this file all the way
+        // through sendAlbum — bytes and the album call must be on one account.
+        const client = nextAccount();
+        const p = withSlotOn(client, async () => {
           const tSlot = performance.now();
           const thumb = await captureThumb(file);
           // The album path only ever handles media files, which MUST carry a
@@ -179,14 +192,15 @@ function createAlbumPipeline(fileSemaphore: Semaphore) {
           // rather than silently landing a thumbless file in the drive.
           if (!thumb) throw new Error(`Thumbnail capture failed for ${file.name}`);
           const tThumb = performance.now();
-          const prepared = await telegramClient.prepareAlbumFile(file, thumb);
-          console.log(`[Perf] enqueue ${file.name}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
+          const prepared = await client.prepareAlbumFile(file, thumb);
+          console.log(`[Perf] enqueue ${file.name} on account ${client.accountId}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
           return prepared;
         }).then((prepared) => {
           onProgress?.(50);
           if (!prepared) { resolve(null); return; }
-          pending.push({ prepared, hash, parentId, onProgress, resolve });
-          if (pending.length >= ALBUM_BATCH) dispatchBatch();
+          const queue = queueFor(client);
+          queue.push({ prepared, hash, parentId, onProgress, resolve });
+          if (queue.length >= ALBUM_BATCH) dispatchBatch(client);
         }).catch((err) => {
           console.error('[AlbumPipeline] Prepare failed:', err);
           onProgress?.(50);
@@ -196,11 +210,13 @@ function createAlbumPipeline(fileSemaphore: Semaphore) {
       });
     },
     /** Call once all enqueue() calls have been made: waits for every prepare
-     * to finish, sends the leftover partial batch, then waits for every
-     * send+register to complete. */
+     * to finish, sends each account's leftover partial batch, then waits for
+     * every send+register to complete. */
     async flush(): Promise<void> {
       await Promise.allSettled(preparePromises);
-      while (pending.length > 0) dispatchBatch();
+      for (const [client, queue] of pending) {
+        while (queue.length > 0) dispatchBatch(client);
+      }
       await Promise.allSettled(sendPromises);
     },
   };
@@ -302,16 +318,26 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     if (signal?.aborted || misses.length === 0) return;
 
-    // 2. Cache misses → one getMessages round trip for the whole batch, then parallel downloadMedia
-    const messageIdToFile = new Map(misses.map((f) => [f.telegram_message_id!, f]));
+    // 2. Cache misses → one getMessages round trip PER ACCOUNT (a message id is
+    //    only meaningful to the account that holds it), then parallel thumb fetches.
+    const byAccount = new Map<number, FileInfo[]>();
+    for (const file of misses) {
+      const key = file.telegram_user_id ?? 0;
+      const group = byAccount.get(key);
+      if (group) group.push(file); else byAccount.set(key, [file]);
+    }
     try {
-      const blobs = await getPrimaryClient().downloadThumbnails(Array.from(messageIdToFile.keys()));
-      for (const [messageId, blob] of blobs) {
-        const file = messageIdToFile.get(messageId);
-        if (!file || signal?.aborted) continue;
-        setCachedThumbnail(file.file_id, blob).catch(() => {});
-        setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
-      }
+      await Promise.all([...byAccount].map(async ([accountId, group]) => {
+        const messageIdToFile = new Map(group.map((f) => [f.telegram_message_id!, f]));
+        const client = accountId ? getClientFor(accountId) : getPrimaryClient();
+        const blobs = await client.downloadThumbnails(Array.from(messageIdToFile.keys()));
+        for (const [messageId, blob] of blobs) {
+          const file = messageIdToFile.get(messageId);
+          if (!file || signal?.aborted) continue;
+          setCachedThumbnail(file.file_id, blob).catch(() => {});
+          setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
+        }
+      }));
     } catch (err: any) {
       if (err?.name !== 'AbortError') {
         console.warn('[Thumb] Batch download error:', err?.message);
@@ -637,11 +663,10 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     onProgress?: (pct: number) => void,
     precomputedHash?: string | null,
   ): Promise<{
-    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>;
+    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean; account_id: number }>;
     fileHash: string | null;
     alreadyRegistered: boolean;
   }> => {
-    const telegramClient = getPrimaryClient();
 
     // Start thumbnail capture NOW from the local file so it runs concurrently with
     // the dedup check. Capturing a frame from a local file takes < 1 second
@@ -665,7 +690,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           return {
             // file_id is unused here — alreadyRegistered=true tells the caller to
             // skip registerUploadedParts, which is the only consumer that needs it.
-            parts: asExisting.map((p) => ({ message_id: p.telegram_message_id, file_id: '', access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false })),
+            parts: asExisting.map((p) => ({ message_id: p.telegram_message_id, file_id: '', access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false, account_id: p.telegram_user_id ?? 0 })),
             fileHash,
             alreadyRegistered: true,
           };
@@ -681,7 +706,9 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       throw new Error(`Thumbnail capture failed for ${file.name}`);
     }
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
-    const uploadResult = await telegramClient.uploadFileSplit(file, onProgress, thumbBlob);
+    // Unpinned: segments of a >512MB file are dispatched to different accounts
+    // and upload concurrently. Each takes a slot on the account it lands on.
+    const uploadResult = await uploadFileSpread(file, onProgress, thumbBlob);
     console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
 
     return {
@@ -696,7 +723,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   const registerUploadedParts = async (
     file: File,
     fileHash: string | null,
-    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean }>,
+    parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean; account_id: number }>,
     parentId: string | null,
   ): Promise<void> => {
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -719,6 +746,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
         totalParts: parts.length,
         originalName: file.name,
         fileHash: fileHash ?? undefined,
+        // Parts of one file can live on different accounts — each row records its own.
+        telegramUserId: part.account_id,
       })
     ));
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
@@ -817,14 +846,14 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       }
     });
 
-    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
-    const albumPipeline = createAlbumPipeline(fileSemaphore);
+    // No global gate any more: uploadFileSpread claims a slot on whichever
+    // account it dispatches to, so N accounts give N independent budgets.
+    const albumPipeline = createAlbumPipeline();
 
     const singlePromises = singleFileOnly.map((planned) => {
       const file = planned.file;
-      return fileSemaphore.withSlot(() =>
-        uploadFileToTelegram(file, (pct) => setRowStatus(file, { progress: pct }), planned.hash)
-      ).then(async (result) => {
+      return uploadFileToTelegram(file, (pct) => setRowStatus(file, { progress: pct }), planned.hash)
+      .then(async (result) => {
         if (!result.alreadyRegistered) {
           await registerUploadedParts(file, result.fileHash, result.parts, currentFolderId);
         }
@@ -988,17 +1017,16 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     // Does NOT register metadata — that happens after the caller releases
     // fileSemaphore, so a slow backend never blocks the next file's bytes.
     const uploadFileEntryFresh = async (file: File): Promise<{
-      parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>;
+      parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>;
       hasThumbnail: boolean;
     }> => {
-      const telegramClient = getPrimaryClient();
       const thumbBlob = await captureThumb(file);
       // Media files must carry a thumbnail — fail rather than register a
       // thumbless media file. Non-media files legitimately have none.
       if (isMediaFile(file) && !thumbBlob) {
         throw new Error(`Thumbnail capture failed for ${file.name}`);
       }
-      const uploadResult = await telegramClient.uploadFileSplit(file, undefined, thumbBlob);
+      const uploadResult = await uploadFileSpread(file, undefined, thumbBlob);
       return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
     };
 
@@ -1006,7 +1034,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       file: File,
       fileHash: string | null,
       folderId: string | null,
-      parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number }>,
+      parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>,
       hasThumbnail: boolean,
     ): Promise<void> => {
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -1026,19 +1054,16 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           totalParts: parts.length,
           originalName: file.name,
           fileHash: fileHash ?? undefined,
+          telegramUserId: part.account_id,
         })
       ));
     };
 
-    // Limit concurrent file uploads — too many simultaneous sendFile() calls
-    // cause GramJS to resolve "me" to entity ID 0 and crash.
-    const fileSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
-
     // Fresh images/videos ≤10MB go through the same producer/consumer album
-    // pipeline as the drag-drop path: fileSemaphore only gates the byte-upload
+    // pipeline as the drag-drop path: an account slot only gates the byte-upload
     // step, grouping into SendMultiMedia + registration happen outside it.
     const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
-    const albumPipeline = createAlbumPipeline(fileSemaphore);
+    const albumPipeline = createAlbumPipeline();
 
     // Batch-scoped content dedup. The folder walk streams files, so planUploads'
     // upfront hash grouping can't be used here: two identical files both miss
@@ -1178,7 +1203,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   return;
                 }
                 const folderId = await ensureFolder(folderPath);
-                const uploadPromise = fileSemaphore.withSlot(() => uploadFileEntryFresh(file))
+                const uploadPromise = uploadFileEntryFresh(file)
                   .then(async (result) => {
                     await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
                     claim.publish(result.parts.map((part, j) => ({
@@ -2072,7 +2097,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                 <video
                   src={previewFile.is_split_file && previewFile.split_group_id
                     ? `/preview-video/split/${previewFile.split_group_id}`
-                    : `/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}`}
+                    : `/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}/${previewFile.telegram_user_id ?? 0}`}
                   controls autoPlay style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }} />
               ) : kind === 'pdf' ? (
                 previewUrl ? <iframe src={previewUrl} title={previewFile.filename} style={{ width: '80vw', height: 'calc(90vh - 100px)', border: 'none' }} />
@@ -2097,13 +2122,13 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 }
 
 // Simple loading indicator for video preview via Service Worker streaming
-function VideoPreviewLoader({ fileId, messageId }: { fileId: string; messageId: number; mimeType?: string }) {
+function VideoPreviewLoader({ fileId, messageId, accountId = 0 }: { fileId: string; messageId: number; accountId?: number; mimeType?: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const video = document.createElement('video');
-    video.src = `/preview-video/${fileId}/${messageId}`;
+    video.src = `/preview-video/${fileId}/${messageId}/${accountId}`;
     
     const onCanPlay = () => {
       setLoading(false);
@@ -2125,7 +2150,7 @@ function VideoPreviewLoader({ fileId, messageId }: { fileId: string; messageId: 
       video.removeEventListener('error', onError);
       clearTimeout(timeout);
     };
-  }, [fileId, messageId]);
+  }, [fileId, messageId, accountId]);
 
   return (
     <div style={{ padding: '8px', minHeight: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -2139,7 +2164,7 @@ function VideoPreviewLoader({ fileId, messageId }: { fileId: string; messageId: 
         <div style={{ color: '#dc2626', textAlign: 'center' }}>{error}</div>
       )}
       <video
-        src={`/preview-video/${fileId}/${messageId}`}
+        src={`/preview-video/${fileId}/${messageId}/${accountId}`}
         controls
         autoPlay
         style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', display: loading ? 'none' : 'block' }}

@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import { getPrimaryClient } from './lib/gramjs';
+import { getPrimaryClient, getClientFor, getAllClients } from './lib/gramjs';
 
 // Global state for keepalive mechanism
 let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
@@ -16,6 +16,11 @@ let isStreamingActive = false;
 // Preload chunk requests that arrive after close are rejected immediately.
 let streamingStopped = false;
 
+/** Client for the account that stores a message. 0 (or unknown) = the primary. */
+function clientForAccount(accountId?: number) {
+  return accountId ? getClientFor(accountId) : getPrimaryClient();
+}
+
 /**
  * Ensure Telegram is connected, reconnect if needed.
  * Returns true if connected, false otherwise.
@@ -26,12 +31,14 @@ async function ensureTelegramConnected(): Promise<boolean> {
   }
 
   console.log('[App] === ensureTelegramConnected START ===');
-  const telegramClient = getPrimaryClient();
+  // Every account, not just the primary — a stream can be served by any of them.
+  const clients = getAllClients();
 
   // Instead of just checking isConnected(), actually try a ping
   // to verify the connection is truly alive
   try {
-    const pingSuccess = await telegramClient.invokePing();
+    const pings = await Promise.all(clients.map((c) => c.invokePing().catch(() => false)));
+    const pingSuccess = pings.length > 0 && pings.every(Boolean);
     console.log('[App] ping result:', pingSuccess);
     if (pingSuccess) {
       lastVerifiedAliveAt = Date.now();
@@ -45,8 +52,8 @@ async function ensureTelegramConnected(): Promise<boolean> {
   console.log('[App] Telegram not responding, attempting reconnection...');
 
   try {
-    // Try to reconnect the client
-    await telegramClient.connect();
+    // Try to reconnect every client
+    await Promise.all(clients.map((c) => c.connect()));
     lastVerifiedAliveAt = Date.now();
     console.log('[App] Telegram reconnected successfully');
     console.log('[App] === ensureTelegramConnected: RECONNECTED ===');
@@ -89,20 +96,20 @@ function startKeepalive() {
   keepaliveInterval = setInterval(async () => {
     console.log('[App] ===== KEEPALIVE TICK =====');
 
-    const telegramClient = getPrimaryClient();
+    const clients = getAllClients();
     
     // Instead of just checking isConnected(), actually try to make an API call
     // to verify the connection is truly alive
     try {
       // Try a simple API call to verify connection
-      await telegramClient.invokePing();
+      await Promise.all(clients.map((c) => c.invokePing()));
       lastVerifiedAliveAt = Date.now();
       console.log('[App] Keepalive: connection truly ALIVE (ping success)');
     } catch (err: any) {
       console.log('[App] Keepalive: ping failed, connection likely dead:', err?.message || err);
       console.log('[App] Keepalive: attempting reconnect...');
       try {
-        await telegramClient.connect();
+        await Promise.all(clients.map((c) => c.connect()));
         lastVerifiedAliveAt = Date.now();
         console.log('[App] Keepalive: RECONNECTED');
       } catch (reconnectErr: any) {
@@ -184,8 +191,8 @@ async function handleCheckConnection(event: MessageEvent) {
   const port = event.ports[0];
   
   try {
-    const telegramClient = getPrimaryClient();
-    const connected = telegramClient?.isConnected() === true;
+    const clients = getAllClients();
+    const connected = clients.length > 0 && clients.every((c) => c.isConnected());
     port?.postMessage({ type: 'CONNECTION_STATUS', requestId, connected });
   } catch (error) {
     port?.postMessage({ type: 'CONNECTION_STATUS', requestId, connected: false });
@@ -203,15 +210,15 @@ async function handleReconnectTelegram(event: MessageEvent) {
   
   try {
     console.log('[App] Reconnecting Telegram due to SW request...');
-    const telegramClient = getPrimaryClient();
-    if (telegramClient) {
-      const wasConnected = telegramClient.isConnected() === true;
+    const clients = getAllClients();
+    if (clients.length > 0) {
+      const wasConnected = clients.every((c) => c.isConnected());
       if (wasConnected) {
         console.log('[App] Telegram already connected');
         port?.postMessage({ type: 'RECONNECT_RESULT', requestId, success: true, alreadyConnected: true });
       } else {
         // Use the connect() method which handles reconnection properly
-        await telegramClient.connect();
+        await Promise.all(clients.map((c) => c.connect()));
         console.log('[App] Telegram reconnected successfully');
         port?.postMessage({ type: 'RECONNECT_RESULT', requestId, success: true, alreadyConnected: false });
       }
@@ -231,7 +238,7 @@ async function handleReconnectTelegram(event: MessageEvent) {
 async function handleGetFileChunk(event: MessageEvent) {
   console.log('[App] ========== handleGetFileChunk START ==========');
   const msg = event.data;
-  const { requestId, messageId, offset, limit, fileSize } = msg;
+  const { requestId, messageId, accountId, fileId, offset, limit, fileSize } = msg;
   const port = event.ports[0];
   
   try {
@@ -258,9 +265,12 @@ async function handleGetFileChunk(event: MessageEvent) {
       return;
     }
     
-    const telegramClient = getPrimaryClient();
+    // access_hash is per (account, document): the wrong client either fails or,
+    // worse, hits a same-numbered message in ITS Saved Messages and streams the
+    // wrong file. Pick by the account the SW passed along with the message id.
+    const telegramClient = clientForAccount(accountId);
 
-    console.log('[App] Getting chunk - messageId:', messageId, 'offset:', offset, 'limit:', limit, 'fileSize:', fileSize);
+    console.log('[App] Getting chunk - messageId:', messageId, 'account:', accountId, 'offset:', offset, 'limit:', limit, 'fileSize:', fileSize);
     
     let actualFileSize = fileSize;
     if (actualFileSize === undefined) {
@@ -270,7 +280,10 @@ async function handleGetFileChunk(event: MessageEvent) {
       console.log('[App] Retrieved fileSize from Telegram:', actualFileSize);
     }
     
-    const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, limit, actualFileSize);
+    // Only pass file_id when it really is the Telegram document id — dedup rows
+    // and split groups use synthetic ids that would false-alarm the guard.
+    const expectedFileId = /^\d+$/.test(String(fileId ?? '')) ? String(fileId) : undefined;
+    const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, limit, actualFileSize, expectedFileId);
     const arrayBuffer = await blob.arrayBuffer();
     console.log('[App] Got chunk, size:', arrayBuffer.byteLength);
     
@@ -289,11 +302,11 @@ async function handleGetFileChunk(event: MessageEvent) {
  */
 async function handleGetFileMetadata(event: MessageEvent) {
   const msg = event.data;
-  const { requestId, messageId } = msg;
+  const { requestId, messageId, accountId } = msg;
   const port = event.ports[0];
   
   try {
-    const telegramClient = getPrimaryClient();
+    const telegramClient = clientForAccount(accountId);
     
     if (!telegramClient.isConnected()) {
       port?.postMessage({ requestId, error: 'Telegram client not connected' });
@@ -338,7 +351,14 @@ async function handleGetSplitMetadata(event: MessageEvent) {
     const partsWithOffset = parts.map((p: any) => {
       const startOffset = totalSize;
       totalSize += p.filesize;
-      return { messageId: p.telegram_message_id as number, size: p.filesize as number, startOffset };
+      // Parts of one split file may sit on different accounts — carry each
+      // part's own so the SW can ask the right client for its bytes.
+      return {
+        messageId: p.telegram_message_id as number,
+        accountId: (p.telegram_user_id as number) || 0,
+        size: p.filesize as number,
+        startOffset,
+      };
     });
 
     const mimeType: string = parts[0]?.mime_type || 'video/mp4';

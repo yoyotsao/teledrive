@@ -105,6 +105,10 @@ export interface RegisterableExistingPart {
   access_hash?: string | null;
   part_index?: number | null;
   has_thumbnail?: boolean;
+  /** Account storing the message. A dedup row MUST inherit it — access_hash is
+   *  only valid against that account, so defaulting to the primary breaks the
+   *  download of anything uploaded via a secondary one. */
+  telegram_user_id?: number;
 }
 
 /**
@@ -129,6 +133,7 @@ export function canonicalExistingParts(files: FileInfo[]): RegisterableExistingP
     access_hash: f.access_hash,
     part_index: index,
     has_thumbnail: f.has_thumbnail,
+    telegram_user_id: f.telegram_user_id,
   });
 
   // A non-split origin means the file is a single Telegram message — exactly one
@@ -193,6 +198,7 @@ export async function registerDuplicateParts(
       totalParts: parts.length,
       originalName: file.name,
       fileHash: hash ?? undefined,
+      telegramUserId: part.telegram_user_id,
     })
   ));
 }

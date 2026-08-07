@@ -171,6 +171,8 @@ export const api = {
     totalParts?: number;
     originalName?: string;
     fileHash?: string;
+    /** Which linked account stores this message; omit for the primary. */
+    telegramUserId?: number;
   }): Promise<FileInfo> => {
     const response = await client.post<FileInfo>('/files/register', {
       filename: params.filename,
@@ -187,6 +189,7 @@ export const api = {
       total_parts: params.totalParts,
       original_name: params.originalName,
       file_hash: params.fileHash,
+      telegram_user_id: params.telegramUserId,
     });
     return response.data;
   },

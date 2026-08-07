@@ -38,6 +38,11 @@ export class Semaphore {
     }
   }
 
+  /** Free slots right now (0 when saturated). Used to pick the least-loaded account. */
+  freeSlots(): number {
+    return this.available;
+  }
+
   /**
    * Convenience method: acquire a slot, run the function, then release.
    * Always releases even if the function throws.

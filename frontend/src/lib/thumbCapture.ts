@@ -1,7 +1,14 @@
 import { generateThumbnail } from '../api/client';
 import { generateVideoThumbnail } from './videoThumbnail';
+import { Semaphore } from './semaphore';
+import { MAX_CONCURRENT_FILES } from '../config';
 
 const DEFAULT_TIMEOUT_MS = 15000;
+
+// Canvas/video decode is a browser resource, not a Telegram one. Upload slots are
+// now per account, so without this gate an N-account drive would run N times as
+// many simultaneous decodes — and capture is exactly what flakes under that load.
+const captureGate = new Semaphore(MAX_CONCURRENT_FILES);
 
 /** True for files eligible for Telegram album grouping and thumbnail capture. */
 export function isMediaFile(file: File): boolean {
@@ -20,6 +27,10 @@ export async function captureThumb(file: File, timeoutMs = DEFAULT_TIMEOUT_MS, a
   const isImage = file.type.startsWith('image/');
   const isVideo = file.type.startsWith('video/');
   if (!isImage && !isVideo) return null;
+  return captureGate.withSlot(() => captureThumbUnbounded(file, timeoutMs, attempts, isVideo));
+}
+
+async function captureThumbUnbounded(file: File, timeoutMs: number, attempts: number, isVideo: boolean): Promise<Blob | null> {
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {

@@ -20,6 +20,12 @@ export const MAX_CONCURRENT_FILES = 3;
  */
 export const MAX_CONCURRENT_CHUNKS = 12;
 
+/** MTProto hard limit for one upload part. Larger requests fail with LIMIT_INVALID. */
+export const CHUNK_SIZE = 512 * 1024;
+
+/** Parts per Telegram message. Beyond this a file is split into several messages. */
+export const MAX_PARTS_PER_FILE = 1000;
+
 /**
  * Number of retry attempts for failed chunk uploads.
  * Each chunk will be retried up to this many times before failing the entire upload.

@@ -19,6 +19,9 @@ export interface FileInfo {
   part_index?: number;
   total_parts?: number;
   trashed_at?: string | null;
+  file_hash?: string | null;
+  /** Linked account whose Saved Messages holds this message — picks the download client. */
+  telegram_user_id?: number;
 }
 
 export interface FileListResponse {

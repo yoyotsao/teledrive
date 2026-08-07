@@ -81,6 +81,11 @@ class Database:
         
         # Add new columns if they don't exist (migration for existing databases)
         try:
+            await self._conn.execute("ALTER TABLE files ADD COLUMN has_thumbnail INTEGER NOT NULL DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass  # Column already exists
+
+        try:
             await self._conn.execute("ALTER TABLE files ADD COLUMN is_split_file INTEGER NOT NULL DEFAULT 0")
         except aiosqlite.OperationalError:
             pass  # Column already exists

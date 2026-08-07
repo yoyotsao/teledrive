@@ -132,11 +132,9 @@ lifespan 啟動 / 取消 `poll_loop`。啟動時呼叫 Bot API `getMe` 取得 bo
 **你要先做一件事**：到 @BotFather 建一個 bot，把 token 放進 `.env` 的
 `TELEGRAM_BOT_TOKEN`。沒有這個東西整套動不了。
 
-1. **`sendMessage` 到未互動過的 bot** —— MTProto 用戶端不需要先按 `/start` 就能發訊息給
-   bot，但這是整個方案的單點依賴，**實作第一件事就要實測**。若 Telegram 真的要求先
-   `/start`，退路是 LoginScreen 顯示一個 `https://t.me/<bot>?start=<nonce>` 連結讓使用者
-   點一次（deep link 會把 nonce 當 `/start` 參數帶進去，後端照樣從 update 拿到 `from_id`，
-   只是體驗多一步）。
+1. ~~**`sendMessage` 到未互動過的 bot**~~ —— **2026-08-07 實測通過**：瀏覽器 GramJS 對
+   從未互動過的 `@TDSessionVerifybot` 直接 `sendMessage` 成功，`getUpdates` 也如期收到，
+   不需要先按 `/start`。`t.me/<bot>?start=<nonce>` deep link 退路用不上。
 2. **JWT 仍是 30 天的長效 bearer**（`auth.py:11`）。偷到 JWT 的人能操作 metadata。這次
    不處理，但它現在是最弱的一環 —— 換掉 session 傳輸後，剩下的攻擊面就是它。
 3. **CORS `allow_origins=["*"]`**（`config.py:26`）。因為用 Bearer 而非 cookie，不構成

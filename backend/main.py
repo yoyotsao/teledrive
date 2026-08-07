@@ -16,10 +16,12 @@ from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
+import asyncio
 import sys
 
 from app.services.config import get_settings
 from app.services.database import get_database, close_database
+from app.services import bot_challenge
 from app.api.routes import router
 
 
@@ -51,10 +53,24 @@ async def lifespan(app: FastAPI):
     logger.info(f"Max file size: {settings.max_file_size / (1024**3):.2f} GB")
     logger.info(f"Chunk size: {settings.chunk_size / (1024**2):.2f} MB")
 
+    # Bot-challenge login: one global getUpdates cursor for the whole process.
+    poll_task = None
+    if settings.telegram_bot_token:
+        try:
+            await bot_challenge.init()
+            poll_task = asyncio.create_task(bot_challenge.poll_loop())
+        except Exception as e:
+            # A bad token must not take the whole API down — /auth/challenge 503s instead.
+            logger.error(f"Bot challenge login unavailable: {e}")
+    else:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — /auth/challenge will return 503")
+
     yield
 
     # Shutdown
     logger.info("Shutting down Telegram Cloud Storage API...")
+    if poll_task:
+        poll_task.cancel()
     await close_database()
     logger.info("Database connection closed")
 

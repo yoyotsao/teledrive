@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect, Depends
+from fastapi.responses import JSONResponse
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -8,10 +9,9 @@ from app.services import get_file_service, get_bot_service
 from app.services import get_telethon_service
 from app.services.database import get_database
 from app.auth import get_current_user, create_jwt
-from app.services.user_sessions import store_user_session, get_user_client
+from app.services import bot_challenge
 from loguru import logger
 import asyncio
-import base64
 
 # Thumbnails are served entirely browser-side: the frontend downloads each
 # file's embedded thumb via GramJS and caches it in IndexedDB (see
@@ -19,56 +19,6 @@ import base64
 # never proxies thumbnail bytes.
 
 router = APIRouter(prefix="/api/v1", tags=["files"])
-
-
-_GRAMJS_DOMAIN_TO_IP = {
-    'pluto.web.telegram.org': '149.154.175.53',
-    'venus.web.telegram.org': '149.154.167.51',
-    'aurora.web.telegram.org': '149.154.175.100',
-    'vesta.web.telegram.org': '149.154.167.91',
-    'flora.web.telegram.org': '91.108.56.130',
-    'pluto-1.web.telegram.org': '149.154.175.53',
-    'venus-1.web.telegram.org': '149.154.167.51',
-    'aurora-1.web.telegram.org': '149.154.175.100',
-    'vesta-1.web.telegram.org': '149.154.167.91',
-    'flora-1.web.telegram.org': '91.108.56.130',
-}
-
-
-def _parse_gramjs_session(gramjs: str):
-    """Convert a GramJS StringSession string to a Telethon MemorySession.
-
-    GramJS format: '1' + base64(dc_id[1] + addr_len[2BE] + addr[N] + port[2BE] + auth_key[256])
-    Telethon MemorySession is populated directly from these components.
-    """
-    import struct
-    import ipaddress
-    from telethon.sessions import MemorySession
-    from telethon.crypto import AuthKey
-
-    if not gramjs or gramjs[0] != '1':
-        raise ValueError("Invalid GramJS session (expected version '1')")
-    b64 = gramjs[1:]
-    b64 += '=' * ((4 - len(b64) % 4) % 4)
-    raw = base64.b64decode(b64)
-    dc_id = raw[0]
-    addr_len = struct.unpack('>H', raw[1:3])[0]
-    addr = raw[3:3 + addr_len].decode('utf-8')
-    port = struct.unpack('>H', raw[3 + addr_len:5 + addr_len])[0]
-    auth_key_bytes = raw[5 + addr_len:5 + addr_len + 256]
-    try:
-        ipaddress.ip_address(addr)
-        resolved = addr
-    except ValueError:
-        resolved = _GRAMJS_DOMAIN_TO_IP.get(addr) or addr
-    session = MemorySession()
-    session.set_dc(dc_id, resolved, port)
-    session.auth_key = AuthKey(auth_key_bytes)
-    return session
-
-
-class LoginRequest(BaseModel):
-    session_string: str
 
 
 class LoginResponse(BaseModel):
@@ -109,52 +59,47 @@ class UpdateFileRequest(BaseModel):
     filename: Optional[str] = None
 
 
-@router.post("/auth/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
-    """Verify a GramJS or Telethon session via Telethon, store per-user client, return JWT."""
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from app.services.config import get_settings
+class ChallengeResponse(BaseModel):
+    nonce: str
+    bot_username: str
+    expires_in: int
 
-    settings = get_settings()
-    client = None
-    try:
-        # Browsers send a GramJS session string; non-browser clients (e.g. the
-        # WebDAV bridge, generate_session.py) send a Telethon StringSession.
-        try:
-            session = _parse_gramjs_session(request.session_string)
-        except Exception:
-            session = StringSession(request.session_string)
-            # StringSession accepts an empty/garbage string as a *blank* session, which
-            # would otherwise cost a full Telegram handshake before failing on get_me().
-            if not session.auth_key:
-                raise HTTPException(status_code=401, detail="Invalid session")
-        client = TelegramClient(session, settings.telegram_api_id, settings.telegram_api_hash)
-        await client.connect()
-        me = await client.get_me()
-        if not me:
-            raise HTTPException(status_code=401, detail="Invalid session")
 
-        telegram_user_id = me.id
-        await store_user_session(telegram_user_id, client)
+class VerifyRequest(BaseModel):
+    nonce: str
 
-        token = create_jwt(telegram_user_id)
-        logger.info(f"User {telegram_user_id} ({me.username}) logged in")
-        return LoginResponse(
-            token=token,
-            user_id=telegram_user_id,
-            username=me.username,
-            first_name=me.first_name,
+
+@router.post("/auth/challenge", response_model=ChallengeResponse)
+async def auth_challenge():
+    """Hand out a one-time nonce for the caller to DM to our bot."""
+    if not bot_challenge.bot_username:
+        raise HTTPException(
+            status_code=503,
+            detail="Bot login unavailable — set TELEGRAM_BOT_TOKEN in .env (create a bot via @BotFather)",
         )
-    except HTTPException:
-        if client:
-            await client.disconnect()
-        raise
-    except Exception as e:
-        if client:
-            await client.disconnect()
-        logger.error(f"Login failed: {e}")
-        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+    return ChallengeResponse(
+        nonce=bot_challenge.new_challenge(),
+        bot_username=bot_challenge.bot_username,
+        expires_in=bot_challenge.TTL_SECONDS,
+    )
+
+
+@router.post("/auth/verify")
+async def auth_verify(request: VerifyRequest):
+    """Trade a nonce we saw arrive at the bot for a JWT. 202 = keep polling."""
+    entry = bot_challenge.take_verified(request.nonce)
+    if entry is None:
+        if bot_challenge.is_pending(request.nonce):
+            return JSONResponse(status_code=202, content={"status": "waiting"})
+        raise HTTPException(status_code=401, detail="Invalid or expired challenge")
+
+    logger.info(f"User {entry['user_id']} ({entry['username']}) logged in via bot challenge")
+    return LoginResponse(
+        token=create_jwt(entry["user_id"]),
+        user_id=entry["user_id"],
+        username=entry["username"],
+        first_name=entry["first_name"],
+    )
 
 
 @router.get("/files/check-hash")

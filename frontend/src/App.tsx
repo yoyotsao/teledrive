@@ -38,8 +38,20 @@ function App() {
       });
   }, []);
 
+  // Prove our identity to the backend by DMing a one-time nonce to its bot —
+  // Telegram reports who sent it, so the session string stays in this browser.
   const handleLogin = async (sessionString: string) => {
-    const loginResp = await api.loginToBackend(sessionString);
+    const { nonce, bot_username } = await api.requestChallenge();
+    const messageId = await getTelegramClient().sendAuthChallenge(bot_username, nonce);
+
+    let loginResp = null;
+    for (let i = 0; i < 60 && !loginResp; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      loginResp = await api.verifyChallenge(nonce);
+    }
+    if (!loginResp) throw new Error('Telegram 驗證逾時，請重試');
+
+    getTelegramClient().deleteAuthChallenge(bot_username, messageId);
     saveCredentialsToStorage(sessionString, loginResp.token);
     setUserName(loginResp.first_name || loginResp.username || String(loginResp.user_id));
     setAuthState('authenticated');

@@ -1384,6 +1384,27 @@ export class TelegramClientManager {
   }
 
   /**
+   * DM a login nonce to our bot. Telegram tells the backend who sent it, which
+   * is the whole point: the session string never leaves the browser.
+   * @returns the sent message's id, so the caller can tidy it up afterwards
+   */
+  async sendAuthChallenge(botUsername: string, nonce: string): Promise<number> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized.');
+    const msg = await this.client.sendMessage(botUsername, { message: nonce });
+    return msg.id;
+  }
+
+  /** Remove the nonce message once it's been redeemed — cosmetic, never fatal. */
+  async deleteAuthChallenge(botUsername: string, messageId: number): Promise<void> {
+    try {
+      await this.client?.deleteMessages(botUsername, [messageId], { revoke: true });
+    } catch (err) {
+      console.warn('[GramJS] Could not delete challenge message:', err);
+    }
+  }
+
+  /**
    * Start QR code login. Calls onQRCode with a fresh tg://login URL whenever
    * Telegram issues a new token (every ~30 s). Resolves with session string
    * when the user scans and the handshake completes.

@@ -79,7 +79,7 @@ function QRTab({ onLogin, apiId, apiHash }: { onLogin: (s: string) => Promise<vo
         });
       },
     ).then(async (sessionString) => {
-      setStatus('後端驗證中...');
+      setStatus('Telegram 驗證中...');
       await onLogin(sessionString);
       setStatus('登入成功！');
     }).catch((err) => {

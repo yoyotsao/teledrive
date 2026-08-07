@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     # Telegram Session String (REQUIRED for MTProto uploads)
     telegram_session_string: Optional[str] = None
     
-    # Bot Token (Optional - not needed for MTProto direct uploads)
+    # Bot Token — required for login. The browser DMs a one-time nonce to this
+    # bot to prove which Telegram account it is; without it /auth/challenge 503s.
     telegram_bot_token: Optional[str] = None
     
     # Server

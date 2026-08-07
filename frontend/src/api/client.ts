@@ -37,10 +37,22 @@ async function withTimeoutRetry<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+export interface ChallengeResponse {
+  nonce: string;
+  bot_username: string;
+  expires_in: number;
+}
+
 export const api = {
-  loginToBackend: async (sessionString: string): Promise<LoginResponse> => {
-    const response = await client.post<LoginResponse>('/auth/login', { session_string: sessionString });
+  requestChallenge: async (): Promise<ChallengeResponse> => {
+    const response = await client.post<ChallengeResponse>('/auth/challenge');
     return response.data;
+  },
+
+  /** Returns null while the backend hasn't seen the nonce arrive at the bot yet. */
+  verifyChallenge: async (nonce: string): Promise<LoginResponse | null> => {
+    const response = await client.post<LoginResponse>('/auth/verify', { nonce });
+    return response.status === 202 ? null : response.data;
   },
   listFiles: async (
     page: number = 1,

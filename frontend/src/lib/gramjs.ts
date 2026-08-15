@@ -18,6 +18,7 @@ import {
   CHUNK_RATE_CLEAN_WINDOW_MS,
   CHUNK_RATE_BURST,
   CHUNK_CEILING_BACKOFF,
+  CHUNK_CEILING_FIRST_BACKOFF,
   CHUNK_CEILING_SLOW_ZONE,
   CHUNK_CEILING_FLOOR,
   CHUNK_RATE_SLOW_STEP,
@@ -37,6 +38,7 @@ import {
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
+import { installPremiumFloodTag, isPremiumFlood } from "./gramjsFloodPatch";
 
 /**
  * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
@@ -91,10 +93,12 @@ function isFloodError(err: unknown): boolean {
  * still fires thousands of times at the 0.5 parts/s floor, and the official
  * Telegram Desktop client hits the same wall), so it must not drive the
  * pacer's rate cut or ceiling memory — only a wait.
+ *
+ * Detection lives in gramjsFloodPatch.ts because GramJS collapses
+ * FLOOD_PREMIUM_WAIT onto plain FloodWaitError and discards the wire string —
+ * a substring test on the thrown error alone can never match.
  */
-function isPremiumFloodError(err: unknown): boolean {
-  return floodText(err).includes('PREMIUM');
-}
+const isPremiumFloodError = isPremiumFlood;
 
 /**
  * Adaptive pacer for chunk uploads (SaveFilePart / SaveBigFilePart). Telegram
@@ -121,13 +125,19 @@ function createChunkPacer(accountId: number): AdaptiveRateLimiter {
   increaseIntervalMs: CHUNK_RATE_INCREASE_INTERVAL_MS,
   cleanWindowMs: CHUNK_RATE_CLEAN_WINDOW_MS,
   burst: CHUNK_RATE_BURST,
-  storageKey: `teledrive_chunk_rate_v2_${accountId}`,
+  // v3: v2's stored ceilings were produced while wait() let parts punch through
+  // an open FLOOD_WAIT penalty window, so every one of them had been driven to
+  // CHUNK_CEILING_FLOOR by floods we inflicted on ourselves. Reading those back
+  // would pin a fresh session at CHUNK_RATE_MIN and never exercise the
+  // firstBackoff convergence, so the old learning is deliberately discarded.
+  storageKey: `teledrive_chunk_rate_v3_${accountId}`,
   label: `ChunkRate:${accountId}`,
   // Ceiling memory: remember the flood-triggering rate and converge just below
   // it, instead of re-probing past the account limit every cycle (the sawtooth
   // that made FLOOD_WAIT recur ~once a minute). See adaptiveRateLimiter.ts.
   ceiling: {
     backoff: CHUNK_CEILING_BACKOFF,
+    firstBackoff: CHUNK_CEILING_FIRST_BACKOFF,
     slowZone: CHUNK_CEILING_SLOW_ZONE,
     floor: CHUNK_CEILING_FLOOR,
     slowStep: CHUNK_RATE_SLOW_STEP,
@@ -261,8 +271,11 @@ export class TelegramClientManager {
         if (isFloodError(err)) {
           if (++floodRetries > 10) throw err;
           const seconds = (err as { seconds?: number } | null)?.seconds;
-          console.warn(`[GramJS:${this.accountId}] ${label} flood: ${floodText(err).trim()} (seconds=${seconds})`);
-          if (isPremiumFloodError(err)) {
+          const premium = isPremiumFloodError(err);
+          console.warn(
+            `[GramJS:${this.accountId}] ${label} flood: ${floodText(err).trim()} (seconds=${seconds}, premium=${premium})`,
+          );
+          if (premium) {
             // Account-tier cap — wait it out at full rate, don't self-throttle.
             this.chunkPacer.pause(seconds);
           } else {
@@ -345,6 +358,10 @@ export class TelegramClientManager {
     if (window.location.protocol === 'https:') {
       installTelegramWsProxy();
     }
+
+    // Must run before any RPC error can be constructed, or a tier-cap flood
+    // gets answered with a rate cut the pacer then persists.
+    installPremiumFloodTag();
 
     this.session = new StringSession(sessionString || "");
 

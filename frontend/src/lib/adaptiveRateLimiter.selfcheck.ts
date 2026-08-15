@@ -31,6 +31,7 @@ const opts = {
   burst: 2,
   ceiling: {
     backoff: 0.95,
+    firstBackoff: 0.5,
     slowZone: 0.8,
     floor: 1.0,
     slowStep: 0.1,
@@ -69,5 +70,45 @@ const cut = genuine.stats();
 check('reportFlood() cuts the rate', cut.rate === 2); // 4 × decreaseFactor 0.5
 check('reportFlood() learns a ceiling', cut.ceiling !== null);
 check('reportFlood() counts the flood', cut.floods === 1);
+
+// Cold start (ceiling still null) must converge in ONE flood. Setting the first
+// ceiling to backoff (0.95) × the flooding rate leaves it a hair under a rate
+// already proven too fast, so it takes ~5 more floods to find the wall — and 3
+// floods inside escalationWindowMs escalate, which drives the rate to minRate
+// and the ceiling to floor. firstBackoff is the harder one-shot cut that keeps
+// a fresh page load from re-running that collapse every session.
+check('first flood learns the ceiling at firstBackoff × the flooding rate', cut.ceiling === 2);
+check('first flood leaves the rate at the ceiling, not above it', cut.rate === cut.ceiling);
+
+// wait() — a penalty window must bind the parts that were already asleep on a
+// slot reserved before the flood landed. reportFlood/pause can only push
+// nextSlotAt forward; they cannot reschedule a pending setTimeout, so without
+// the re-check in wait() up to MAX_CONCURRENT_CHUNKS parts wake on stale
+// deadlines and fire into a punished account — each harvesting the same
+// window's remaining seconds (a 12→10→8→6→5→3 countdown in the wild) and
+// extending it. Rate 0.5 here so one slot interval is a whole 2s.
+const gated = new AdaptiveRateLimiter({ ...opts, initialRate: 0.5, label: 'penalty-window' });
+const t1 = Date.now();
+const firedAt: number[] = [];
+const waiters = Array.from({ length: 12 }, () =>
+  gated.wait().then(() => firedAt.push(Date.now() - t1)),
+);
+// Let the parts the burst allowance already released reach the server — those
+// are the ones that come back FLOOD_WAIT, and they cannot be recalled.
+await new Promise((r) => setTimeout(r, 50));
+const alreadyGone = firedAt.length;
+gated.reportFlood(6);
+const windowEndsAt = Date.now() - t1 + 6_000 + 1_000;
+await Promise.all(waiters);
+
+const stillAsleep = firedAt.slice(alreadyGone);
+check(
+  'penalty window holds back every part that had not left yet',
+  stillAsleep.every((t) => t >= windowEndsAt - 100),
+);
+check(
+  'parts released after the window stay paced 1/rate apart',
+  stillAsleep.slice(1).every((t, i) => t - stillAsleep[i] >= 2_000 - 100),
+);
 
 console.log('\nall checks passed');

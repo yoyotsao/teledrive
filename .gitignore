@@ -30,7 +30,8 @@ backend/__pycache__/
 backend/*.pyc
 backend/.env
 backend/teledrive.db
-backend/teledrive.db.bak
+# Every backup flavour too (.bak, .bak-dup-*, .pre-volume-migration-*, …)
+backend/teledrive.db.*
 
 # Frontend
 node_modules/

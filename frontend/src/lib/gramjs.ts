@@ -949,7 +949,6 @@ export class TelegramClientManager {
     const ref = readMedia(message.media);
     if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
     const fileSize = ref.size;
-    console.log('[Streaming] Total size:', fileSize);
 
     const CHUNK_SIZE = 512 * 1024;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
@@ -1156,6 +1155,92 @@ export class TelegramClientManager {
     // Discard prefix bytes so caller gets exactly offset..offset+limit
     const sliced = bytes.slice(prefix, prefix + limit);
     return new Blob([sliced], { type: 'video/mp4' });
+  }
+
+  /**
+   * Resolve a channel/group from a username, t.me link, or numeric id.
+   *
+   * A numeric id alone is not enough for a private channel — MTProto needs the
+   * peer's access_hash, which only lives in the session's entity cache. So on
+   * failure we pull the dialog list once (which populates that cache) and try
+   * again before giving up.
+   */
+  async resolveChat(input: string): Promise<{ entity: any; title: string; noForwards: boolean }> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized');
+
+    const raw = input.trim().replace(/^https?:\/\/t\.me\//i, '').replace(/^@/, '');
+    const asNumber = /^-?\d+$/.test(raw) ? Number(raw) : null;
+    const target: string | number = asNumber ?? raw;
+
+    let entity: any;
+    try {
+      entity = await this.client.getEntity(target as any);
+    } catch (err) {
+      console.warn('[ChatImport] getEntity failed, refreshing dialogs and retrying', err);
+      await this.client.getDialogs({ limit: 200 });
+      try {
+        entity = await this.client.getEntity(target as any);
+      } catch {
+        throw new Error(`此帳號無法存取 chat「${input}」。請先用同一個 Telegram 帳號開啟過該對話。`);
+      }
+    }
+
+    const title = entity.title
+      || [entity.firstName, entity.lastName].filter(Boolean).join(' ')
+      || entity.username
+      || String(input);
+    return { entity, title, noForwards: Boolean(entity.noforwards) };
+  }
+
+  /**
+   * Yield the chat's media messages oldest-first.
+   *
+   * No server-side InputMessagesFilter is used: no single filter covers
+   * photos + videos + documents at once, and running several filtered passes
+   * would break the single oldest-to-newest ordering the import relies on for
+   * resumability. Filtering client-side costs one getHistory page per 100
+   * messages, which is cheap next to the forward rate limit.
+   */
+  async *iterChatMedia(entity: any): AsyncGenerator<Api.Message> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized');
+    for await (const message of this.client.iterMessages(entity, { reverse: true })) {
+      const msg = message as Api.Message;
+      if (msg?.media && readMedia(msg.media)) yield msg;
+    }
+  }
+
+  /**
+   * Forward one message into Saved Messages and return the new message.
+   *
+   * ponytail: one message per call, paced by messageRateLimiter (~3/s). Telegram
+   * accepts up to 100 ids per forwardMessages call, which would be ~100x faster;
+   * the upgrade path is batching and matching the returned messages back to
+   * their sources by media id, since the API gives no explicit mapping.
+   */
+  async forwardToSaved(entity: any, messageId: number): Promise<Api.Message> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.messageRateLimiter.wait();
+        const result = await this.client.forwardMessages('me', {
+          messages: [messageId],
+          fromPeer: entity,
+        });
+        const forwarded = (result as any[])[0] as Api.Message;
+        if (!forwarded?.id) throw new Error(`Forward of message ${messageId} returned no message`);
+        return forwarded;
+      } catch (err: any) {
+        if (isFloodError(err) && attempt < 2) {
+          this.penalizeForFlood('forwardMessages', err);
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error(`Forward of message ${messageId} failed after retries`);
   }
 
   /**

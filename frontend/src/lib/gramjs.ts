@@ -1169,7 +1169,7 @@ export class TelegramClientManager {
     await this.waitUntilReady();
     if (!this.client) throw new Error('Client not initialized');
 
-    const raw = input.trim().replace(/^https?:\/\/t\.me\//i, '').replace(/^@/, '');
+    const raw = input.trim().replace(/^(https?:\/\/)?t\.me\//i, '').replace(/^@/, '');
     const asNumber = /^-?\d+$/.test(raw) ? Number(raw) : null;
     const target: string | number = asNumber ?? raw;
 

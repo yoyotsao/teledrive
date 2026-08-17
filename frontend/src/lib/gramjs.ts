@@ -37,6 +37,7 @@ import {
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
+import { readMedia, type MediaRef } from "./telegramMedia";
 
 /**
  * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
@@ -190,6 +191,28 @@ function generateRandomBigInt(): ReturnType<typeof bigInt> {
 }
 
 /**
+ * Build the right file location for a media ref. Photos need
+ * InputPhotoFileLocation with a size type — an InputDocumentFileLocation with
+ * a photo id downloads nothing useful, which is the bug this replaces.
+ */
+function fileLocationFor(ref: MediaRef, thumbSize: string): Api.TypeInputFileLocation {
+  if (ref.kind === 'photo') {
+    return new Api.InputPhotoFileLocation({
+      id: ref.rawId as any,
+      accessHash: ref.accessHash as any,
+      fileReference: ref.fileReference,
+      thumbSize,
+    });
+  }
+  return new Api.InputDocumentFileLocation({
+    id: ref.rawId as any,
+    accessHash: ref.accessHash as any,
+    fileReference: ref.fileReference,
+    thumbSize,
+  });
+}
+
+/**
  * GramJS client wrapper for browser-based Telegram operations.
  * Manages direct MTProto connections to Telegram for file upload/download.
  */
@@ -283,7 +306,7 @@ export class TelegramClientManager {
   private initPromise: Promise<void> | null = null;
   // Caches the resolved document location per message so SW chunk streaming doesn't
   // pay a getMessages round trip on every single chunk request.
-  private fileLocationCache = new Map<number, { docId: bigint; accessHash: bigint; fileReference?: Uint8Array }>();
+  private fileLocationCache = new Map<number, MediaRef>();
 
   /**
    * Resolve (and cache) the document location for a message. Pass forceRefresh=true
@@ -293,7 +316,7 @@ export class TelegramClientManager {
     messageId: number,
     forceRefresh = false,
     expectedFileId?: string,
-  ): Promise<{ docId: bigint; accessHash: bigint; fileReference?: Uint8Array }> {
+  ): Promise<MediaRef> {
     if (!forceRefresh) {
       const cached = this.fileLocationCache.get(messageId);
       if (cached) return cached;
@@ -301,22 +324,18 @@ export class TelegramClientManager {
     const messages = await this.client!.getMessages("me", { ids: [messageId] });
     const message = messages[0] as Api.Message;
     if (!message?.media) throw new Error("Message has no media");
-    const media = message.media as any;
-    if (media.className !== 'MessageMediaDocument') {
-      throw new Error('Unsupported media type: ' + media?.className);
-    }
-    const doc = media.document;
-    if (expectedFileId && String(doc.id) !== expectedFileId) {
+    const ref = readMedia(message.media);
+    if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
+    if (expectedFileId && ref.id !== expectedFileId) {
       // Message ids are only unique within one account. If we ever ask the
       // wrong client, this is what turns "silently downloaded someone else's
       // file" into a loud failure.
       throw new Error(
-        `Message ${messageId} on account ${this.accountId} holds document ${doc.id}, expected ${expectedFileId}`
+        `Message ${messageId} on account ${this.accountId} holds document ${ref.id}, expected ${expectedFileId}`
       );
     }
-    const location = { docId: doc.id as bigint, accessHash: doc.accessHash as bigint, fileReference: doc.fileReference as Uint8Array | undefined };
-    this.fileLocationCache.set(messageId, location);
-    return location;
+    this.fileLocationCache.set(messageId, ref);
+    return ref;
   }
 
   /**
@@ -776,26 +795,15 @@ export class TelegramClientManager {
         downloadSemaphore.withSlot(async () => {
           const msg = message as Api.Message | undefined;
           if (!msg || !msg.media) return;
-          const media = msg.media as any;
-          const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
-          if (!doc?.thumbs?.length) return; // no embedded thumb — nothing to show
-          // Pick the largest real PhotoSize (has a `type`; excludes inline
-          // stripped/cached sizes whose raw bytes aren't a standalone JPEG).
-          const sized = (doc.thumbs as any[]).filter((t) => typeof t.type === 'string' && !t.bytes);
-          const thumb = sized[sized.length - 1];
-          if (!thumb) return;
+          const ref = readMedia(msg.media);
+          if (!ref?.previewThumbSize) return; // no usable preview — nothing to show
           try {
             // Fetch the thumb via GetFile on the MAIN connection with cdnSupported
             // OFF, instead of downloadMedia — downloadMedia borrows an exported
             // sender to the file's media DC, and that extra ws-proxied connection
             // reconnect-loops ("Connection closed while receiving data"). Keeping
             // thumbnails on the main sender (like the parallel preview path) avoids it.
-            const location = new Api.InputDocumentFileLocation({
-              id: doc.id,
-              accessHash: doc.accessHash,
-              fileReference: doc.fileReference,
-              thumbSize: thumb.type,
-            });
+            const location = fileLocationFor(ref, ref.previewThumbSize);
             const fileResult = await client.invoke(
               new Api.upload.GetFile({
                 location,
@@ -839,31 +847,10 @@ export class TelegramClientManager {
       throw new Error("No media found for message: " + messageId);
     }
 
-    const media = message.media as any;
-    let size = 0;
-    let mimeType = 'application/octet-stream';
-
-    if (media?.className === 'MessageMediaDocument') {
-      const doc = media.document;
-      if (!doc) {
-        throw new Error("No document in media");
-      }
-      size = Number(doc.size || 0);
-      mimeType = doc.mimeType || 'application/octet-stream';
-    } else if (media?.className === 'MessageMediaPhoto') {
-      const photo = media.photo;
-      if (!photo) {
-        throw new Error("No photo in media");
-      }
-      size = Number(photo.size || 0);
-      mimeType = 'image/jpeg';
-    } else {
-      throw new Error("Unsupported media type: " + media?.className);
-    }
-
-    console.log('[FileMetadata] Got metadata - size:', size, 'mimeType:', mimeType);
-    
-    return { size, mimeType };
+    const ref = readMedia(message.media);
+    if (!ref) throw new Error("Unsupported media type: " + (message.media as any)?.className);
+    console.log('[FileMetadata] Got metadata - size:', ref.size, 'mimeType:', ref.mimeType);
+    return { size: ref.size, mimeType: ref.mimeType };
   }
 
   /**
@@ -957,34 +944,12 @@ export class TelegramClientManager {
    */
   async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream', waitForComplete: boolean = false): Promise<Blob> {
     console.log('[Streaming] Starting streaming download...');
-    
+
     // Extract file location from message media
-    let fileSize: number = 0;
-    let docId: bigint = BigInt(0);
-    let accessHash: bigint = BigInt(0);
-    let fileReference: Uint8Array | undefined;
-    
-    const media = message.media as any;
-    
-    if (media?.className === 'MessageMediaDocument') {
-      const doc = media.document;
-      if (!doc) throw new Error('No document in media');
-      docId = doc.id;
-      accessHash = doc.accessHash;
-      fileReference = doc.fileReference;
-      fileSize = Number(doc.size);
-      console.log('[Streaming] Document size:', fileSize);
-    } else if (media?.className === 'MessageMediaPhoto') {
-      const photo = media.photo;
-      if (!photo) throw new Error('No photo in media');
-      docId = photo.id;
-      accessHash = photo.accessHash;
-      fileReference = photo.fileReference;
-      fileSize = Number(photo.size);
-      console.log('[Streaming] Photo size:', fileSize);
-    } else {
-      throw new Error('Unsupported media type: ' + media?.className);
-    }
+    const ref = readMedia(message.media);
+    if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
+    const fileSize = ref.size;
+    console.log('[Streaming] Total size:', fileSize);
 
     const CHUNK_SIZE = 512 * 1024;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
@@ -999,12 +964,7 @@ export class TelegramClientManager {
     let downloadError: Error | null = null;
     let onProgress: (() => void) | null = null;
 
-    const location = new Api.InputDocumentFileLocation({
-      id: docId as any,
-      accessHash: accessHash as any,
-      fileReference: fileReference,
-      thumbSize: "",
-    });
+    const location = fileLocationFor(ref, ref.fullThumbSize);
 
     const chunkSemaphore = new Semaphore(6);
     const client = this.client;
@@ -1138,20 +1098,14 @@ export class TelegramClientManager {
       }
     }
 
-    const toLocation = (loc: { docId: bigint; accessHash: bigint; fileReference?: Uint8Array }) =>
-      new Api.InputDocumentFileLocation({
-        id: loc.docId as any,
-        accessHash: loc.accessHash as any,
-        fileReference: loc.fileReference,
-        thumbSize: "",
-      });
+    const toLocation = (ref: MediaRef) => fileLocationFor(ref, ref.fullThumbSize);
 
     // Cached after the first chunk of a given message — subsequent chunks skip getMessages entirely.
     const invokeGetFile = async (off: number, lim: number): Promise<any> => {
-      const loc = await this.getFileLocation(messageId, false, expectedFileId);
+      const ref = await this.getFileLocation(messageId, false, expectedFileId);
       try {
         return await this.client!.invoke(
-          new Api.upload.GetFile({ location: toLocation(loc), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+          new Api.upload.GetFile({ location: toLocation(ref), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
         );
       } catch (err: any) {
         if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {

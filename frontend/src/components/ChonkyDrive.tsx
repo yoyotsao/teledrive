@@ -14,6 +14,7 @@ import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { ContextMenu, MenuItem } from './ContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
+import { ImportChatDialog } from './ImportChatDialog';
 import { DetailsPanel } from './DetailsPanel';
 import { fileKind } from '../lib/fileKind';
 import { downloadFileToDisk, fetchFileBlob } from '../lib/download';
@@ -255,6 +256,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetId: string | null } | null>(null);
   const [renameTarget, setRenameTarget] = useState<FileInfo | null>(null);
   const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [showImportChat, setShowImportChat] = useState(false);
   const [detailsFile, setDetailsFile] = useState<FileInfo | null>(null);
   const [emptyTrashConfirm, setEmptyTrashConfirm] = useState(false);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
@@ -1756,6 +1758,12 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
               + 新資料夾
             </button>
             <button
+              onClick={() => setShowImportChat(true)}
+              style={{ background: 'var(--td-accent)', border: 'none', cursor: 'pointer', color: 'white', fontSize: '14px', padding: '8px 16px', borderRadius: '6px', fontWeight: 500 }}
+            >
+              匯入 chat
+            </button>
+            <button
               onClick={handleUploadClick}
               style={{ background: '#16a34a', border: 'none', cursor: 'pointer', color: 'white', fontSize: '14px', padding: '8px 16px', borderRadius: '6px', fontWeight: 500 }}
             >
@@ -2052,6 +2060,13 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           selectBaseName={!renameTarget.isDir}
           onSubmit={(name) => performRename(renameTarget, name)}
           onCancel={() => setRenameTarget(null)}
+        />
+      )}
+
+      {showImportChat && (
+        <ImportChatDialog
+          onClose={() => setShowImportChat(false)}
+          onDone={() => { void loadContents(); }}
         />
       )}
 

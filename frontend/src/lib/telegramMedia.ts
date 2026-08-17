@@ -89,3 +89,90 @@ export function readMedia(media: unknown): MediaRef | null {
 
   return null;
 }
+
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
+
+const MIME_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp',
+  'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/x-matroska': 'mkv', 'video/webm': 'webm',
+  'audio/mpeg': 'mp3', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/flac': 'flac',
+  'application/pdf': 'pdf', 'application/zip': 'zip', 'text/plain': 'txt',
+};
+
+export function extFromMime(mime: string | undefined): string {
+  const base = (mime || '').split(';')[0].trim().toLowerCase();
+  if (!base) return 'bin';
+  if (MIME_EXT[base]) return MIME_EXT[base];
+  const subtype = base.split('/')[1];
+  return subtype || 'bin';
+}
+
+/** UTC yyyymmdd_hhmmss from a Telegram unix timestamp (seconds). */
+function stamp(unixSeconds: number): string {
+  const d = new Date(unixSeconds * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}`
+    + `_${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+/**
+ * Strip anything that would break a path or a UI row, and cap the length so a
+ * pathological caption-as-filename can't blow past filesystem limits on
+ * download. The extension is preserved across truncation.
+ */
+export function sanitizeFilename(name: string): string {
+  const cleaned = name
+    .replace(CONTROL_CHARS, '')  // control chars, e.g. newlines in captions
+    .replace(/[/\\]/g, '_')
+    .trim();
+  if (!cleaned) return 'unnamed';
+  const MAX = 200;
+  if (cleaned.length <= MAX) return cleaned;
+  const dot = cleaned.lastIndexOf('.');
+  const ext = dot > 0 && cleaned.length - dot <= 12 ? cleaned.slice(dot) : '';
+  return cleaned.slice(0, MAX - ext.length) + ext;
+}
+
+function attr(attributes: any[] | undefined, className: string): any {
+  return (attributes ?? []).find((a) => a?.className === className);
+}
+
+/**
+ * Best available name for a message's media. Captions are deliberately NOT
+ * used: they are frequently long prose with newlines and emoji, and when a
+ * real DocumentAttributeFilename exists it is always the better name anyway.
+ * Every synthesized name embeds the message id, so names never collide.
+ */
+export function deriveFilename(message: any): string {
+  const msgId = message?.id;
+  const media = message?.media;
+
+  if (media?.className === 'MessageMediaPhoto') {
+    return `photo_${stamp(Number(message?.date ?? 0))}_${msgId}.jpg`;
+  }
+
+  const doc = media?.document;
+  const attributes = doc?.attributes as any[] | undefined;
+  const mime = doc?.mimeType as string | undefined;
+  const ext = extFromMime(mime);
+
+  const named = attr(attributes, 'DocumentAttributeFilename');
+  if (named?.fileName) return sanitizeFilename(String(named.fileName));
+
+  if (attr(attributes, 'DocumentAttributeAnimated')) return `gif_${msgId}.${ext}`;
+  if (attr(attributes, 'DocumentAttributeSticker')) return `sticker_${msgId}.${ext}`;
+
+  const audio = attr(attributes, 'DocumentAttributeAudio');
+  if (audio) {
+    if (audio.title) {
+      const label = audio.performer ? `${audio.performer} - ${audio.title}` : String(audio.title);
+      return sanitizeFilename(`${label}.${ext}`);
+    }
+    return `audio_${msgId}.${ext}`;
+  }
+
+  if (attr(attributes, 'DocumentAttributeVideo')) return `video_${msgId}.${ext}`;
+
+  return `file_${msgId}.${ext}`;
+}

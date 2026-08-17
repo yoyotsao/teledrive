@@ -9,7 +9,7 @@
  * sizes[]). Both bugs are silent at the type level because gramjs hands us
  * `any`. These asserts are what "we read the right bytes" means.
  */
-import { readMedia, photoSizeBytes } from './telegramMedia.ts';
+import { readMedia, photoSizeBytes, deriveFilename, sanitizeFilename, extFromMime } from './telegramMedia.ts';
 
 function check(label: string, cond: boolean): void {
   if (!cond) throw new Error(`FAIL: ${label}`);
@@ -84,5 +84,75 @@ check('unsupported media returns null',
 check('null media returns null', readMedia(null) === null);
 check('document media without a document returns null',
   readMedia({ className: 'MessageMediaDocument' }) === null);
+
+// --- 檔名推導 ---------------------------------------------------------------
+const DATE = 1755388800; // 2025-08-17T00:00:00Z
+
+function docMessage(attributes: any[], mimeType = 'application/octet-stream') {
+  return {
+    id: 42,
+    date: DATE,
+    media: { className: 'MessageMediaDocument', document: { id: 1, accessHash: 2, size: 1, mimeType, attributes } },
+  };
+}
+
+check('real filename wins',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeFilename', fileName: 'report.pdf' }])) === 'report.pdf');
+
+check('video without a filename is named from the message id',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeVideo' }], 'video/mp4')) === 'video_42.mp4');
+
+check('audio with title and performer',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeAudio', title: 'Song', performer: 'Band' }], 'audio/mpeg'))
+    === 'Band - Song.mp3');
+
+check('audio with title only',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeAudio', title: 'Song' }], 'audio/mpeg'))
+    === 'Song.mp3');
+
+check('audio without title',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeAudio' }], 'audio/ogg')) === 'audio_42.ogg');
+
+check('animated gif',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeAnimated' }], 'video/mp4')) === 'gif_42.mp4');
+
+check('sticker',
+  deriveFilename(docMessage([{ className: 'DocumentAttributeSticker' }], 'image/webp')) === 'sticker_42.webp');
+
+check('bare document falls back to file_ with a mime-derived extension',
+  deriveFilename(docMessage([], 'application/zip')) === 'file_42.zip');
+
+check('unknown mime falls back to its subtype',
+  deriveFilename(docMessage([], 'application/x-weird')) === 'file_42.x-weird');
+
+check('missing mime falls back to bin',
+  deriveFilename(docMessage([], '')) === 'file_42.bin');
+
+check('filename attribute wins even for a video',
+  deriveFilename(docMessage(
+    [{ className: 'DocumentAttributeVideo' }, { className: 'DocumentAttributeFilename', fileName: 'clip.mkv' }],
+    'video/mp4')) === 'clip.mkv');
+
+const photoMsg = {
+  id: 77,
+  date: DATE,
+  media: { className: 'MessageMediaPhoto', photo: { id: 3, accessHash: 4, sizes: [{ type: 'x', size: 10 }] } },
+};
+check('photo name embeds its timestamp and message id',
+  deriveFilename(photoMsg) === 'photo_20250817_000000_77.jpg');
+
+// sanitize
+check('path separators are stripped',
+  sanitizeFilename('a/b\\c.txt') === 'a_b_c.txt');
+check('control characters are stripped but spaces survive',
+  sanitizeFilename('a b\nc.txt') === 'a bc.txt');
+check('an empty name becomes a placeholder',
+  sanitizeFilename('   ') === 'unnamed');
+const long = 'x'.repeat(300) + '.mp4';
+check('long names are truncated to 200 chars', sanitizeFilename(long).length === 200);
+check('truncation keeps the extension', sanitizeFilename(long).endsWith('.mp4'));
+
+check('extFromMime maps known types', extFromMime('image/jpeg') === 'jpg');
+check('extFromMime handles parameters', extFromMime('image/jpeg; charset=binary') === 'jpg');
 
 console.log('\nAll telegramMedia checks passed.');

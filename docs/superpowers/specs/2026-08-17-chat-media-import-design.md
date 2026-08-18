@@ -21,7 +21,7 @@ forward 是 Telegram 伺服器內部搬移 media 參照，**不傳輸檔案內�
 
 ## 架構
 
-純前端功能，**後端零改動**。
+功能主體在前端。後端只有一處改動：`POST /api/v1/files/register` 增加擁有權檢查，當同一個 `file_id` 已屬於別的 drive 時回 409 —— 因為 `files.file_id` 是全域主鍵而 `insert_file` 用 `INSERT OR REPLACE`，兩個 drive 匯入同一個公開頻道會 forward 到同一批 document，後者會覆寫前者的記錄連 `owner_id` 一起換掉。這個檢查不搬移任何檔案內容，不影響「binary 不經過 Python 後端」的架構不變量。
 
 新增：
 
@@ -34,7 +34,7 @@ forward 是 Telegram 伺服器內部搬移 media 參照，**不傳輸檔案內�
 - 新增 `resolveChat(input)`、`iterChatMedia(entity)`、`forwardToSaved(entity, msgId)`
 - 為 `MessageMediaPhoto` 補上下載分支（見「照片支援」）
 
-沿用既有後端 API：`POST /api/v1/folders`、`GET /api/v1/files`、`POST /api/v1/files/register`。
+沿用既有後端 API：`POST /api/v1/folders`、`GET /api/v1/files`、`POST /api/v1/files/register`（後者現在可能回 409，見上）。
 
 ## 流程
 

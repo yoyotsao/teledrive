@@ -90,6 +90,26 @@ export function readMedia(media: unknown): MediaRef | null {
   return null;
 }
 
+/**
+ * True when a resolved chat entity IS the account's own user — i.e. Saved
+ * Messages, chat import's destination. Checked two ways because either input
+ * shape alone can miss it: `self` is the flag Telegram sets on the entity
+ * `getEntity('me')` returns, but the SAME account resolved via its own
+ * username or numeric id comes back without `self` set, only a matching id.
+ *
+ * Used to block importing Saved Messages as a chat-import SOURCE: forwarding
+ * it into itself re-registers every file already in the drive under the
+ * import folder with a new message id, and insert_file's INSERT OR REPLACE
+ * wipes split_group_id/part_index/is_split_file on the way — permanently
+ * breaking every split (>512MB) file in the drive. Do not remove this as a
+ * "redundant" check.
+ */
+export function isOwnAccount(entity: { self?: boolean; id?: unknown } | null | undefined, accountId: number): boolean {
+  if (!entity) return false;
+  if (entity.self === true) return true;
+  return entity.id != null && String(entity.id) === String(accountId);
+}
+
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
 

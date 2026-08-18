@@ -37,7 +37,7 @@ import {
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
-import { readMedia, type MediaRef } from "./telegramMedia";
+import { readMedia, isOwnAccount, type MediaRef } from "./telegramMedia";
 
 /**
  * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
@@ -1184,6 +1184,19 @@ export class TelegramClientManager {
       } catch {
         throw new Error(`此帳號無法存取 chat「${input}」。請先用同一個 Telegram 帳號開啟過該對話。`);
       }
+    }
+
+    // CRITICAL — do not remove: Saved Messages is chat import's DESTINATION.
+    // 'me', the account's own username, and the account's own numeric id all
+    // resolve to this same entity, and none of them error out — getEntity('me')
+    // just returns the self User. Importing it forwards every message of Saved
+    // Messages back into Saved Messages and re-registers each with the SAME
+    // file_id the drive already holds; insert_file is INSERT OR REPLACE on
+    // file_id, so every existing row gets rewritten with a new message id, the
+    // import folder as parent, and split_group_id/part_index/is_split_file
+    // reset — permanently breaking every split (>512MB) file in this drive.
+    if (isOwnAccount(entity, this.accountId)) {
+      throw new Error('Saved Messages 是匯入的目的地，不能同時作為來源匯入 —— 這麼做會覆蓋並毀損雲端硬碟中已有的檔案紀錄（尤其是大檔案的分割片段）。');
     }
 
     const title = entity.title

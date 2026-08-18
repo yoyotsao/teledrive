@@ -9,7 +9,7 @@
  * sizes[]). Both bugs are silent at the type level because gramjs hands us
  * `any`. These asserts are what "we read the right bytes" means.
  */
-import { readMedia, photoSizeBytes, deriveFilename, sanitizeFilename, extFromMime } from './telegramMedia.ts';
+import { readMedia, photoSizeBytes, deriveFilename, sanitizeFilename, extFromMime, isOwnAccount } from './telegramMedia.ts';
 
 function check(label: string, cond: boolean): void {
   if (!cond) throw new Error(`FAIL: ${label}`);
@@ -154,5 +154,19 @@ check('truncation keeps the extension', sanitizeFilename(long).endsWith('.mp4'))
 
 check('extFromMime maps known types', extFromMime('image/jpeg') === 'jpg');
 check('extFromMime handles parameters', extFromMime('image/jpeg; charset=binary') === 'jpg');
+
+// --- isOwnAccount: guards chat import from resolving Saved Messages as a SOURCE ----
+// (getEntity('me') / own username / own numeric id must all be caught — see gramjs.ts resolveChat)
+check('self flag alone marks the entity as the account itself',
+  isOwnAccount({ self: true, id: 999 }, 42) === true);
+check('a matching numeric id alone marks the entity as the account itself (no self flag, e.g. resolved by username)',
+  isOwnAccount({ id: 42 }, 42) === true);
+check('both self flag and matching id still marks the entity as the account itself',
+  isOwnAccount({ self: true, id: 42 }, 42) === true);
+check('neither self flag nor matching id means it is a genuinely different chat',
+  isOwnAccount({ self: false, id: 999 }, 42) === false);
+check('a bigint-ish id compares by decimal string, not reference',
+  isOwnAccount({ id: '42' }, 42) === true);
+check('null entity is never the own account', isOwnAccount(null, 42) === false);
 
 console.log('\nAll telegramMedia checks passed.');

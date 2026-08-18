@@ -214,10 +214,21 @@ async def register_file(
     # Trust boundary: the client names the storage account, so verify it is actually
     # linked to this drive — otherwise a caller could attribute files to a stranger.
     storage_account = request.telegram_user_id or current_user
+    db = await get_database()
     if storage_account != current_user:
-        db = await get_database()
         if not await db.get_linked_account(current_user, storage_account):
             raise HTTPException(status_code=403, detail="Account not linked to this drive")
+
+    # Same trust boundary: file_id is a global primary key and insert_file is
+    # INSERT OR REPLACE, so registering a file_id that already belongs to a
+    # DIFFERENT drive would silently overwrite that drive's row — owner_id
+    # included, i.e. steal it. Before chat import, file_id was always a
+    # document id minted by the caller's own upload, so this collision was
+    # essentially impossible; importing a public channel two drives both have
+    # access to makes it near-certain.
+    existing = await db.get_file(request.file_id)
+    if existing and existing["owner_id"] != current_user:
+        raise HTTPException(status_code=409, detail="File already registered to a different drive")
 
     try:
         file_service = get_file_service()

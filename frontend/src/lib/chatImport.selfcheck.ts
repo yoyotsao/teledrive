@@ -123,4 +123,63 @@ const noop = () => {};
     result.failed === 1 && result.imported === 2 && registered.length === 2);
 }
 
+// --- 轉發回來卻讀不到 media：視為失敗，而非用來源 access_hash 湊一筆可能壞掉的紀錄 -------
+{
+  const { deps, registered } = makeDeps({
+    forwardToSaved: async (_e, msgId) => ({ id: msgId + 1000, media: { className: 'MessageMediaPoll' } }),
+  });
+  const result = await runImport('@chan', deps, noop, never);
+  check('an unreadable forward is counted as failed, not registered',
+    result.failed === 3 && result.imported === 0 && registered.length === 0);
+}
+
+// --- 連續失敗達上限即中止（例如 PEER_FLOOD 這種不會在幾秒內解除的帳號級限制）-------------
+{
+  const manyDocs = Array.from({ length: 10 }, (_, i) => docMsg(i + 1, 100 + i + 1));
+  let calls = 0;
+  const { deps } = makeDeps({
+    iterChatMedia: () => manyDocs,
+    forwardToSaved: async () => { calls++; throw new Error('PEER_FLOOD'); },
+  });
+  let message = '';
+  try { await runImport('@chan', deps, noop, never); } catch (e: any) { message = e.message; }
+  check('the run aborts after exactly 5 consecutive failures, not all 10',
+    calls === 5);
+  check('the abort error surfaces the last underlying failure',
+    message.includes('PEER_FLOOD'));
+}
+
+// --- 交錯出現的成功會重置連續失敗計數，不會被誤判成「總失敗數」而提早中止 -------------------
+{
+  const manyDocs = Array.from({ length: 12 }, (_, i) => docMsg(i + 1, 100 + i + 1));
+  let calls = 0;
+  const { deps, registered } = makeDeps({
+    iterChatMedia: () => manyDocs,
+    forwardToSaved: async (_e, msgId) => {
+      calls++;
+      if (calls % 5 !== 0) throw new Error('transient');
+      return { ...docMsg(msgId + 1000, msgId + 100), id: msgId + 1000 };
+    },
+  });
+  const result = await runImport('@chan', deps, noop, never);
+  check('a success resets the consecutive-failure counter, so the run processes all 12 messages',
+    calls === 12 && result.imported === 2 && result.failed === 10);
+  check('the two successes registered despite eight intervening failures',
+    registered.length === 2);
+}
+
+// --- 掃描進度：非媒體訊息也要計入 scanned 並觸發 onProgress，才能讓長段純文字聊天可被中止 ---
+{
+  const textMsg = { id: 99, date: 1755388800, media: null };
+  const { deps } = makeDeps({
+    iterChatMedia: () => [textMsg, docMsg(1, 101)],
+  });
+  const scannedTicks: number[] = [];
+  const result = await runImport('@chan', deps, (p) => scannedTicks.push(p.scanned), never);
+  check('a non-media message is scanned but not imported/skipped/failed',
+    result.scanned === 2 && result.imported === 1 && result.skipped === 0 && result.failed === 0);
+  check('onProgress ticks scanned for a message with no media at all',
+    scannedTicks.includes(1));
+}
+
 console.log('\nAll chatImport checks passed.');

@@ -57,13 +57,29 @@ export async function runImport(
 
   const progress: ImportProgress = { scanned: 0, imported: 0, skipped: 0, failed: 0, current: title };
 
+  // Aborts a run stuck on a global cause (e.g. PEER_FLOOD, which isFloodError
+  // matches but which does not clear in seconds and carries no wait time) after
+  // this many failures IN A ROW — a success resets it to 0. Without this, a
+  // global failure just burns through the whole chat one doomed forward at a
+  // time while the dialog reports "steady progress" importing nothing.
+  const MAX_CONSECUTIVE_FAILURES = 5;
+  let consecutiveFailures = 0;
+  let lastFailure: unknown = null;
+
   for await (const message of deps.iterChatMedia(entity) as AsyncIterable<any>) {
     if (shouldStop()) break;
 
-    const source = readMedia(message.media);
-    if (!source) continue;
-
+    // Tick scan progress for EVERY message, not just media ones: iterChatMedia
+    // yields the whole chat now (see gramjs.ts), so a long non-media stretch
+    // must still move `scanned` and still be interruptible via shouldStop().
     progress.scanned++;
+
+    const source = readMedia(message.media);
+    if (!source) {
+      onProgress({ ...progress });
+      continue;
+    }
+
     if (seen.has(source.id)) {
       progress.skipped++;
       onProgress({ ...progress });
@@ -75,7 +91,14 @@ export async function runImport(
 
     try {
       const forwarded = await deps.forwardToSaved(entity, message.id);
-      const stored = readMedia(forwarded.media) ?? source;
+      const stored = readMedia(forwarded.media);
+      if (!stored) {
+        // iterChatMedia already proved the SOURCE readable, so an unreadable
+        // forward is anomalous, not expected — treat it as a failure rather
+        // than silently registering the source's access_hash against a
+        // message id it doesn't belong to (a record that may not download).
+        throw new Error(`Forwarded message ${forwarded.id} has no readable media (source message ${message.id})`);
+      }
       await deps.register({
         filename,
         filesize: stored.size,
@@ -92,11 +115,19 @@ export async function runImport(
       // source id stays unseen and a re-run would import the message again.
       seen.add(source.id);
       progress.imported++;
+      consecutiveFailures = 0;
     } catch (err) {
       console.error('[ChatImport] failed on message', message.id, err);
       progress.failed++;
+      consecutiveFailures++;
+      lastFailure = err;
     }
     onProgress({ ...progress });
+
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      const reason = lastFailure instanceof Error ? lastFailure.message : String(lastFailure);
+      throw new Error(`連續 ${MAX_CONSECUTIVE_FAILURES} 則訊息匯入失敗，已中止匯入。最後錯誤：${reason}`);
+    }
   }
 
   return progress;

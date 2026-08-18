@@ -1207,20 +1207,21 @@ export class TelegramClientManager {
   }
 
   /**
-   * Yield the chat's media messages oldest-first.
+   * Yield every message in the chat, oldest-first — media and non-media alike.
    *
-   * No server-side InputMessagesFilter is used: no single filter covers
-   * photos + videos + documents at once, and running several filtered passes
-   * would break the single oldest-to-newest ordering the import relies on for
-   * resumability. Filtering client-side costs one getHistory page per 100
-   * messages, which is cheap next to the forward rate limit.
+   * The media filter itself lives in runImport (chatImport.ts, via readMedia),
+   * not here: a chat can have thousands of text messages before its first
+   * media one, and runImport needs to see (report scan progress for, and be
+   * able to stop within) that whole stretch. An iterator that silently
+   * skipped non-media messages would hide it from the loop entirely, leaving
+   * onProgress uncalled and shouldStop() unchecked for as long as the
+   * stretch lasts.
    */
   async *iterChatMedia(entity: any): AsyncGenerator<Api.Message> {
     await this.waitUntilReady();
     if (!this.client) throw new Error('Client not initialized');
     for await (const message of this.client.iterMessages(entity, { reverse: true })) {
-      const msg = message as Api.Message;
-      if (msg?.media && readMedia(msg.media)) yield msg;
+      yield message as Api.Message;
     }
   }
 

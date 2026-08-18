@@ -51,7 +51,7 @@ forward 是 Telegram 伺服器內部搬移 media 參照，**不傳輸檔案內�
    | 欄位 | 值 |
    |---|---|
    | `message_id` | forward 後在 Saved Messages 的新 message id |
-   | `file_id` | 來源 media id（forward 不改變，故可當去重鍵） |
+   | `file_id` | 轉發後訊息中 media 的 id（假設 forward 不改變 media id，故等同來源 id，可當去重鍵） |
    | `access_hash` | forward 後訊息中 media 的 access_hash |
    | `parent_id` | 步驟 3 的資料夾 id |
    | `telegram_user_id` | 執行匯入的主帳號（`getPrimaryClient()`） |

@@ -906,8 +906,7 @@ export class TelegramClientManager {
     // GramJS's sequential 128KB-per-round-trip downloadMedia. Every byte is
     // relayed through the ws-proxy, so hiding round-trips with pipelined GetFile
     // requests is the single biggest win for multi-MB previews. Fall back to the
-    // sequential path if the parallel one fails (e.g. a genuine MessageMediaPhoto,
-    // which the chunked path doesn't build a location for).
+    // sequential path if the parallel one fails.
     if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType.startsWith('image/')) {
       console.log('[Download] Image file, using parallel chunked download...');
       try {

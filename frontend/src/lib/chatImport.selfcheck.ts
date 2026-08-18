@@ -62,7 +62,7 @@ const noop = () => {};
   check('nothing skipped on a fresh import', result.skipped === 0);
   check('register uses the forwarded message id, not the source id',
     registered[0].messageId === 1001);
-  check('register uses the source media id as file_id',
+  check('register uses the forwarded media id as file_id (coincides with the source id in this fixture)',
     registered[0].fileId === '101');
   check('register targets the created folder', registered[0].parentId === 'folder-1');
   check('register attributes the file to the importing account',

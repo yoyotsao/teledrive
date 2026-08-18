@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { runImport, type ImportProgress } from '../lib/chatImport';
 import { liveDeps } from '../lib/chatImportDeps';
 
@@ -12,6 +12,11 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
   const [error, setError] = useState<string | null>(null);
   const [finished, setFinished] = useState(false);
   const stopRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
 
   const start = async () => {
     const value = input.trim();
@@ -19,6 +24,7 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
     setError(null);
     setRunning(true);
     setFinished(false);
+    setProgress(null);
     stopRef.current = false;
     try {
       const result = await runImport(value, liveDeps(), setProgress, () => stopRef.current);
@@ -46,10 +52,14 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
         </div>
 
         <input
+          ref={inputRef}
           value={input}
           disabled={running}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !running) start(); }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !running) start();
+            if (e.key === 'Escape' && !running) onClose();
+          }}
           placeholder="@channelname、t.me/xxx 或 -1001234567890"
           style={{ width: '100%', padding: '8px 10px', fontSize: 14, borderRadius: 6, border: '1px solid var(--td-border)', background: 'var(--td-bg)', color: 'var(--td-text)', boxSizing: 'border-box' }}
         />

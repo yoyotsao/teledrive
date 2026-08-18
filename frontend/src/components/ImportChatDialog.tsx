@@ -30,11 +30,13 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
       const result = await runImport(value, liveDeps(), setProgress, () => stopRef.current);
       setProgress(result);
       setFinished(true);
-      onDone();
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
       setRunning(false);
+      // Every exit path — success, stop, or a mid-iteration throw — may have
+      // imported at least one file, so the drive must refresh regardless.
+      onDone();
     }
   };
 
@@ -71,7 +73,7 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
 
         {progress && (
           <div style={{ fontSize: 13, color: 'var(--td-text)', marginTop: 14, fontVariantNumeric: 'tabular-nums' }}>
-            已匯入 {progress.imported}　跳過 {progress.skipped}　失敗 {progress.failed}
+            已掃描 {progress.scanned}　已匯入 {progress.imported}　跳過 {progress.skipped}　失敗 {progress.failed}
             <div style={{ fontSize: 12, color: 'var(--td-text-muted)', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {finished ? '完成' : progress.current}
             </div>

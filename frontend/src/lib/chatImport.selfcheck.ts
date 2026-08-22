@@ -15,19 +15,23 @@ function check(label: string, cond: boolean): void {
   console.log(`ok - ${label}`);
 }
 
-function docMsg(id: number, docId: number) {
+function namedDoc(id: number, docId: number, fileName: string, size = 10, mimeType = 'video/mp4') {
   return {
     id,
     date: 1755388800,
     media: {
       className: 'MessageMediaDocument',
       document: {
-        id: docId, accessHash: 999, size: 10, mimeType: 'video/mp4',
-        attributes: [{ className: 'DocumentAttributeFilename', fileName: `f${docId}.mp4` }],
+        id: docId, accessHash: 999, size, mimeType,
+        attributes: [{ className: 'DocumentAttributeFilename', fileName }],
         thumbs: [],
       },
     },
   };
+}
+
+function docMsg(id: number, docId: number) {
+  return namedDoc(id, docId, `f${docId}.mp4`);
 }
 
 function makeDeps(overrides: Partial<ImportDeps> = {}) {
@@ -41,7 +45,7 @@ function makeDeps(overrides: Partial<ImportDeps> = {}) {
       return { ...docMsg(msgId + 1000, msgId + 100), id: msgId + 1000 };
     },
     ensureFolder: async () => 'folder-1',
-    existingFileIds: async () => new Set<string>(),
+    existingFiles: async () => [],
     register: async (p) => { registered.push(p); },
     accountId: 7,
     ...overrides,
@@ -73,7 +77,10 @@ const noop = () => {};
 // --- 續傳：已存在的媒體要跳過 --------------------------------------------------
 {
   const { deps, forwarded, registered } = makeDeps({
-    existingFileIds: async () => new Set(['101', '102']),
+    existingFiles: async () => [
+      { fileId: '101', filename: 'f101.mp4', filesize: 10, mimeType: 'video/mp4' },
+      { fileId: '102', filename: 'f102.mp4', filesize: 10, mimeType: 'video/mp4' },
+    ],
   });
   const result = await runImport('@chan', deps, noop, never);
   check('resume skips media already in the drive', result.skipped === 2);
@@ -180,6 +187,90 @@ const noop = () => {};
     result.scanned === 2 && result.imported === 1 && result.skipped === 0 && result.failed === 0);
   check('onProgress ticks scanned for a message with no media at all',
     scannedTicks.includes(1));
+}
+
+// --- 同名判斷與自動改名 -------------------------------------------------------
+/**
+ * Forwards by echoing the source media under a new message id. `mediaIdShift`
+ * defaults to rewriting the media id too, so anything these cases dedupe was
+ * deduped by the (name, size, mime) test rather than by the media-id test that
+ * already existed; pass 0 for the way Telegram actually behaves, where a
+ * forward keeps the source's media id.
+ */
+function echoDeps(messages: any[], overrides: Partial<ImportDeps> = {}, mediaIdShift = 5000) {
+  const byId = new Map<number, any>(messages.map((m) => [m.id, m]));
+  return makeDeps({
+    iterChatMedia: () => messages,
+    forwardToSaved: async (_e, msgId) => {
+      const doc = byId.get(msgId).media.document;
+      return namedDoc(msgId + 1000, Number(doc.id) + mediaIdShift, doc.attributes[0].fileName, doc.size, doc.mimeType);
+    },
+    ...overrides,
+  });
+}
+
+{
+  const { deps, registered } = echoDeps([
+    namedDoc(1, 101, 'dup.mp4', 10),
+    namedDoc(2, 102, 'dup.mp4', 10),
+  ]);
+  const result = await runImport('@chan', deps, noop, never);
+  check('two different media with the same name, size and mime import only once',
+    result.imported === 1 && result.skipped === 1 && registered.length === 1);
+}
+
+{
+  const { deps, registered } = echoDeps([
+    namedDoc(1, 101, 'dup.mp4', 10),
+    namedDoc(2, 102, 'dup.mp4', 20),
+    namedDoc(3, 103, 'dup.mp4', 30),
+  ]);
+  const result = await runImport('@chan', deps, noop, never);
+  check('same-named files of different sizes are all kept',
+    result.imported === 3 && result.skipped === 0);
+  check('collisions within one run are numbered (1), (2)',
+    registered.map((r) => r.filename).join(',') === 'dup.mp4,dup (1).mp4,dup (2).mp4');
+}
+
+{
+  const { deps, registered } = echoDeps([namedDoc(1, 101, 'dup.mp4', 10)], {
+    existingFiles: async () => [{ fileId: '999', filename: 'dup.mp4', filesize: 99, mimeType: 'video/mp4' }],
+  });
+  const result = await runImport('@chan', deps, noop, never);
+  check('a name already taken by a drive row is renamed rather than duplicated',
+    result.imported === 1 && registered[0].filename === 'dup (1).mp4');
+}
+
+{
+  const { deps, registered } = echoDeps([namedDoc(1, 101, 'dup.mp4', 10)], {
+    existingFiles: async () => [{ fileId: '999', filename: 'dup.mp4', filesize: 10, mimeType: 'video/mp4' }],
+  });
+  const result = await runImport('@chan', deps, noop, never);
+  check('a file matching a drive row on name, size and mime is skipped despite its new media id',
+    result.imported === 0 && result.skipped === 1 && registered.length === 0);
+}
+
+// 重跑穩定性：把第一輪註冊的結果當成第二輪的既有列，序號不可層層疊加。
+// Media id 維持不變，因為 Telegram 的轉發本來就會保留來源的 media id。
+{
+  const messages = [
+    namedDoc(1, 101, 'dup.mp4', 10),
+    namedDoc(2, 102, 'dup.mp4', 20),
+    namedDoc(3, 103, 'other.mp4', 30),
+  ];
+  const first = echoDeps(messages, {}, 0);
+  const firstResult = await runImport('@chan', first.deps, noop, never);
+  check('the first pass keeps both same-named files, numbering the second',
+    firstResult.imported === 3
+    && first.registered.map((r: any) => r.filename).join(',') === 'dup.mp4,dup (1).mp4,other.mp4');
+
+  const rows = first.registered.map((r: any) => ({
+    fileId: r.fileId, filename: r.filename, filesize: r.filesize, mimeType: r.mimeType,
+  }));
+  const second = echoDeps(messages, { existingFiles: async () => rows }, 0);
+  const result = await runImport('@chan', second.deps, noop, never);
+  check('re-importing the same chat skips everything instead of growing "dup (1) (1).mp4"',
+    result.imported === 0 && result.skipped === 3 && second.registered.length === 0);
 }
 
 console.log('\nAll chatImport checks passed.');

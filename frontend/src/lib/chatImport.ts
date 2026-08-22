@@ -8,6 +8,7 @@
  * the selfcheck's node bundle never has to resolve `telegram` or `axios`.
  */
 import { readMedia, deriveFilename } from './telegramMedia';
+import { buildFolderIndex, rememberImported, resolveImport, type FolderEntry } from './importNaming';
 
 export type ImportProgress = {
   scanned: number;
@@ -34,7 +35,8 @@ export type ImportDeps = {
   iterChatMedia(entity: any): AsyncIterable<any> | Iterable<any>;
   forwardToSaved(entity: any, messageId: number): Promise<any>;
   ensureFolder(name: string): Promise<string>;
-  existingFileIds(folderId: string): Promise<Set<string>>;
+  /** Every row already filed under the import folder — the resume log and the taken-name list. */
+  existingFiles(folderId: string): Promise<FolderEntry[]>;
   register(params: RegisterParams): Promise<void>;
   accountId: number;
 };
@@ -52,8 +54,11 @@ export async function runImport(
 
   const folderId = await deps.ensureFolder(title);
   // The drive's own records are the resume log: any media id already filed
-  // under this folder has been imported, in this run or a previous one.
-  const seen = await deps.existingFileIds(folderId);
+  // under this folder has been imported, in this run or a previous one. The
+  // index also carries the folder's names and (name, size, mime) identities,
+  // and is updated as this run registers files, so a name taken a moment ago
+  // counts exactly like one that was already in the drive.
+  const index = buildFolderIndex(await deps.existingFiles(folderId));
 
   const progress: ImportProgress = { scanned: 0, imported: 0, skipped: 0, failed: 0, current: title };
 
@@ -80,13 +85,23 @@ export async function runImport(
       continue;
     }
 
-    if (seen.has(source.id)) {
+    // Forwarding never puts the bytes in the browser, so an imported file has
+    // no file_hash to compare. resolveImport() therefore decides "already got
+    // it" from the media id plus the (name, size, mime) triple Telegram
+    // reports, and renames whatever survives that test into a free name.
+    const decision = resolveImport(index, {
+      fileId: source.id,
+      filename: deriveFilename(message),
+      filesize: source.size,
+      mimeType: source.mimeType,
+    });
+    if (decision.action === 'skip') {
       progress.skipped++;
       onProgress({ ...progress });
       continue;
     }
 
-    const filename = deriveFilename(message);
+    const filename = decision.filename;
     progress.current = filename;
 
     try {
@@ -110,10 +125,24 @@ export async function runImport(
         hasThumbnail: stored.previewThumbSize !== null,
         telegramUserId: deps.accountId,
       });
-      seen.add(stored.id);
+      // Record what was actually written to the drive — the stored media id
+      // and the final, possibly renamed filename — so this run's view of the
+      // folder matches what a re-run will read back from it.
+      rememberImported(index, {
+        fileId: stored.id,
+        filename,
+        filesize: stored.size,
+        mimeType: stored.mimeType,
+      });
       // Guard the case where forwarding rewrites the media id: without this the
       // source id stays unseen and a re-run would import the message again.
-      seen.add(source.id);
+      // Only this run benefits — a re-run rebuilds the index from drive rows,
+      // which carry the stored id. There the (name, size, mime) test covers
+      // it, except for a file that had to be renamed: its stored name no
+      // longer matches the name derived from the source, so it would import
+      // once more. Telegram forwards keep the source media id, so this stays
+      // hypothetical.
+      index.ids.add(source.id);
       progress.imported++;
       consecutiveFailures = 0;
     } catch (err) {

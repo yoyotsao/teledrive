@@ -10,6 +10,7 @@
 import { getPrimaryClient, loadAccounts } from './gramjs';
 import { api } from '../api/client';
 import type { ImportDeps } from './chatImport';
+import type { FolderEntry } from './importNaming';
 
 export function liveDeps(): ImportDeps {
   const client = getPrimaryClient();
@@ -28,15 +29,25 @@ export function liveDeps(): ImportDeps {
       return created.file_id;
     },
 
-    existingFileIds: async (folderId) => {
-      const ids = new Set<string>();
+    // Same single pass over the folder as before — it just keeps the name,
+    // size and mime it used to throw away, which is what the same-file test
+    // and the collision renaming run on. No extra requests, no backend change.
+    existingFiles: async (folderId) => {
+      const entries: FolderEntry[] = [];
       const PAGE = 200;
       for (let page = 1; ; page++) {
         const res = await api.listFiles(page, PAGE, folderId);
-        for (const f of res.files) ids.add(f.file_id);
+        for (const f of res.files) {
+          entries.push({
+            fileId: f.file_id,
+            filename: f.filename,
+            filesize: f.filesize,
+            mimeType: f.mime_type,
+          });
+        }
         if (res.files.length < PAGE) break;
       }
-      return ids;
+      return entries;
     },
 
     register: async (p) => {

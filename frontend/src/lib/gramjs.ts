@@ -37,7 +37,8 @@ import {
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
-import { readMedia, isOwnAccount, type MediaRef } from "./telegramMedia";
+import { readMedia, isOwnAccount, senderDcFor, type MediaRef } from "./telegramMedia";
+import { unwrapForwardedMessage } from "./forwardResult";
 
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
@@ -223,6 +224,29 @@ export class TelegramClientManager {
     const waitMs = (typeof seconds === 'number' && seconds > 0 ? seconds : FLOOD_PENALTY_MS / 1000) * 1000;
     console.warn(`[GramJS:${this.accountId}] ${label} hit FLOOD_WAIT — pausing message sends for ${waitMs}ms`);
     this.messageRateLimiter.penalize(waitMs);
+  }
+
+  /**
+   * Run one upload.GetFile on whichever connection can actually serve it.
+   *
+   * Media this account uploaded lives on its home DC, so the main sender
+   * answers and we stay on it — deliberately, because gramjs's getSender()
+   * opens a fresh exported sender for ANY dcId it is handed, and that
+   * redundant same-DC connection is what made batch thumbnail downloads
+   * reconnect-loop through the ws proxy (813dc42).
+   *
+   * A forwarded file (chat import) keeps the SOURCE chat's DC, and the main
+   * sender answers those with FILE_MIGRATE_x instead of bytes. gramjs's own
+   * download path has always read the dcId off the media for exactly this
+   * reason (client/downloads.js: iterDownload → getSender(info.dcId)); our
+   * wrapper just never carried the field through. senderDcFor() decides.
+   */
+  private async getFileFrom(request: InstanceType<typeof Api.upload.GetFile>, ref: MediaRef): Promise<any> {
+    const client = this.client!;
+    const dcId = senderDcFor(ref.dcId, (client.session as any)?.dcId);
+    if (dcId === undefined) return await client.invoke(request);
+    const sender = await (client as any).getSender(dcId);
+    return await sender.send(request);
   }
 
   /**
@@ -749,7 +773,6 @@ export class TelegramClientManager {
     if (messageIds.length === 0) return result;
 
     const messages = await this.client.getMessages("me", { ids: messageIds });
-    const client = this.client;
     const downloadSemaphore = new Semaphore(6);
 
     await Promise.all(
@@ -766,15 +789,16 @@ export class TelegramClientManager {
             // reconnect-loops ("Connection closed while receiving data"). Keeping
             // thumbnails on the main sender (like the parallel preview path) avoids it.
             const location = fileLocationFor(ref, ref.previewThumbSize);
-            const fileResult = await client.invoke(
+            const fileResult = await this.getFileFrom(
               new Api.upload.GetFile({
                 location,
                 offset: BigInt(0) as any,
                 limit: 512 * 1024, // aligned; thumbs are far smaller, EOF truncates
                 precise: false,
                 cdnSupported: false,
-              })
-            ) as any;
+              }),
+              ref,
+            );
             if (fileResult?.bytes?.length) {
               result.set(msg.id, new Blob([new Uint8Array(fileResult.bytes)], { type: 'image/jpeg' }));
             }
@@ -927,7 +951,6 @@ export class TelegramClientManager {
     const location = fileLocationFor(ref, ref.fullThumbSize);
 
     const chunkSemaphore = new Semaphore(6);
-    const client = this.client;
 
     const downloadChunk = async (chunkIndex: number) => {
       const offset = chunkIndex * CHUNK_SIZE;
@@ -936,15 +959,16 @@ export class TelegramClientManager {
       // (that produced 400 LIMIT_INVALID). Always request a full aligned 512KB —
       // Telegram returns only the bytes that exist up to EOF.
       const limit = CHUNK_SIZE;
-      const fileResult = await client!.invoke(
+      const fileResult = await this.getFileFrom(
         new Api.upload.GetFile({
           location,
           offset: BigInt(offset) as any,
           limit,
           precise: false,
           cdnSupported: true,
-        })
-      ) as any;
+        }),
+        ref,
+      );
 
       if (fileResult?.bytes) {
         chunkSlots[chunkIndex] = new Uint8Array(fileResult.bytes);
@@ -1064,15 +1088,17 @@ export class TelegramClientManager {
     const invokeGetFile = async (off: number, lim: number): Promise<any> => {
       const ref = await this.getFileLocation(messageId, false, expectedFileId);
       try {
-        return await this.client!.invoke(
-          new Api.upload.GetFile({ location: toLocation(ref), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+        return await this.getFileFrom(
+          new Api.upload.GetFile({ location: toLocation(ref), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
+          ref,
         );
       } catch (err: any) {
         if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {
           console.warn('[ChunkByOffset] File reference expired, refreshing for message', messageId);
           const fresh = await this.getFileLocation(messageId, true, expectedFileId);
-          return await this.client!.invoke(
-            new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+          return await this.getFileFrom(
+            new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
+            fresh,
           );
         }
         throw err;
@@ -1204,9 +1230,7 @@ export class TelegramClientManager {
           messages: [messageId],
           fromPeer: entity,
         });
-        const forwarded = (result as any[])[0] as Api.Message;
-        if (!forwarded?.id) throw new Error(`Forward of message ${messageId} returned no message`);
-        return forwarded;
+        return unwrapForwardedMessage(result, messageId) as Api.Message;
       } catch (err: any) {
         if (isFloodError(err) && attempt < 2) {
           this.penalizeForFlood('forwardMessages', err);

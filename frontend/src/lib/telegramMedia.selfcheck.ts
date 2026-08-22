@@ -9,7 +9,7 @@
  * sizes[]). Both bugs are silent at the type level because gramjs hands us
  * `any`. These asserts are what "we read the right bytes" means.
  */
-import { readMedia, photoSizeBytes, deriveFilename, sanitizeFilename, extFromMime, isOwnAccount } from './telegramMedia.ts';
+import { readMedia, photoSizeBytes, deriveFilename, sanitizeFilename, extFromMime, isOwnAccount, senderDcFor } from './telegramMedia.ts';
 
 function check(label: string, cond: boolean): void {
   if (!cond) throw new Error(`FAIL: ${label}`);
@@ -168,5 +168,29 @@ check('neither self flag nor matching id means it is a genuinely different chat'
 check('a bigint-ish id compares by decimal string, not reference',
   isOwnAccount({ id: '42' }, 42) === true);
 check('null entity is never the own account', isOwnAccount(null, 42) === false);
+
+// --- 媒體所在的 DC ------------------------------------------------------------
+// 自己上傳的檔案永遠落在帳號的 home DC，所以這個欄位一直沒人要。轉發進來的
+// 檔案保留來源的 DC，對主連線發 upload.GetFile 會換來 FILE_MIGRATE。
+check('document: dcId is carried through', readMedia({
+  ...doc, document: { ...doc.document, dcId: 1 },
+})!.dcId === 1);
+check('photo: dcId is carried through', readMedia({
+  className: 'MessageMediaPhoto',
+  photo: { id: 1, accessHash: 2, fileReference: new Uint8Array([1]), dcId: 4, sizes: [{ type: 'x', size: 10 }] },
+})!.dcId === 4);
+check('media with no dcId reports it as undefined, not 0',
+  readMedia(doc)!.dcId === undefined);
+
+// --- 該用哪一條連線發 GetFile --------------------------------------------------
+// getSender(dcId) 只要 dcId 有值就一定新建一條 exported sender，即使那就是
+// home DC —— 那條多餘的連線正是先前縮圖批次下載 reconnect 迴圈的成因
+// (813dc42)。所以同 DC 必須回 undefined，代表「用主連線」。
+check('media on the home DC uses the main sender', senderDcFor(2, 2) === undefined);
+check('media on a foreign DC names that DC', senderDcFor(1, 2) === 1);
+check('unknown media DC falls back to the main sender', senderDcFor(undefined, 2) === undefined);
+check('unknown session DC falls back to the main sender', senderDcFor(1, undefined) === undefined);
+check('a non-numeric DC falls back to the main sender', senderDcFor('x', 2) === undefined);
+check('dcId 0 is treated as unknown, not as a real DC', senderDcFor(0, 2) === undefined);
 
 console.log('\nAll telegramMedia checks passed.');

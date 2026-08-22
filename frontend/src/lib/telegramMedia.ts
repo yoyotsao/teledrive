@@ -19,6 +19,13 @@ export type MediaRef = {
   fullThumbSize: string;
   /** thumbSize for fetching a preview, or null when there is nothing usable. */
   previewThumbSize: string | null;
+  /**
+   * The data centre that actually holds the bytes, or undefined when Telegram
+   * didn't say. Files this account uploaded always sit on its own home DC, so
+   * nothing needed this until chat import: a FORWARDED file keeps the source's
+   * DC, and asking the main sender for it earns FILE_MIGRATE instead of bytes.
+   */
+  dcId?: number;
 };
 
 /**
@@ -45,6 +52,30 @@ function realSizesAscending(sizes: any[] | undefined): { type: string; bytes: nu
     .sort((a, b) => a.bytes - b.bytes);
 }
 
+/** DC ids are positive small ints; anything else means "Telegram didn't tell us". */
+function dcNumber(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * Which sender should carry this media's upload.GetFile — the DC id to borrow
+ * an exported sender for, or undefined for "use the main connection".
+ *
+ * Returning undefined for same-DC media is the point, not an optimisation:
+ * gramjs's `getSender(dcId)` builds a NEW exported sender whenever dcId is
+ * truthy, even when it names the DC we are already connected to. That
+ * redundant second connection is what made batch thumbnail downloads
+ * reconnect-loop through the ws proxy (fixed in 813dc42 by staying on the main
+ * sender), so home-DC media must keep using the main sender.
+ */
+export function senderDcFor(mediaDcId: unknown, sessionDcId: unknown): number | undefined {
+  const media = dcNumber(mediaDcId);
+  const session = dcNumber(sessionDcId);
+  if (media === undefined || session === undefined) return undefined;
+  return media === session ? undefined : media;
+}
+
 export function readMedia(media: unknown): MediaRef | null {
   const m = media as any;
   if (!m) return null;
@@ -63,6 +94,7 @@ export function readMedia(media: unknown): MediaRef | null {
       mimeType: doc.mimeType || 'application/octet-stream',
       fullThumbSize: '',
       previewThumbSize: thumbs.length ? thumbs[thumbs.length - 1].type : null,
+      dcId: dcNumber(doc.dcId),
     };
   }
 
@@ -84,6 +116,7 @@ export function readMedia(media: unknown): MediaRef | null {
       // largest size IS the file as far as the drive is concerned.
       fullThumbSize: largest.type,
       previewThumbSize: sizes[0].type,
+      dcId: dcNumber(photo.dcId),
     };
   }
 

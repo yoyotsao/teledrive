@@ -8,6 +8,7 @@ import { captureThumb, isMediaFile } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
+import { ThumbBatchQueue } from '../lib/thumbQueue';
 import { ALBUM_BATCH } from '../config';
 import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, PlannedFile, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
@@ -270,6 +271,10 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   const isDraggingRef = useRef(false); // Track external file drag for upload
   const pendingThumbsRef = useRef<Set<string>>(new Set());
   const thumbnailAbortRef = useRef<AbortController | null>(null);
+  const thumbQueueRef = useRef(new ThumbBatchQueue());
+  // The page after the last rendered one, fetched early so its thumbnails are
+  // already downloading (or cached) by the time the user scrolls into it.
+  const prefetchRef = useRef<{ page: number; promise: Promise<{ items: FileInfo[]; total: number }> } | null>(null);
 
   const PAGE_SIZE = 200;
   const currentPageRef = useRef(1);
@@ -291,16 +296,9 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   const fileCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
-  const loadThumbnails = useCallback(async (files: FileInfo[], signal?: AbortSignal) => {
-    const thumbFiles = files.filter(
-      (f) => (f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/'))
-             && f.has_thumbnail
-             && f.telegram_message_id
-             && !pendingThumbsRef.current.has(f.file_id)
-    );
-    if (thumbFiles.length === 0) return;
-    thumbFiles.forEach((f) => pendingThumbsRef.current.add(f.file_id));
-
+  // One page's worth of thumbnail work. Only ever called from the queue below —
+  // running two of these at once is what used to kill the MTProto connection.
+  const downloadThumbBatch = useCallback(async (thumbFiles: FileInfo[], signal?: AbortSignal) => {
     // 1. Check IndexedDB cache for all files in parallel (bounded) — instant hits show immediately
     const cacheCheckSemaphore = new Semaphore(6);
     const misses: FileInfo[] = [];
@@ -349,6 +347,26 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     }
   }, []);
 
+  // Queue a page's thumbnails. The queue runs one page at a time, newest page
+  // first — a fast scroll that appends many pages must not fan out its downloads
+  // across all of them at once (that dropped the connection and froze thumbs).
+  const loadThumbnails = useCallback(async (files: FileInfo[], signal?: AbortSignal) => {
+    const thumbFiles = files.filter(
+      (f) => (f.mime_type?.startsWith('image/') || f.mime_type?.startsWith('video/'))
+             && f.has_thumbnail
+             && f.telegram_message_id
+             && !pendingThumbsRef.current.has(f.file_id)
+    );
+    if (thumbFiles.length === 0) return;
+    thumbFiles.forEach((f) => pendingThumbsRef.current.add(f.file_id));
+    const outcome = await thumbQueueRef.current.enqueue(
+      () => downloadThumbBatch(thumbFiles, signal),
+      signal,
+    );
+    // Never ran (view changed while queued) — let a later visit retry these ids.
+    if (outcome !== 'done') thumbFiles.forEach((f) => pendingThumbsRef.current.delete(f.file_id));
+  }, [downloadThumbBatch]);
+
   // One page of results for the current view. Folder mode also pulls the (un-paginated)
   // folder list so subfolders always show; search/trash return files+folders in one list.
   const fetchPage = useCallback(async (page: number): Promise<{ items: FileInfo[]; total: number }> => {
@@ -371,6 +389,21 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     return { items: resp.files, total: resp.total };
   }, [view, sortBy, sortOrder, currentFolderId]);
 
+  // Fetch a page ahead of the viewport and start its thumbnails right away, so
+  // scrolling into it shows pictures instead of placeholders. loadMoreFiles then
+  // reuses this promise instead of re-fetching the same page.
+  const prefetchPage = useCallback((page: number, signal?: AbortSignal) => {
+    if (prefetchRef.current?.page === page) return;
+    const promise = fetchPage(page);
+    prefetchRef.current = { page, promise };
+    promise.then(({ items }) => {
+      if (!signal?.aborted) loadThumbnails(items, signal);
+    }).catch(() => {
+      // Let loadMoreFiles retry the fetch itself if this one failed.
+      if (prefetchRef.current?.page === page) prefetchRef.current = null;
+    });
+  }, [fetchPage, loadThumbnails]);
+
   const loadContents = useCallback(async () => {
     thumbnailAbortRef.current?.abort();
     const thumbAbort = new AbortController();
@@ -378,6 +411,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     currentPageRef.current = 1;
     hasMoreRef.current = false;
+    prefetchRef.current = null; // the old view's look-ahead page is meaningless now
     setSelectedFiles(new Set()); // view changed — drop selection of now-absent ids
     setLoading(true);
     setError(null);
@@ -394,6 +428,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       setFiles(fileEntries);
       setOriginalFiles(items);
       loadThumbnails(items, thumbAbort.signal);
+      if (hasMoreRef.current) prefetchPage(2, thumbAbort.signal);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load files');
       setFiles([]);
@@ -401,34 +436,45 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     } finally {
       setLoading(false);
     }
-  }, [fetchPage, loadThumbnails]);
+  }, [fetchPage, loadThumbnails, prefetchPage]);
 
   const loadMoreFiles = useCallback(async () => {
     if (isLoadingMoreRef.current || !hasMoreRef.current) return;
     isLoadingMoreRef.current = true;
     setIsLoadingMore(true);
     const nextPage = currentPageRef.current + 1;
+    const signal = thumbnailAbortRef.current?.signal;
+    // Already prefetched? Take that fetch (and its already-queued thumbnails).
+    const prefetched = prefetchRef.current?.page === nextPage ? prefetchRef.current : null;
+    prefetchRef.current = null;
     try {
-      const { items, total } = await fetchPage(nextPage);
+      const { items, total } = await (prefetched ? prefetched.promise : fetchPage(nextPage));
       currentPageRef.current = nextPage;
       hasMoreRef.current = nextPage * PAGE_SIZE < total;
       setOriginalFiles((prev) => [...prev, ...items]);
       setFiles((prev) => [...prev, ...items.map(toFileData)]);
-      loadThumbnails(items);
+      if (!prefetched) loadThumbnails(items, signal);
+      if (hasMoreRef.current) prefetchPage(nextPage + 1, signal);
     } catch (err) {
       console.error('Failed to load more files:', err);
     } finally {
       isLoadingMoreRef.current = false;
       setIsLoadingMore(false);
     }
-  }, [fetchPage, loadThumbnails]);
+  }, [fetchPage, loadThumbnails, prefetchPage]);
 
   useEffect(() => {
     const sentinel = sentinelRef.current;
-    if (!sentinel) return;
+    const root = scrollContainerRef.current;
+    if (!sentinel || !root) return;
     const observer = new IntersectionObserver(
-      (entries) => { if (entries[0].isIntersecting) loadMoreFiles(); },
-      { rootMargin: '300px' }
+      (entries) => { if (entries.some((e) => e.isIntersecting)) loadMoreFiles(); },
+      // `root` MUST be the scroll container. With root:null the margin expands
+      // the VIEWPORT rect but not the container's clip rect, so the prefetch
+      // margin is silently dead: measured live, the sentinel then only counted
+      // as intersecting at scrollTop === maxScroll exactly — that is why the
+      // next page (and its thumbnails) only started at the absolute bottom.
+      { root, rootMargin: '800px' }
     );
     observer.observe(sentinel);
     return () => observer.disconnect();

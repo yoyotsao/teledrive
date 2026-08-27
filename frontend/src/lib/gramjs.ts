@@ -39,39 +39,6 @@ import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
 import { readMedia, isOwnAccount, type MediaRef } from "./telegramMedia";
 
-/**
- * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
- * Browsers block ws:// (plain WebSocket) from https:// pages. Our proxy accepts
- * wss:// (valid SSL via Cloudflare) and forwards to Telegram via plain ws://.
- * Called once before TelegramClient initialization when on HTTPS.
- */
-function installTelegramWsProxy(): void {
-  if ((window as any).__telegramWsProxyInstalled) return;
-  (window as any).__telegramWsProxyInstalled = true;
-
-  const OrigWebSocket = window.WebSocket;
-
-  class TelegramProxiedWebSocket extends OrigWebSocket {
-    constructor(url: string, protocols?: string | string[]) {
-      let finalUrl = url;
-      if (url.includes('/apiws')) {
-        try {
-          const tgUrl = new URL(url);
-          const port = tgUrl.port || '80';
-          const proxyPath = `/api/v1/ws-proxy?host=${encodeURIComponent(tgUrl.hostname)}&port=${port}`;
-          finalUrl = `wss://${window.location.host}${proxyPath}`;
-        } catch {
-          // keep original url on parse failure
-        }
-      }
-      super(finalUrl, protocols);
-    }
-  }
-
-  (window as any).WebSocket = TelegramProxiedWebSocket;
-}
-
-
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
 // requests onto the flood.
@@ -358,18 +325,13 @@ export class TelegramClientManager {
   }
 
   private async doInitialize(apiId: number, apiHash: string, sessionString: string): Promise<void> {
-    // On HTTPS, browsers block plain ws:// connections (mixed content).
-    // Monkey-patch WebSocket so GramJS's Telegram connections are routed through
-    // our backend proxy (/api/v1/ws-proxy), which forwards to Telegram via plain ws://.
-    if (window.location.protocol === 'https:') {
-      installTelegramWsProxy();
-    }
-
     this.session = new StringSession(sessionString || "");
 
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: window.location.protocol === 'https:',
+      // Telegram's plain-ws endpoint (port 80) now answers 302, so wss:443 is the
+      // only working transport - regardless of whether this page is http or https.
+      useWSS: true,
       deviceModel: "TeleDrive Browser",
       appVersion: "1.0.0",
       floodSleepThreshold: 300,
@@ -904,7 +866,7 @@ export class TelegramClientManager {
 
     // Images: download all 512KB chunks in parallel (waitForComplete) instead of
     // GramJS's sequential 128KB-per-round-trip downloadMedia. Every byte is
-    // relayed through the ws-proxy, so hiding round-trips with pipelined GetFile
+    // fetched over one MTProto connection, so hiding round-trips with pipelined GetFile
     // requests is the single biggest win for multi-MB previews. Fall back to the
     // sequential path if the parallel one fails.
     if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType.startsWith('image/')) {
@@ -1288,13 +1250,12 @@ export class TelegramClientManager {
     onQRCode: (url: string, expiresAt: number) => void,
     onPasswordRequired: (hint: string) => Promise<string>,
   ): Promise<string> {
-    if (window.location.protocol === 'https:') {
-      installTelegramWsProxy();
-    }
     this.session = new StringSession('');
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: window.location.protocol === 'https:',
+      // Telegram's plain-ws endpoint (port 80) now answers 302, so wss:443 is the
+      // only working transport - regardless of whether this page is http or https.
+      useWSS: true,
       deviceModel: 'TeleDrive Browser',
       appVersion: '1.0.0',
     });
@@ -1334,13 +1295,12 @@ export class TelegramClientManager {
     onCodeRequired: () => void,
     onPasswordRequired: (hint: string) => void,
   ): { waitForLogin: Promise<string>; submitCode: (code: string) => void; submitPassword: (pwd: string) => void } {
-    if (window.location.protocol === 'https:') {
-      installTelegramWsProxy();
-    }
     this.session = new StringSession('');
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: window.location.protocol === 'https:',
+      // Telegram's plain-ws endpoint (port 80) now answers 302, so wss:443 is the
+      // only working transport - regardless of whether this page is http or https.
+      useWSS: true,
       deviceModel: 'TeleDrive Browser',
       appVersion: '1.0.0',
     });

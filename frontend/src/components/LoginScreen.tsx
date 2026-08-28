@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { TelegramClientManager } from '../lib/gramjs';
+import { qrFreshness } from '../lib/qrExpiry';
 
 type Props = {
   // The client carries the freshly-authenticated session; the caller decides
@@ -67,6 +68,11 @@ export default function LoginScreen({ onLogin }: Props) {
 
 function QRTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: string }) {
   const [qrUrl, setQrUrl] = useState<string>('');
+  // Telegram's absolute deadline for the token in `qrUrl`. GramJS re-exports on
+  // its own hardcoded 30s timer, which outlives the ~29s token, so without this
+  // the last second of every cycle shows a code the phone will reject.
+  const [expiresAt, setExpiresAt] = useState(0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [status, setStatus] = useState<string>('正在生成 QR Code...');
   const [passwordHint, setPasswordHint] = useState('');
   const [password, setPassword] = useState('');
@@ -76,6 +82,7 @@ function QRTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: st
 
   const startQR = useCallback(() => {
     setQrUrl('');
+    setExpiresAt(0);
     setStatus('正在連線...');
     setError('');
     setAwaitingPassword(false);
@@ -85,7 +92,12 @@ function QRTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: st
     client.startQRLogin(
       apiId,
       apiHash,
-      (url) => { setQrUrl(url); setStatus('請用 Telegram 手機 App 掃描'); },
+      (url, expires) => {
+        setQrUrl(url);
+        setExpiresAt(expires);
+        setNowMs(Date.now());
+        setStatus('請用 Telegram 手機 App 掃描');
+      },
       (hint) => {
         setPasswordHint(hint || '');
         setAwaitingPassword(true);
@@ -104,6 +116,17 @@ function QRTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: st
   }, [apiId, apiHash, onLogin]);
 
   useEffect(() => { startQR(); }, [startQR]);
+
+  // Only the clock moves here — the token is whatever GramJS last handed us.
+  // Ticking is confined to QRTab, whose re-renders do not touch startQR's deps,
+  // so this cannot restart the login flow.
+  useEffect(() => {
+    if (!expiresAt) return;
+    const id = setInterval(() => setNowMs(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [expiresAt]);
+
+  const fresh = qrFreshness(expiresAt, nowMs);
 
   const submitPassword = () => {
     resolvePassword?.(password);
@@ -133,12 +156,18 @@ function QRTab({ onLogin, apiId, apiHash }: Props & { apiId: number; apiHash: st
 
   return (
     <div style={{ textAlign: 'center' }}>
-      {qrUrl
+      {qrUrl && fresh.usable
         ? <QRCodeSVG value={qrUrl} size={200} style={{ margin: '0 auto 16px', display: 'block' }} />
-        : <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af' }}>
-            載入中...
+        : <div style={{
+            height: 200, marginBottom: 16, display: 'flex', alignItems: 'center',
+            justifyContent: 'center', color: '#9ca3af', fontSize: 13, textAlign: 'center',
+          }}>
+            {qrUrl ? 'QR Code 已過期，正在換發…' : '載入中...'}
           </div>}
-      <p style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>{status}</p>
+      <p style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
+        {status}
+        {fresh.usable && `（${fresh.secondsLeft} 秒後換新）`}
+      </p>
       {error && <p style={errorStyle}>{error}</p>}
       <button onClick={startQR} style={{ ...btnStyle, background: '#f3f4f6', color: '#374151', marginTop: 8 }}>
         重新生成

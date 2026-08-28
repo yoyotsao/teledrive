@@ -129,6 +129,18 @@ export const CHUNK_RATE_BURST = 2;
 /** On FLOOD_WAIT, the learned ceiling is set to at most this fraction of the rate that triggered it. */
 export const CHUNK_CEILING_BACKOFF = 0.95;
 
+/**
+ * Harder fraction used for the FIRST flood of a session, while no ceiling has
+ * been learned yet. CHUNK_CEILING_BACKOFF only makes sense as a refinement of a
+ * ceiling already near the wall; applied cold it parks the ceiling a hair below
+ * a rate just proven too fast, so several more floods are needed to find the
+ * real limit — and 3 of them inside CHUNK_FLOOD_ESCALATION_WINDOW_MS escalate,
+ * collapsing the rate to CHUNK_RATE_MIN and the ceiling to CHUNK_CEILING_FLOOR.
+ * Halving instead converges in one step, which matters because CHUNK_RATE_INIT
+ * is a blind guess on every fresh page load.
+ */
+export const CHUNK_CEILING_FIRST_BACKOFF = 0.5;
+
 /** Fraction of the ceiling above which the fast ramp gives way to the slow creep. */
 export const CHUNK_CEILING_SLOW_ZONE = 0.8;
 

@@ -1,6 +1,12 @@
 export interface CeilingOptions {
   /** On flood, ceiling ≤ backoff × the rate that triggered it. */
   backoff: number;
+  /**
+   * Fraction used instead of `backoff` for the first flood, while no ceiling has
+   * been learned. `backoff` refines a ceiling already near the wall; applied
+   * cold it needs several floods to converge, and enough of them escalate.
+   */
+  firstBackoff: number;
   /** Fraction of ceiling where the fast ramp gives way to the slow creep. */
   slowZone: number;
   /** Ceiling is never learned below this (parts/s). */
@@ -156,16 +162,32 @@ export class AdaptiveRateLimiter {
     }
   }
 
-  /** Resolves once the caller's reserved virtual-time slot has arrived. */
+  /**
+   * Resolves once the caller's reserved virtual-time slot has arrived AND no
+   * penalty window is open.
+   *
+   * The re-check after sleeping is what makes a FLOOD_WAIT penalty binding on
+   * parts that were ALREADY asleep on a slot reserved before the flood landed.
+   * reportFlood/pause can only push `nextSlotAt` forward; they cannot reschedule
+   * a pending setTimeout. Without the loop, up to MAX_CONCURRENT_CHUNKS parts
+   * wake on their stale deadlines and fire straight into a punished account —
+   * each one harvesting the same window's remaining seconds (observed as a
+   * 12→10→8→6→5→3 countdown) and extending it via pauseUntil. Re-reserving on
+   * each pass also keeps those parts 1/rate apart afterwards, instead of
+   * releasing them as one herd at the instant the window closes.
+   */
   async wait(): Promise<void> {
-    const interval = 1000 / this.rate;
-    const now = Date.now();
-    const earliest = Math.max(now, this.penaltyUntil);
-    const scheduled = Math.max(this.nextSlotAt, earliest - this.opts.burst * interval);
-    this.nextSlotAt = scheduled + interval;
-    const delay = scheduled - now;
-    if (delay > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delay));
+    for (;;) {
+      const interval = 1000 / this.rate;
+      const now = Date.now();
+      const earliest = Math.max(now, this.penaltyUntil);
+      const scheduled = Math.max(this.nextSlotAt, earliest - this.opts.burst * interval);
+      this.nextSlotAt = scheduled + interval;
+      const delay = scheduled - now;
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      if (Date.now() >= this.penaltyUntil) return;
     }
   }
 
@@ -212,11 +234,15 @@ export class AdaptiveRateLimiter {
         if (escalate) this.escalatedUntil = now + ceilOpts.escalationResetMs;
 
         const clampCeiling = (c: number) => Math.min(this.opts.maxRate, Math.max(ceilOpts.floor, c));
-        const cand = prevRate * ceilOpts.backoff;
         // ceiling is never raised by a flood: below it → pull to midpoint (fast
         // convergence when the account limit drops); at it → drift down `backoff`
-        // each time; above it (a probe) → leave essentially intact.
-        let nextCeiling = this.ceiling === null ? cand : Math.min(cand, (this.ceiling + prevRate) / 2);
+        // each time; above it (a probe) → leave essentially intact. With nothing
+        // learned yet the flooding rate is the only datum, so cut it hard in one
+        // step rather than shaving `backoff` off a rate already proven too fast.
+        let nextCeiling =
+          this.ceiling === null
+            ? prevRate * ceilOpts.firstBackoff
+            : Math.min(prevRate * ceilOpts.backoff, (this.ceiling + prevRate) / 2);
         if (escalate) nextCeiling *= ceilOpts.escalatedCeilingFactor;
         this.ceiling = clampCeiling(nextCeiling);
 

@@ -10,7 +10,7 @@ import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { ThumbBatchQueue } from '../lib/thumbQueue';
 import { ALBUM_BATCH } from '../config';
-import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, PlannedFile, RegisterableExistingPart } from '../lib/uploadPlanner';
+import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, assertPartsCoverFile, PlannedFile, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { ContextMenu, MenuItem } from './ContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -726,13 +726,17 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       fileHash = await sha256File(file).catch(() => null);
       if (fileHash) {
         const hashCheck = await api.checkFileHash(fileHash).catch(() => ({ found: false, files: [] as FileInfo[] }));
-        if (hashCheck.found && hashCheck.files.length > 0) {
+        // Collapse to the canonical part set — /check-hash returns every row
+        // sharing the hash (including prior dedup rows), and registering one
+        // new row per returned row doubles the count on each re-upload. An
+        // empty result means nothing stored covers the whole file; the upload
+        // below then runs for real instead of cloning a truncated record.
+        const asExisting = hashCheck.found
+          ? canonicalExistingParts(hashCheck.files, file.size)
+          : [];
+        if (asExisting.length > 0) {
           console.log('[Upload] Duplicate detected by hash, skipping Telegram upload for:', file.name);
           onProgress?.(100);
-          // Collapse to the canonical part set — /check-hash returns every row
-          // sharing the hash (including prior dedup rows), and registering one
-          // new row per returned row doubles the count on each re-upload.
-          const asExisting = canonicalExistingParts(hashCheck.files);
           await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
           console.log('[Upload] Dedup: registered', asExisting.length, 'parts from existing upload');
           return {
@@ -774,6 +778,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean; account_id: number }>,
     parentId: string | null,
   ): Promise<void> => {
+    assertPartsCoverFile(file, parts);
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     await Promise.all(parts.map((part, i) =>
       api.registerFile({
@@ -833,19 +838,11 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     const registerSemaphore = new Semaphore(8);
     const duplicatePromises = plan.duplicates.map((dup) =>
       registerSemaphore.withSlot(() =>
-        registerDuplicateParts(
-          dup.file,
-          dup.hash,
-          dup.existing.map((f) => ({
-            filesize: f.filesize,
-            mime_type: f.mime_type,
-            telegram_message_id: f.telegram_message_id!,
-            access_hash: f.access_hash,
-            part_index: f.part_index,
-            has_thumbnail: f.has_thumbnail,
-          })),
-          currentFolderId,
-        )
+        // dup.parts, never dup.existing: /check-hash returns every row sharing
+        // the hash, so registering them one-for-one multiplies the record count
+        // on each re-upload. planUploads has already collapsed them to one part
+        // per index and proven they cover the file.
+        registerDuplicateParts(dup.file, dup.hash, dup.parts, currentFolderId)
       ).then(() => {
         setRowStatus(dup.file, { progress: 100, status: 'complete' });
       }).catch((err: any) => {
@@ -1085,6 +1082,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>,
       hasThumbnail: boolean,
     ): Promise<void> => {
+      assertPartsCoverFile(file, parts);
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       await Promise.all(parts.map((part, j) =>
         registerFileBounded({
@@ -1168,16 +1166,23 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
               const fileHash = await hashFileBounded(file);
               if (fileHash) {
                 const hashCheck = await checkFileHashBounded(fileHash);
-                if (hashCheck.found && hashCheck.files.length > 0) {
+                // Collapse to canonical parts — see the drag/picker dedup path.
+                // Empty means no stored copy covers the whole file, so this
+                // falls through and uploads for real.
+                const asExisting = hashCheck.found
+                  ? canonicalExistingParts(hashCheck.files, file.size)
+                  : [];
+                if (asExisting.length > 0) {
                   console.log('[Upload] Duplicate detected by hash (folder upload):', file.name);
                   const folderId = await ensureFolder(folderPath);
-                  // Collapse to canonical parts — see the drag/picker dedup path.
-                  const asExisting = canonicalExistingParts(hashCheck.files);
                   await registerDuplicateParts(file, fileHash, asExisting, folderId);
                   completed++;
                   updateVisible(file.name, { progress: 100, status: 'complete' });
                   updateUI();
                   return;
+                }
+                if (hashCheck.files.length > 0) {
+                  console.warn('[Upload] Hash matched but stored copy is incomplete, re-uploading:', file.name);
                 }
               }
               // Claim this hash for the batch, or fall in behind whoever claimed it

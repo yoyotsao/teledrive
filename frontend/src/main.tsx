@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import { getPrimaryClient, getClientFor, getAllClients } from './lib/gramjs';
+import { StreamGate } from './lib/streamGate';
 
 // Global state for keepalive mechanism
 let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
@@ -12,9 +13,9 @@ const KEEPALIVE_INTERVAL_MS = 15000; // 15 seconds
 const CONNECTION_CHECK_INTERVAL_MS = 20000;
 let lastVerifiedAliveAt = 0;
 let isStreamingActive = false;
-// Set to true when the user closes the video; reset when a new video opens.
-// Preload chunk requests that arrive after close are rejected immediately.
-let streamingStopped = false;
+// Shut when the user closes the video, reopened when a preview opens, so
+// that preload chunk requests arriving after a close are rejected immediately.
+const streamGate = new StreamGate();
 
 /** Client for the account that stores a message. 0 (or unknown) = the primary. */
 function clientForAccount(accountId?: number) {
@@ -71,7 +72,7 @@ async function ensureTelegramConnected(): Promise<boolean> {
  */
 function stopKeepalive() {
   isStreamingActive = false;
-  streamingStopped = true;
+  streamGate.closed();
   if (keepaliveInterval) {
     clearInterval(keepaliveInterval);
     keepaliveInterval = null;
@@ -83,6 +84,14 @@ window.addEventListener('teledrive:stop-streaming', () => {
   stopKeepalive();
 });
 
+// ...and this when one opens. Without it the gate stays shut after the first
+// close: handleGetFileChunk consults the gate BEFORE it reaches startKeepalive(),
+// so nothing on the serving path can ever reopen it — every later video would
+// answer 503 until the page was reloaded.
+window.addEventListener('teledrive:start-streaming', () => {
+  streamGate.opened();
+});
+
 function startKeepalive() {
   if (keepaliveInterval) {
     console.log('[App] keepalive already running, skipping start');
@@ -90,7 +99,6 @@ function startKeepalive() {
   }
 
   console.log('[App] === STARTING KEEPALIVE INTERVAL ===');
-  streamingStopped = false; // new video opened — allow chunk requests again
   isStreamingActive = true;
   
   keepaliveInterval = setInterval(async () => {
@@ -243,7 +251,7 @@ async function handleGetFileChunk(event: MessageEvent) {
   
   try {
     // Reject preload requests that arrive after the user closed the video
-    if (streamingStopped) {
+    if (!streamGate.accepts()) {
       port?.postMessage({ requestId, error: 'Streaming stopped' });
       return;
     }

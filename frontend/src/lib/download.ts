@@ -15,6 +15,22 @@ export function clientForFile(file: Pick<FileInfo, 'telegram_user_id'>): Telegra
   return file.telegram_user_id ? getClientFor(file.telegram_user_id) : getPrimaryClient();
 }
 
+/**
+ * Fail rather than hand back a blob that is not the whole file.
+ *
+ * The download path already refuses to assemble an incomplete set of chunks
+ * against the size Telegram declares for the document. This second check is
+ * against the size WE recorded at upload time, so a file whose Telegram
+ * document is itself short — a truncated upload — is caught here instead of
+ * being saved to disk as a plausible-looking file.
+ */
+function assertWholeFile(blob: Blob, expected: number, what: string): Blob {
+  if (expected > 0 && blob.size !== expected) {
+    throw new Error(`Incomplete download for ${what}: got ${blob.size} of ${expected} bytes`);
+  }
+  return blob;
+}
+
 // Fetch a file's full bytes from Telegram (handles split files).
 export async function fetchFileBlob(file: FileInfo): Promise<Blob> {
   const mimeType = file.mime_type || 'application/octet-stream';
@@ -22,7 +38,8 @@ export async function fetchFileBlob(file: FileInfo): Promise<Blob> {
     return downloadSplitMerged(file.split_group_id, mimeType);
   }
   if (!file.telegram_message_id) throw new Error('No telegram_message_id for file');
-  return clientForFile(file).downloadFile(file.telegram_message_id, mimeType);
+  const blob = await clientForFile(file).downloadFile(file.telegram_message_id, mimeType);
+  return assertWholeFile(blob, file.filesize, file.filename);
 }
 
 /**
@@ -64,11 +81,14 @@ export async function downloadSplitMerged(splitGroupId: string, mimeType: string
       // Each part carries its own storage account.
       const blob = await clientForFile(part).downloadFile(messageId, mimeType);
       console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
-      return blob;
+      // A short part would merge into a corrupt file that still opens.
+      return assertWholeFile(blob, part.filesize, `part ${i} of ${splitGroupId}`);
     }))
   );
 
-  return new Blob(blobs, { type: mimeType });
+  const merged = new Blob(blobs, { type: mimeType });
+  const expected = uniqueParts.reduce((n, p) => n + (p.filesize || 0), 0);
+  return assertWholeFile(merged, expected, `split group ${splitGroupId}`);
 }
 
 // Download a file's bytes from Telegram and trigger a browser save.
@@ -85,5 +105,9 @@ export function saveBlob(blob: Blob, filename: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // a.click() only STARTS the download; the browser reads the blob URL after
+  // this task ends. Revoking it synchronously races that read, and the bigger
+  // the file the more likely the race is lost — the download then fails or
+  // lands truncated. Let the current task finish first.
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }

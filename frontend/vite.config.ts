@@ -22,11 +22,6 @@ export default defineConfig(({ mode }) => {
       port: 3000,
       allowedHosts: true,
       proxy: {
-        '/api/v1/ws-proxy': {
-          target: process.env.BACKEND_URL || env.BACKEND_URL || 'http://127.0.0.1:8000',
-          changeOrigin: true,
-          ws: true,
-        },
         '/api/v1': {
           target: process.env.BACKEND_URL || env.BACKEND_URL || 'http://127.0.0.1:8000',
           changeOrigin: true,

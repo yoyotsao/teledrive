@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, WebSocket, WebSocketDisconnect, Depends
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
@@ -214,10 +214,21 @@ async def register_file(
     # Trust boundary: the client names the storage account, so verify it is actually
     # linked to this drive — otherwise a caller could attribute files to a stranger.
     storage_account = request.telegram_user_id or current_user
+    db = await get_database()
     if storage_account != current_user:
-        db = await get_database()
         if not await db.get_linked_account(current_user, storage_account):
             raise HTTPException(status_code=403, detail="Account not linked to this drive")
+
+    # Same trust boundary: file_id is a global primary key and insert_file is
+    # INSERT OR REPLACE, so registering a file_id that already belongs to a
+    # DIFFERENT drive would silently overwrite that drive's row — owner_id
+    # included, i.e. steal it. Before chat import, file_id was always a
+    # document id minted by the caller's own upload, so this collision was
+    # essentially impossible; importing a public channel two drives both have
+    # access to makes it near-certain.
+    existing = await db.get_file(request.file_id)
+    if existing and existing["owner_id"] != current_user:
+        raise HTTPException(status_code=409, detail="File already registered to a different drive")
 
     try:
         file_service = get_file_service()
@@ -505,56 +516,6 @@ async def delete_folder(folder_id: str, current_user: int = Depends(get_current_
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.websocket("/ws-proxy")
-async def websocket_proxy(websocket: WebSocket, host: str, port: int = 80):
-    """
-    Proxy WebSocket connections to Telegram servers.
-    Required when the app is served over HTTPS — browsers block ws:// from https:// pages.
-    The browser connects here via wss:// (valid SSL via Cloudflare), we forward to Telegram
-    via plain ws://.
-    """
-    import websockets as ws_lib
-
-    # Echo back any requested subprotocol — required by WebSocket spec.
-    # GramJS sends a non-empty Sec-WebSocket-Protocol; without echoing it the browser drops the connection.
-    subprotocol_header = websocket.headers.get("sec-websocket-protocol")
-    chosen_subprotocol = subprotocol_header.split(",")[0].strip() if subprotocol_header else None
-    await websocket.accept(subprotocol=chosen_subprotocol)
-
-    telegram_url = f"ws://{host}:{port}/apiws"
-    logger.info(f"WS proxy: {websocket.client} → {telegram_url} (subprotocol={chosen_subprotocol})")
-
-    tg_subprotocols = [chosen_subprotocol] if chosen_subprotocol else None
-    try:
-        async with ws_lib.connect(telegram_url, max_size=2**24, subprotocols=tg_subprotocols) as tg:
-            async def browser_to_telegram():
-                try:
-                    while True:
-                        data = await websocket.receive_bytes()
-                        await tg.send(data)
-                except (WebSocketDisconnect, Exception):
-                    pass
-
-            async def telegram_to_browser():
-                try:
-                    async for message in tg:
-                        if isinstance(message, bytes):
-                            await websocket.send_bytes(message)
-                        else:
-                            await websocket.send_text(message)
-                except Exception:
-                    pass
-
-            await asyncio.gather(browser_to_telegram(), telegram_to_browser())
-    except Exception as e:
-        logger.warning(f"WS proxy closed: {e}")
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
 
 
 @router.get("/files/by-split-group/{split_group_id}", response_model=FileListResponse)

@@ -35,43 +35,13 @@ import {
   CHUNK_ESCALATION_RESET_MS,
   CHUNK_SIZE as PART_SIZE,
 } from "../config";
+import { ChunkAssembly } from './chunkAssembly';
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
+import { readMedia, isOwnAccount, senderDcFor, type MediaRef } from "./telegramMedia";
+import { unwrapForwardedMessage } from "./forwardResult";
 import { installPremiumFloodTag, isPremiumFlood } from "./gramjsFloodPatch";
-
-/**
- * Redirect GramJS's Telegram WebSocket connections through the backend proxy.
- * Browsers block ws:// (plain WebSocket) from https:// pages. Our proxy accepts
- * wss:// (valid SSL via Cloudflare) and forwards to Telegram via plain ws://.
- * Called once before TelegramClient initialization when on HTTPS.
- */
-function installTelegramWsProxy(): void {
-  if ((window as any).__telegramWsProxyInstalled) return;
-  (window as any).__telegramWsProxyInstalled = true;
-
-  const OrigWebSocket = window.WebSocket;
-
-  class TelegramProxiedWebSocket extends OrigWebSocket {
-    constructor(url: string, protocols?: string | string[]) {
-      let finalUrl = url;
-      if (url.includes('/apiws')) {
-        try {
-          const tgUrl = new URL(url);
-          const port = tgUrl.port || '80';
-          const proxyPath = `/api/v1/ws-proxy?host=${encodeURIComponent(tgUrl.hostname)}&port=${port}`;
-          finalUrl = `wss://${window.location.host}${proxyPath}`;
-        } catch {
-          // keep original url on parse failure
-        }
-      }
-      super(finalUrl, protocols);
-    }
-  }
-
-  (window as any).WebSocket = TelegramProxiedWebSocket;
-}
-
 
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
@@ -200,6 +170,28 @@ function generateRandomBigInt(): ReturnType<typeof bigInt> {
 }
 
 /**
+ * Build the right file location for a media ref. Photos need
+ * InputPhotoFileLocation with a size type — an InputDocumentFileLocation with
+ * a photo id downloads nothing useful, which is the bug this replaces.
+ */
+function fileLocationFor(ref: MediaRef, thumbSize: string): Api.TypeInputFileLocation {
+  if (ref.kind === 'photo') {
+    return new Api.InputPhotoFileLocation({
+      id: ref.rawId as any,
+      accessHash: ref.accessHash as any,
+      fileReference: ref.fileReference,
+      thumbSize,
+    });
+  }
+  return new Api.InputDocumentFileLocation({
+    id: ref.rawId as any,
+    accessHash: ref.accessHash as any,
+    fileReference: ref.fileReference,
+    thumbSize,
+  });
+}
+
+/**
  * GramJS client wrapper for browser-based Telegram operations.
  * Manages direct MTProto connections to Telegram for file upload/download.
  */
@@ -243,6 +235,29 @@ export class TelegramClientManager {
     const waitMs = (typeof seconds === 'number' && seconds > 0 ? seconds : FLOOD_PENALTY_MS / 1000) * 1000;
     console.warn(`[GramJS:${this.accountId}] ${label} hit FLOOD_WAIT — pausing message sends for ${waitMs}ms`);
     this.messageRateLimiter.penalize(waitMs);
+  }
+
+  /**
+   * Run one upload.GetFile on whichever connection can actually serve it.
+   *
+   * Media this account uploaded lives on its home DC, so the main sender
+   * answers and we stay on it — deliberately, because gramjs's getSender()
+   * opens a fresh exported sender for ANY dcId it is handed, and that
+   * redundant same-DC connection is what made batch thumbnail downloads
+   * reconnect-loop through the ws proxy (813dc42).
+   *
+   * A forwarded file (chat import) keeps the SOURCE chat's DC, and the main
+   * sender answers those with FILE_MIGRATE_x instead of bytes. gramjs's own
+   * download path has always read the dcId off the media for exactly this
+   * reason (client/downloads.js: iterDownload → getSender(info.dcId)); our
+   * wrapper just never carried the field through. senderDcFor() decides.
+   */
+  private async getFileFrom(request: InstanceType<typeof Api.upload.GetFile>, ref: MediaRef): Promise<any> {
+    const client = this.client!;
+    const dcId = senderDcFor(ref.dcId, (client.session as any)?.dcId);
+    if (dcId === undefined) return await client.invoke(request);
+    const sender = await (client as any).getSender(dcId);
+    return await sender.send(request);
   }
 
   /**
@@ -296,7 +311,7 @@ export class TelegramClientManager {
   private initPromise: Promise<void> | null = null;
   // Caches the resolved document location per message so SW chunk streaming doesn't
   // pay a getMessages round trip on every single chunk request.
-  private fileLocationCache = new Map<number, { docId: bigint; accessHash: bigint; fileReference?: Uint8Array }>();
+  private fileLocationCache = new Map<number, MediaRef>();
 
   /**
    * Resolve (and cache) the document location for a message. Pass forceRefresh=true
@@ -306,7 +321,7 @@ export class TelegramClientManager {
     messageId: number,
     forceRefresh = false,
     expectedFileId?: string,
-  ): Promise<{ docId: bigint; accessHash: bigint; fileReference?: Uint8Array }> {
+  ): Promise<MediaRef> {
     if (!forceRefresh) {
       const cached = this.fileLocationCache.get(messageId);
       if (cached) return cached;
@@ -314,22 +329,18 @@ export class TelegramClientManager {
     const messages = await this.client!.getMessages("me", { ids: [messageId] });
     const message = messages[0] as Api.Message;
     if (!message?.media) throw new Error("Message has no media");
-    const media = message.media as any;
-    if (media.className !== 'MessageMediaDocument') {
-      throw new Error('Unsupported media type: ' + media?.className);
-    }
-    const doc = media.document;
-    if (expectedFileId && String(doc.id) !== expectedFileId) {
+    const ref = readMedia(message.media);
+    if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
+    if (expectedFileId && ref.id !== expectedFileId) {
       // Message ids are only unique within one account. If we ever ask the
       // wrong client, this is what turns "silently downloaded someone else's
       // file" into a loud failure.
       throw new Error(
-        `Message ${messageId} on account ${this.accountId} holds document ${doc.id}, expected ${expectedFileId}`
+        `Message ${messageId} on account ${this.accountId} holds document ${ref.id}, expected ${expectedFileId}`
       );
     }
-    const location = { docId: doc.id as bigint, accessHash: doc.accessHash as bigint, fileReference: doc.fileReference as Uint8Array | undefined };
-    this.fileLocationCache.set(messageId, location);
-    return location;
+    this.fileLocationCache.set(messageId, ref);
+    return ref;
   }
 
   /**
@@ -352,13 +363,6 @@ export class TelegramClientManager {
   }
 
   private async doInitialize(apiId: number, apiHash: string, sessionString: string): Promise<void> {
-    // On HTTPS, browsers block plain ws:// connections (mixed content).
-    // Monkey-patch WebSocket so GramJS's Telegram connections are routed through
-    // our backend proxy (/api/v1/ws-proxy), which forwards to Telegram via plain ws://.
-    if (window.location.protocol === 'https:') {
-      installTelegramWsProxy();
-    }
-
     // Must run before any RPC error can be constructed, or a tier-cap flood
     // gets answered with a rate cut the pacer then persists.
     installPremiumFloodTag();
@@ -367,7 +371,9 @@ export class TelegramClientManager {
 
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: window.location.protocol === 'https:',
+      // Telegram's plain-ws endpoint (port 80) now answers 302, so wss:443 is the
+      // only working transport - regardless of whether this page is http or https.
+      useWSS: true,
       deviceModel: "TeleDrive Browser",
       appVersion: "1.0.0",
       floodSleepThreshold: 300,
@@ -785,7 +791,6 @@ export class TelegramClientManager {
     if (messageIds.length === 0) return result;
 
     const messages = await this.client.getMessages("me", { ids: messageIds });
-    const client = this.client;
     const downloadSemaphore = new Semaphore(6);
 
     await Promise.all(
@@ -793,35 +798,25 @@ export class TelegramClientManager {
         downloadSemaphore.withSlot(async () => {
           const msg = message as Api.Message | undefined;
           if (!msg || !msg.media) return;
-          const media = msg.media as any;
-          const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
-          if (!doc?.thumbs?.length) return; // no embedded thumb — nothing to show
-          // Pick the largest real PhotoSize (has a `type`; excludes inline
-          // stripped/cached sizes whose raw bytes aren't a standalone JPEG).
-          const sized = (doc.thumbs as any[]).filter((t) => typeof t.type === 'string' && !t.bytes);
-          const thumb = sized[sized.length - 1];
-          if (!thumb) return;
+          const ref = readMedia(msg.media);
+          if (!ref?.previewThumbSize) return; // no usable preview — nothing to show
           try {
             // Fetch the thumb via GetFile on the MAIN connection with cdnSupported
             // OFF, instead of downloadMedia — downloadMedia borrows an exported
             // sender to the file's media DC, and that extra ws-proxied connection
             // reconnect-loops ("Connection closed while receiving data"). Keeping
             // thumbnails on the main sender (like the parallel preview path) avoids it.
-            const location = new Api.InputDocumentFileLocation({
-              id: doc.id,
-              accessHash: doc.accessHash,
-              fileReference: doc.fileReference,
-              thumbSize: thumb.type,
-            });
-            const fileResult = await client.invoke(
+            const location = fileLocationFor(ref, ref.previewThumbSize);
+            const fileResult = await this.getFileFrom(
               new Api.upload.GetFile({
                 location,
                 offset: BigInt(0) as any,
                 limit: 512 * 1024, // aligned; thumbs are far smaller, EOF truncates
                 precise: false,
                 cdnSupported: false,
-              })
-            ) as any;
+              }),
+              ref,
+            );
             if (fileResult?.bytes?.length) {
               result.set(msg.id, new Blob([new Uint8Array(fileResult.bytes)], { type: 'image/jpeg' }));
             }
@@ -856,31 +851,10 @@ export class TelegramClientManager {
       throw new Error("No media found for message: " + messageId);
     }
 
-    const media = message.media as any;
-    let size = 0;
-    let mimeType = 'application/octet-stream';
-
-    if (media?.className === 'MessageMediaDocument') {
-      const doc = media.document;
-      if (!doc) {
-        throw new Error("No document in media");
-      }
-      size = Number(doc.size || 0);
-      mimeType = doc.mimeType || 'application/octet-stream';
-    } else if (media?.className === 'MessageMediaPhoto') {
-      const photo = media.photo;
-      if (!photo) {
-        throw new Error("No photo in media");
-      }
-      size = Number(photo.size || 0);
-      mimeType = 'image/jpeg';
-    } else {
-      throw new Error("Unsupported media type: " + media?.className);
-    }
-
-    console.log('[FileMetadata] Got metadata - size:', size, 'mimeType:', mimeType);
-    
-    return { size, mimeType };
+    const ref = readMedia(message.media);
+    if (!ref) throw new Error("Unsupported media type: " + (message.media as any)?.className);
+    console.log('[FileMetadata] Got metadata - size:', ref.size, 'mimeType:', ref.mimeType);
+    return { size: ref.size, mimeType: ref.mimeType };
   }
 
   /**
@@ -932,99 +906,70 @@ export class TelegramClientManager {
       return new Blob([buffer], { type: mimeType });
     }
 
-    // Images: download all 512KB chunks in parallel (waitForComplete) instead of
-    // GramJS's sequential 128KB-per-round-trip downloadMedia. Every byte is
-    // relayed through the ws-proxy, so hiding round-trips with pipelined GetFile
-    // requests is the single biggest win for multi-MB previews. Fall back to the
-    // sequential path if the parallel one fails (e.g. a genuine MessageMediaPhoto,
-    // which the chunked path doesn't build a location for).
-    if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType.startsWith('image/')) {
-      console.log('[Download] Image file, using parallel chunked download...');
-      try {
-        return await this.downloadFileChunked(message, mimeType, true);
-      } catch (err: any) {
-        console.warn('[Download] Parallel image download failed, falling back to downloadMedia:', err?.message);
-        const buffer = await this.client.downloadMedia(message.media);
-        if (!buffer || buffer.length === 0) {
-          throw new Error("Failed to download file - empty buffer");
-        }
-        return new Blob([buffer], { type: mimeType });
-      }
-    }
-
-    // Try chunked download first (better for large files)
+    // Each GetFile is a round trip to the media DC, so pipelining 512KB
+    // requests beats GramJS's sequential 128KB-per-round-trip downloadMedia by
+    // a wide margin. Fall back to the sequential path only if the parallel one
+    // fails outright.
     try {
-      console.log('[Download] Trying chunked GetFile download...');
-      const result = await this.downloadFileChunked(message, mimeType);
-      return result;
+      console.log('[Download] Using parallel chunked download...');
+      return await this.downloadFileChunked(message, mimeType);
     } catch (err: any) {
       console.error('[Download] Chunked download failed, trying downloadMedia:', err.message);
-      // Fallback to downloadMedia for small files
-      console.log('[Download] Starting downloadMedia fallback...');
       const buffer = await this.client.downloadMedia(message.media);
       if (!buffer || buffer.length === 0) {
         throw new Error("Failed to download file - empty buffer");
+      }
+      if (buffer.length !== fileSize && fileSize > 0) {
+        throw new Error(`Truncated download: got ${buffer.length} of ${fileSize} bytes`);
       }
       return new Blob([buffer], { type: mimeType });
     }
   }
 
   /**
-   * Download file using streaming - returns blob immediately for playback while downloading continues.
+   * Download a message's document in full, 512KB chunks in parallel.
+   *
+   * Resolves only when every chunk is in hand and the bytes add up to the size
+   * Telegram declared. It used to double as a streaming primitive that could
+   * resolve early with a ~10MB prefix, which is how full downloads ended up
+   * saved to disk truncated at ~10MB while the console kept logging chunks
+   * nobody read. Video playback does not come through here at all — it streams
+   * via the Service Worker and downloadFileChunkedByOffset() — so there is no
+   * caller that wants a partial blob, and no flag left to forget to pass.
    */
-  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream', waitForComplete: boolean = false): Promise<Blob> {
-    console.log('[Streaming] Starting streaming download...');
-    
+  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream'): Promise<Blob> {
     // Extract file location from message media
-    let fileSize: number = 0;
-    let docId: bigint = BigInt(0);
-    let accessHash: bigint = BigInt(0);
-    let fileReference: Uint8Array | undefined;
-    
-    const media = message.media as any;
-    
-    if (media?.className === 'MessageMediaDocument') {
-      const doc = media.document;
-      if (!doc) throw new Error('No document in media');
-      docId = doc.id;
-      accessHash = doc.accessHash;
-      fileReference = doc.fileReference;
-      fileSize = Number(doc.size);
-      console.log('[Streaming] Document size:', fileSize);
-    } else if (media?.className === 'MessageMediaPhoto') {
-      const photo = media.photo;
-      if (!photo) throw new Error('No photo in media');
-      docId = photo.id;
-      accessHash = photo.accessHash;
-      fileReference = photo.fileReference;
-      fileSize = Number(photo.size);
-      console.log('[Streaming] Photo size:', fileSize);
-    } else {
-      throw new Error('Unsupported media type: ' + media?.className);
-    }
+    const ref = readMedia(message.media);
+    if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
+    const fileSize = ref.size;
 
     const CHUNK_SIZE = 512 * 1024;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-    console.log('[Streaming] Total size:', fileSize, 'chunks:', totalChunks);
+    console.log('[Download] Total size:', fileSize, 'chunks:', totalChunks);
 
-    // Chunks land in fixed slots (parallel downloads can finish out of order);
-    // `readyPrefix` tracks how many LEADING slots are contiguously filled, since only a
-    // contiguous prefix from byte 0 is a valid playable blob.
-    const chunkSlots: (Uint8Array | undefined)[] = new Array(totalChunks);
-    let readyPrefix = 0;
-    let isDownloadComplete = false;
-    let downloadError: Error | null = null;
-    let onProgress: (() => void) | null = null;
-
-    const location = new Api.InputDocumentFileLocation({
-      id: docId as any,
-      accessHash: accessHash as any,
-      fileReference: fileReference,
-      thumbSize: "",
-    });
-
+    const assembly = new ChunkAssembly(totalChunks, fileSize);
+    const location = fileLocationFor(ref, ref.fullThumbSize);
     const chunkSemaphore = new Semaphore(6);
-    const client = this.client;
+
+    // A chunk request that never answers would otherwise hang the download
+    // forever. Judge that by lack of progress, not by total elapsed time: a
+    // multi-GB file legitimately takes far longer than any fixed deadline.
+    const STALL_TIMEOUT_MS = 120000;
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    let armStall = () => {};
+    const stalled = new Promise<never>((_, reject) => {
+      armStall = () => {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(
+          () => reject(new Error(
+            `Download stalled: no chunk completed in ${STALL_TIMEOUT_MS / 1000}s ` +
+            `(${assembly.receivedBytes}/${fileSize} bytes)`
+          )),
+          STALL_TIMEOUT_MS,
+        );
+      };
+      armStall();
+    });
 
     const downloadChunk = async (chunkIndex: number) => {
       const offset = chunkIndex * CHUNK_SIZE;
@@ -1033,86 +978,42 @@ export class TelegramClientManager {
       // (that produced 400 LIMIT_INVALID). Always request a full aligned 512KB —
       // Telegram returns only the bytes that exist up to EOF.
       const limit = CHUNK_SIZE;
-      const fileResult = await client!.invoke(
+      const fileResult = await this.getFileFrom(
         new Api.upload.GetFile({
           location,
           offset: BigInt(offset) as any,
           limit,
           precise: false,
           cdnSupported: true,
-        })
-      ) as any;
+        }),
+        ref,
+      );
 
-      if (fileResult?.bytes) {
-        chunkSlots[chunkIndex] = new Uint8Array(fileResult.bytes);
-        while (chunkSlots[readyPrefix] !== undefined) readyPrefix++;
-        console.log(`[Streaming] Chunk ${chunkIndex + 1}/${totalChunks} ready (contiguous: ${readyPrefix}/${totalChunks})`);
-      }
-      onProgress?.();
+      if (!fileResult?.bytes) throw new Error(`Chunk ${chunkIndex} returned no bytes`);
+      assembly.put(chunkIndex, new Uint8Array(fileResult.bytes));
+      armStall();
+      console.log(`[Download] Chunk ${chunkIndex + 1}/${totalChunks} ready (${assembly.receivedBytes}/${fileSize} bytes)`);
     };
 
-    // Start downloading in background immediately, 4 chunks in flight at a time
-    const downloadInBackground = async () => {
-      try {
-        await Promise.all(
+    try {
+      // allSettled, not all: a rejection from one chunk must not leave the
+      // other in-flight chunks' rejections unhandled.
+      const results = await Promise.race([
+        Promise.allSettled(
           Array.from({ length: totalChunks }, (_, i) => chunkSemaphore.withSlot(() => downloadChunk(i)))
-        );
-        isDownloadComplete = true;
-        console.log('[Streaming] All chunks downloaded!');
-      } catch (err: any) {
-        console.error('[Streaming] GetFile error:', err.message);
-        downloadError = err;
-        isDownloadComplete = true;
-      }
-      onProgress?.();
-    };
-    downloadInBackground();
+        ),
+        stalled,
+      ]);
+      const failed = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+      if (failed) throw new Error(`Chunk download failed: ${failed.reason?.message || failed.reason}`);
 
-    const buildBlob = () => new Blob(chunkSlots.slice(0, readyPrefix) as BlobPart[], { type: mimeType });
-
-    // Wait for enough contiguous bytes (10MB) for playback to start reliably (video needs keyframes),
-    // or full completion, or a 60s safety timeout — whichever comes first. Event-driven, no polling.
-    const MIN_READY_BYTES = 10 * 1024 * 1024;
-    return new Promise<Blob>((resolve, reject) => {
-      let settled = false;
-      const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        // waitForComplete callers (image previews / full downloads) need the
-        // ENTIRE file — returning a partial prefix would be a truncated image,
-        // so surface a timeout error instead and let the caller fall back.
-        if (waitForComplete && !isDownloadComplete) {
-          reject(new Error('Download timeout before completion'));
-          return;
-        }
-        console.log('[Streaming] Timeout, returning blob with size:', readyPrefix * CHUNK_SIZE);
-        resolve(buildBlob());
-      }, waitForComplete ? 180000 : 60000);
-
-      const check = () => {
-        if (settled) return;
-        // For full downloads any chunk error is fatal (the blob would have a
-        // hole); for streaming we only bail when nothing at all arrived.
-        if (downloadError && (waitForComplete || readyPrefix === 0)) {
-          settled = true;
-          clearTimeout(timeoutId);
-          reject(downloadError);
-          return;
-        }
-        const readyBytes = Math.min(readyPrefix * CHUNK_SIZE, fileSize);
-        const ready = waitForComplete
-          ? isDownloadComplete
-          : (readyBytes >= MIN_READY_BYTES || (isDownloadComplete && readyPrefix > 0));
-        if (ready) {
-          settled = true;
-          clearTimeout(timeoutId);
-          console.log('[Streaming] Ready, size:', readyBytes, 'complete:', isDownloadComplete);
-          resolve(buildBlob());
-        }
-      };
-      onProgress = check;
-      check();
-    });
+      // Throws unless every chunk is present and the bytes match fileSize.
+      const blob = new Blob(assembly.parts() as BlobPart[], { type: mimeType });
+      console.log('[Download] Complete, size:', blob.size);
+      return blob;
+    } finally {
+      clearTimeout(stallTimer);
+    }
   }
 
   /**
@@ -1155,27 +1056,23 @@ export class TelegramClientManager {
       }
     }
 
-    const toLocation = (loc: { docId: bigint; accessHash: bigint; fileReference?: Uint8Array }) =>
-      new Api.InputDocumentFileLocation({
-        id: loc.docId as any,
-        accessHash: loc.accessHash as any,
-        fileReference: loc.fileReference,
-        thumbSize: "",
-      });
+    const toLocation = (ref: MediaRef) => fileLocationFor(ref, ref.fullThumbSize);
 
     // Cached after the first chunk of a given message — subsequent chunks skip getMessages entirely.
     const invokeGetFile = async (off: number, lim: number): Promise<any> => {
-      const loc = await this.getFileLocation(messageId, false, expectedFileId);
+      const ref = await this.getFileLocation(messageId, false, expectedFileId);
       try {
-        return await this.client!.invoke(
-          new Api.upload.GetFile({ location: toLocation(loc), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+        return await this.getFileFrom(
+          new Api.upload.GetFile({ location: toLocation(ref), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
+          ref,
         );
       } catch (err: any) {
         if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {
           console.warn('[ChunkByOffset] File reference expired, refreshing for message', messageId);
           const fresh = await this.getFileLocation(messageId, true, expectedFileId);
-          return await this.client!.invoke(
-            new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true })
+          return await this.getFileFrom(
+            new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
+            fresh,
           );
         }
         throw err;
@@ -1222,6 +1119,104 @@ export class TelegramClientManager {
   }
 
   /**
+   * Resolve a channel/group from a username, t.me link, or numeric id.
+   *
+   * A numeric id alone is not enough for a private channel — MTProto needs the
+   * peer's access_hash, which only lives in the session's entity cache. So on
+   * failure we pull the dialog list once (which populates that cache) and try
+   * again before giving up.
+   */
+  async resolveChat(input: string): Promise<{ entity: any; title: string; noForwards: boolean }> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized');
+
+    const raw = input.trim().replace(/^(https?:\/\/)?t\.me\//i, '').replace(/^@/, '');
+    const asNumber = /^-?\d+$/.test(raw) ? Number(raw) : null;
+    const target: string | number = asNumber ?? raw;
+
+    let entity: any;
+    try {
+      entity = await this.client.getEntity(target as any);
+    } catch (err) {
+      console.warn('[ChatImport] getEntity failed, refreshing dialogs and retrying', err);
+      await this.client.getDialogs({ limit: 200 });
+      try {
+        entity = await this.client.getEntity(target as any);
+      } catch {
+        throw new Error(`此帳號無法存取 chat「${input}」。請先用同一個 Telegram 帳號開啟過該對話。`);
+      }
+    }
+
+    // CRITICAL — do not remove: Saved Messages is chat import's DESTINATION.
+    // 'me', the account's own username, and the account's own numeric id all
+    // resolve to this same entity, and none of them error out — getEntity('me')
+    // just returns the self User. Importing it forwards every message of Saved
+    // Messages back into Saved Messages and re-registers each with the SAME
+    // file_id the drive already holds; insert_file is INSERT OR REPLACE on
+    // file_id, so every existing row gets rewritten with a new message id, the
+    // import folder as parent, and split_group_id/part_index/is_split_file
+    // reset — permanently breaking every split (>512MB) file in this drive.
+    if (isOwnAccount(entity, this.accountId)) {
+      throw new Error('Saved Messages 是匯入的目的地，不能同時作為來源匯入 —— 這麼做會覆蓋並毀損雲端硬碟中已有的檔案紀錄（尤其是大檔案的分割片段）。');
+    }
+
+    const title = entity.title
+      || [entity.firstName, entity.lastName].filter(Boolean).join(' ')
+      || entity.username
+      || String(input);
+    return { entity, title, noForwards: Boolean(entity.noforwards) };
+  }
+
+  /**
+   * Yield every message in the chat, oldest-first — media and non-media alike.
+   *
+   * The media filter itself lives in runImport (chatImport.ts, via readMedia),
+   * not here: a chat can have thousands of text messages before its first
+   * media one, and runImport needs to see (report scan progress for, and be
+   * able to stop within) that whole stretch. An iterator that silently
+   * skipped non-media messages would hide it from the loop entirely, leaving
+   * onProgress uncalled and shouldStop() unchecked for as long as the
+   * stretch lasts.
+   */
+  async *iterChatMedia(entity: any): AsyncGenerator<Api.Message> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized');
+    for await (const message of this.client.iterMessages(entity, { reverse: true })) {
+      yield message as Api.Message;
+    }
+  }
+
+  /**
+   * Forward one message into Saved Messages and return the new message.
+   *
+   * ponytail: one message per call, paced by messageRateLimiter (~3/s). Telegram
+   * accepts up to 100 ids per forwardMessages call, which would be ~100x faster;
+   * the upgrade path is batching and matching the returned messages back to
+   * their sources by media id, since the API gives no explicit mapping.
+   */
+  async forwardToSaved(entity: any, messageId: number): Promise<Api.Message> {
+    await this.waitUntilReady();
+    if (!this.client) throw new Error('Client not initialized');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.messageRateLimiter.wait();
+        const result = await this.client.forwardMessages('me', {
+          messages: [messageId],
+          fromPeer: entity,
+        });
+        return unwrapForwardedMessage(result, messageId) as Api.Message;
+      } catch (err: any) {
+        if (isFloodError(err) && attempt < 2) {
+          this.penalizeForFlood('forwardMessages', err);
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error(`Forward of message ${messageId} failed after retries`);
+  }
+
+  /**
    * DM a login nonce to our bot. Telegram tells the backend who sent it, which
    * is the whole point: the session string never leaves the browser.
    * @returns the sent message's id, so the caller can tidy it up afterwards
@@ -1253,13 +1248,12 @@ export class TelegramClientManager {
     onQRCode: (url: string, expiresAt: number) => void,
     onPasswordRequired: (hint: string) => Promise<string>,
   ): Promise<string> {
-    if (window.location.protocol === 'https:') {
-      installTelegramWsProxy();
-    }
     this.session = new StringSession('');
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: window.location.protocol === 'https:',
+      // Telegram's plain-ws endpoint (port 80) now answers 302, so wss:443 is the
+      // only working transport - regardless of whether this page is http or https.
+      useWSS: true,
       deviceModel: 'TeleDrive Browser',
       appVersion: '1.0.0',
     });
@@ -1299,13 +1293,12 @@ export class TelegramClientManager {
     onCodeRequired: () => void,
     onPasswordRequired: (hint: string) => void,
   ): { waitForLogin: Promise<string>; submitCode: (code: string) => void; submitPassword: (pwd: string) => void } {
-    if (window.location.protocol === 'https:') {
-      installTelegramWsProxy();
-    }
     this.session = new StringSession('');
     this.client = new TelegramClient(this.session, apiId, apiHash, {
       connectionRetries: 5,
-      useWSS: window.location.protocol === 'https:',
+      // Telegram's plain-ws endpoint (port 80) now answers 302, so wss:443 is the
+      // only working transport - regardless of whether this page is http or https.
+      useWSS: true,
       deviceModel: 'TeleDrive Browser',
       appVersion: '1.0.0',
     });

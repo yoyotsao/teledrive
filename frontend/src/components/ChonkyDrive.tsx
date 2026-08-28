@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
 import { getPrimaryClient, getClientFor, getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
@@ -1511,6 +1511,15 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       setError(err instanceof Error ? err.message : 'Failed to move files');
     }
   }, [selectedFiles, loadContents]);
+
+  // Tell main.tsx a video stream is starting. The chunk-serving gate it keeps
+  // is shut by closePreview() below, and the serving path cannot reopen it —
+  // without this signal the second video of a session (and every one after it)
+  // is answered 503 'Streaming stopped' until the page is reloaded.
+  useLayoutEffect(() => {
+    if (!previewFile?.mime_type?.startsWith('video/')) return;
+    window.dispatchEvent(new CustomEvent('teledrive:start-streaming'));
+  }, [previewFile?.file_id, previewFile?.mime_type]);
 
   const closePreview = useCallback(async () => {
     if (previewFile?.mime_type?.startsWith('video/')) {

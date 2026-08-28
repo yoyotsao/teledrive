@@ -34,6 +34,7 @@ import {
   CHUNK_ESCALATION_RESET_MS,
   CHUNK_SIZE as PART_SIZE,
 } from "../config";
+import { ChunkAssembly } from './chunkAssembly';
 import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
@@ -888,48 +889,38 @@ export class TelegramClientManager {
       return new Blob([buffer], { type: mimeType });
     }
 
-    // Images: download all 512KB chunks in parallel (waitForComplete) instead of
-    // GramJS's sequential 128KB-per-round-trip downloadMedia. Every byte is
-    // fetched over one MTProto connection, so hiding round-trips with pipelined GetFile
-    // requests is the single biggest win for multi-MB previews. Fall back to the
-    // sequential path if the parallel one fails.
-    if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType.startsWith('image/')) {
-      console.log('[Download] Image file, using parallel chunked download...');
-      try {
-        return await this.downloadFileChunked(message, mimeType, true);
-      } catch (err: any) {
-        console.warn('[Download] Parallel image download failed, falling back to downloadMedia:', err?.message);
-        const buffer = await this.client.downloadMedia(message.media);
-        if (!buffer || buffer.length === 0) {
-          throw new Error("Failed to download file - empty buffer");
-        }
-        return new Blob([buffer], { type: mimeType });
-      }
-    }
-
-    // Try chunked download first (better for large files)
+    // Each GetFile is a round trip to the media DC, so pipelining 512KB
+    // requests beats GramJS's sequential 128KB-per-round-trip downloadMedia by
+    // a wide margin. Fall back to the sequential path only if the parallel one
+    // fails outright.
     try {
-      console.log('[Download] Trying chunked GetFile download...');
-      const result = await this.downloadFileChunked(message, mimeType);
-      return result;
+      console.log('[Download] Using parallel chunked download...');
+      return await this.downloadFileChunked(message, mimeType);
     } catch (err: any) {
       console.error('[Download] Chunked download failed, trying downloadMedia:', err.message);
-      // Fallback to downloadMedia for small files
-      console.log('[Download] Starting downloadMedia fallback...');
       const buffer = await this.client.downloadMedia(message.media);
       if (!buffer || buffer.length === 0) {
         throw new Error("Failed to download file - empty buffer");
+      }
+      if (buffer.length !== fileSize && fileSize > 0) {
+        throw new Error(`Truncated download: got ${buffer.length} of ${fileSize} bytes`);
       }
       return new Blob([buffer], { type: mimeType });
     }
   }
 
   /**
-   * Download file using streaming - returns blob immediately for playback while downloading continues.
+   * Download a message's document in full, 512KB chunks in parallel.
+   *
+   * Resolves only when every chunk is in hand and the bytes add up to the size
+   * Telegram declared. It used to double as a streaming primitive that could
+   * resolve early with a ~10MB prefix, which is how full downloads ended up
+   * saved to disk truncated at ~10MB while the console kept logging chunks
+   * nobody read. Video playback does not come through here at all — it streams
+   * via the Service Worker and downloadFileChunkedByOffset() — so there is no
+   * caller that wants a partial blob, and no flag left to forget to pass.
    */
-  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream', waitForComplete: boolean = false): Promise<Blob> {
-    console.log('[Streaming] Starting streaming download...');
-
+  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream'): Promise<Blob> {
     // Extract file location from message media
     const ref = readMedia(message.media);
     if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
@@ -937,20 +928,31 @@ export class TelegramClientManager {
 
     const CHUNK_SIZE = 512 * 1024;
     const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-    console.log('[Streaming] Total size:', fileSize, 'chunks:', totalChunks);
+    console.log('[Download] Total size:', fileSize, 'chunks:', totalChunks);
 
-    // Chunks land in fixed slots (parallel downloads can finish out of order);
-    // `readyPrefix` tracks how many LEADING slots are contiguously filled, since only a
-    // contiguous prefix from byte 0 is a valid playable blob.
-    const chunkSlots: (Uint8Array | undefined)[] = new Array(totalChunks);
-    let readyPrefix = 0;
-    let isDownloadComplete = false;
-    let downloadError: Error | null = null;
-    let onProgress: (() => void) | null = null;
-
+    const assembly = new ChunkAssembly(totalChunks, fileSize);
     const location = fileLocationFor(ref, ref.fullThumbSize);
-
     const chunkSemaphore = new Semaphore(6);
+
+    // A chunk request that never answers would otherwise hang the download
+    // forever. Judge that by lack of progress, not by total elapsed time: a
+    // multi-GB file legitimately takes far longer than any fixed deadline.
+    const STALL_TIMEOUT_MS = 120000;
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    let armStall = () => {};
+    const stalled = new Promise<never>((_, reject) => {
+      armStall = () => {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(
+          () => reject(new Error(
+            `Download stalled: no chunk completed in ${STALL_TIMEOUT_MS / 1000}s ` +
+            `(${assembly.receivedBytes}/${fileSize} bytes)`
+          )),
+          STALL_TIMEOUT_MS,
+        );
+      };
+      armStall();
+    });
 
     const downloadChunk = async (chunkIndex: number) => {
       const offset = chunkIndex * CHUNK_SIZE;
@@ -970,76 +972,31 @@ export class TelegramClientManager {
         ref,
       );
 
-      if (fileResult?.bytes) {
-        chunkSlots[chunkIndex] = new Uint8Array(fileResult.bytes);
-        while (chunkSlots[readyPrefix] !== undefined) readyPrefix++;
-        console.log(`[Streaming] Chunk ${chunkIndex + 1}/${totalChunks} ready (contiguous: ${readyPrefix}/${totalChunks})`);
-      }
-      onProgress?.();
+      if (!fileResult?.bytes) throw new Error(`Chunk ${chunkIndex} returned no bytes`);
+      assembly.put(chunkIndex, new Uint8Array(fileResult.bytes));
+      armStall();
+      console.log(`[Download] Chunk ${chunkIndex + 1}/${totalChunks} ready (${assembly.receivedBytes}/${fileSize} bytes)`);
     };
 
-    // Start downloading in background immediately, 4 chunks in flight at a time
-    const downloadInBackground = async () => {
-      try {
-        await Promise.all(
+    try {
+      // allSettled, not all: a rejection from one chunk must not leave the
+      // other in-flight chunks' rejections unhandled.
+      const results = await Promise.race([
+        Promise.allSettled(
           Array.from({ length: totalChunks }, (_, i) => chunkSemaphore.withSlot(() => downloadChunk(i)))
-        );
-        isDownloadComplete = true;
-        console.log('[Streaming] All chunks downloaded!');
-      } catch (err: any) {
-        console.error('[Streaming] GetFile error:', err.message);
-        downloadError = err;
-        isDownloadComplete = true;
-      }
-      onProgress?.();
-    };
-    downloadInBackground();
+        ),
+        stalled,
+      ]);
+      const failed = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+      if (failed) throw new Error(`Chunk download failed: ${failed.reason?.message || failed.reason}`);
 
-    const buildBlob = () => new Blob(chunkSlots.slice(0, readyPrefix) as BlobPart[], { type: mimeType });
-
-    // Wait for enough contiguous bytes (10MB) for playback to start reliably (video needs keyframes),
-    // or full completion, or a 60s safety timeout — whichever comes first. Event-driven, no polling.
-    const MIN_READY_BYTES = 10 * 1024 * 1024;
-    return new Promise<Blob>((resolve, reject) => {
-      let settled = false;
-      const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        // waitForComplete callers (image previews / full downloads) need the
-        // ENTIRE file — returning a partial prefix would be a truncated image,
-        // so surface a timeout error instead and let the caller fall back.
-        if (waitForComplete && !isDownloadComplete) {
-          reject(new Error('Download timeout before completion'));
-          return;
-        }
-        console.log('[Streaming] Timeout, returning blob with size:', readyPrefix * CHUNK_SIZE);
-        resolve(buildBlob());
-      }, waitForComplete ? 180000 : 60000);
-
-      const check = () => {
-        if (settled) return;
-        // For full downloads any chunk error is fatal (the blob would have a
-        // hole); for streaming we only bail when nothing at all arrived.
-        if (downloadError && (waitForComplete || readyPrefix === 0)) {
-          settled = true;
-          clearTimeout(timeoutId);
-          reject(downloadError);
-          return;
-        }
-        const readyBytes = Math.min(readyPrefix * CHUNK_SIZE, fileSize);
-        const ready = waitForComplete
-          ? isDownloadComplete
-          : (readyBytes >= MIN_READY_BYTES || (isDownloadComplete && readyPrefix > 0));
-        if (ready) {
-          settled = true;
-          clearTimeout(timeoutId);
-          console.log('[Streaming] Ready, size:', readyBytes, 'complete:', isDownloadComplete);
-          resolve(buildBlob());
-        }
-      };
-      onProgress = check;
-      check();
-    });
+      // Throws unless every chunk is present and the bytes match fileSize.
+      const blob = new Blob(assembly.parts() as BlobPart[], { type: mimeType });
+      console.log('[Download] Complete, size:', blob.size);
+      return blob;
+    } finally {
+      clearTimeout(stallTimer);
+    }
   }
 
   /**

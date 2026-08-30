@@ -1,4 +1,4 @@
-import { getClientFor, getPrimaryClient, TelegramClientManager } from './gramjs';
+import { getClientFor, getPrimaryClient, TelegramClientManager, DownloadProgress } from './gramjs';
 import { api } from '../api/client';
 import { Semaphore } from './semaphore';
 import { FileInfo } from '../types';
@@ -32,13 +32,13 @@ function assertWholeFile(blob: Blob, expected: number, what: string): Blob {
 }
 
 // Fetch a file's full bytes from Telegram (handles split files).
-export async function fetchFileBlob(file: FileInfo): Promise<Blob> {
+export async function fetchFileBlob(file: FileInfo, onProgress?: DownloadProgress): Promise<Blob> {
   const mimeType = file.mime_type || 'application/octet-stream';
   if (file.is_split_file && file.split_group_id) {
-    return downloadSplitMerged(file.split_group_id, mimeType);
+    return downloadSplitMerged(file.split_group_id, mimeType, onProgress);
   }
   if (!file.telegram_message_id) throw new Error('No telegram_message_id for file');
-  const blob = await clientForFile(file).downloadFile(file.telegram_message_id, mimeType);
+  const blob = await clientForFile(file).downloadFile(file.telegram_message_id, mimeType, onProgress);
   return assertWholeFile(blob, file.filesize, file.filename);
 }
 
@@ -50,7 +50,11 @@ export async function fetchFileBlob(file: FileInfo): Promise<Blob> {
  * account, and parts of a single file are deliberately spread over several,
  * so any id-based ordering here would corrupt the merged file.
  */
-export async function downloadSplitMerged(splitGroupId: string, mimeType: string): Promise<Blob> {
+export async function downloadSplitMerged(
+  splitGroupId: string,
+  mimeType: string,
+  onProgress?: DownloadProgress,
+): Promise<Blob> {
   const { files } = await api.getSplitGroupFiles(splitGroupId);
   if (!files || files.length === 0) {
     throw new Error('No files found for split group: ' + splitGroupId);
@@ -73,13 +77,22 @@ export async function downloadSplitMerged(splitGroupId: string, mimeType: string
     console.warn('[DownloadMerge] Dropped', sorted.length - uniqueParts.length, 'duplicate-message parts');
   }
 
+  // Parts download concurrently, so progress has to be summed across them
+  // rather than reported per part — otherwise the number would jump backwards.
+  const expectedTotal = uniqueParts.reduce((n, p) => n + (p.filesize || 0), 0);
+  const receivedPerPart = new Array<number>(uniqueParts.length).fill(0);
+  const reportPart = (index: number) => (received: number) => {
+    receivedPerPart[index] = received;
+    onProgress?.(receivedPerPart.reduce((a, b) => a + b, 0), expectedTotal);
+  };
+
   const partSemaphore = new Semaphore(3);
   const blobs = await Promise.all(
     uniqueParts.map((part, i) => partSemaphore.withSlot(async () => {
       const messageId = part.telegram_message_id;
       if (!messageId) throw new Error(`Missing telegram_message_id for part: ${part.file_id}`);
       // Each part carries its own storage account.
-      const blob = await clientForFile(part).downloadFile(messageId, mimeType);
+      const blob = await clientForFile(part).downloadFile(messageId, mimeType, reportPart(i));
       console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
       // A short part would merge into a corrupt file that still opens.
       return assertWholeFile(blob, part.filesize, `part ${i} of ${splitGroupId}`);
@@ -87,8 +100,7 @@ export async function downloadSplitMerged(splitGroupId: string, mimeType: string
   );
 
   const merged = new Blob(blobs, { type: mimeType });
-  const expected = uniqueParts.reduce((n, p) => n + (p.filesize || 0), 0);
-  return assertWholeFile(merged, expected, `split group ${splitGroupId}`);
+  return assertWholeFile(merged, expectedTotal, `split group ${splitGroupId}`);
 }
 
 // Download a file's bytes from Telegram and trigger a browser save.

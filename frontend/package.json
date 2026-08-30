@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node scripts/build-buffer-polyfill.mjs",
+    "prebuild": "node scripts/build-buffer-polyfill.mjs && node scripts/build-service-worker.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test:e2e": "playwright test --project=isolated",

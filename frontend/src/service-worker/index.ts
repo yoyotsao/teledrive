@@ -2,25 +2,40 @@
 
 declare const self: ServiceWorkerGlobalScope;
 
+import { PreloadBuffer } from '../lib/preloadBuffer';
+
 // Cache name for future use (Phase 2+)
 const CACHE_NAME = 'teledrive-sw-v1';
 const VIDEO_PREVIEW_PATH = '/preview-video/';
 const SPLIT_PREVIEW_PATH = '/preview-video/split/';
 
-// Rolling lookahead buffer — preloads PRELOAD_AHEAD chunks concurrently so the
-// video element never stalls waiting for the next chunk to download.
+// Rolling lookahead — preloads PRELOAD_AHEAD chunks concurrently so the video
+// element never stalls waiting for the next chunk to download. The media
+// element asks for one range at a time and waits for it, so this buffer is the
+// ONLY parallelism playback gets.
 const PRELOAD_AHEAD = 3; // 3 × 512 KB = 1.5 MB rolling buffer
 
-interface PreloadEntry {
-  data: ArrayBuffer | null;
-  inProgress: boolean;
-}
+// One buffer per streamed message — a split file has one per part, since each
+// part is its own Telegram message on its own account.
+const preloadBuffers = new Map<string, PreloadBuffer>();
+// A session can stream many files; only the part being played and the ones
+// around it are worth holding bytes for.
+const MAX_PRELOAD_BUFFERS = 4;
 
-// key = `${fileId}:${messageId}:${offset}`
-const preloadCache = new Map<string, PreloadEntry>();
+function bufferFor(fileId: string, messageId: string, accountId: string, fileSize: number): PreloadBuffer {
+  const key = `${fileId}:${messageId}`;
+  const existing = preloadBuffers.get(key);
+  if (existing) return existing;
 
-function preloadKey(fileId: string, messageId: string, offset: number): string {
-  return `${fileId}:${messageId}:${offset}`;
+  const buffer = new PreloadBuffer(PRELOAD_AHEAD, (offset, limit) =>
+    requestChunkFromApp(fileId, messageId, accountId, offset, limit, fileSize));
+  preloadBuffers.set(key, buffer);
+  while (preloadBuffers.size > MAX_PRELOAD_BUFFERS) {
+    const oldest = preloadBuffers.keys().next().value as string;
+    preloadBuffers.get(oldest)?.clear();
+    preloadBuffers.delete(oldest);
+  }
+  return buffer;
 }
 
 // Split file parts cache (keyed by splitGroupId)
@@ -63,7 +78,8 @@ self.addEventListener('activate', () => {
 self.addEventListener('message', (event) => {
   if (event.data?.type === 'CLEANUP') {
     console.log('[ServiceWorker] Cleanup message received');
-    preloadCache.clear();
+    for (const buffer of preloadBuffers.values()) buffer.clear();
+    preloadBuffers.clear();
     splitPartsCache.clear();
   }
 });
@@ -339,64 +355,6 @@ async function requestFileMetadata(fileId: string, messageId: string, accountId:
   });
 }
 
-/**
- * Kick off parallel preloads for the next PRELOAD_AHEAD chunks after currentOffset.
- * Already-cached or in-progress offsets are skipped.
- * Evicts entries that are behind currentOffset or beyond the lookahead window.
- */
-function preloadAhead(
-  fileId: string,
-  messageId: string,
-  accountId: string,
-  currentOffset: number,
-  chunkSize: number,
-  fileSize: number
-): void {
-  // Evict stale entries (behind current position or beyond window)
-  const maxAheadOffset = currentOffset + (PRELOAD_AHEAD + 1) * chunkSize;
-  for (const key of preloadCache.keys()) {
-    const parts = key.split(':');
-    const entryOffset = parseInt(parts[2], 10);
-    if (entryOffset < currentOffset || entryOffset > maxAheadOffset) {
-      preloadCache.delete(key);
-    }
-  }
-
-  // Schedule PRELOAD_AHEAD chunks ahead
-  for (let i = 1; i <= PRELOAD_AHEAD; i++) {
-    const nextOffset = currentOffset + i * chunkSize;
-    if (nextOffset >= fileSize) break;
-
-    const key = preloadKey(fileId, messageId, nextOffset);
-    if (preloadCache.has(key)) continue;
-
-    const entry: PreloadEntry = { data: null, inProgress: true };
-    preloadCache.set(key, entry);
-
-    requestChunkFromApp(fileId, messageId, accountId, nextOffset, chunkSize, fileSize)
-      .then((data) => {
-        const e = preloadCache.get(key);
-        if (e) { e.data = data; e.inProgress = false; }
-      })
-      .catch(() => {
-        preloadCache.delete(key); // will be retried on next request
-      });
-  }
-}
-
-/**
- * Return and evict a preloaded chunk if ready, or null if still downloading.
- */
-function consumePreloadedChunk(fileId: string, messageId: string, offset: number): ArrayBuffer | null {
-  const key = preloadKey(fileId, messageId, offset);
-  const entry = preloadCache.get(key);
-  if (entry?.data) {
-    preloadCache.delete(key);
-    return entry.data;
-  }
-  return null;
-}
-
 // Fetch event handler - intercept requests
 self.addEventListener('fetch', (event: FetchEvent) => {
   const url = new URL(event.request.url);
@@ -457,18 +415,17 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         const effectiveLimit = Math.min(limit, bytesLeftInPart);
 
         // Parts of one split file can live on different accounts (they were
-        // uploaded in parallel), so each part carries its own.
-        const chunkData = await requestChunkFromApp(
-          splitGroupId,
-          String(part.messageId),
-          String(part.accountId ?? 0),
-          partOffset,
-          effectiveLimit,
-          part.size
-        );
+        // uploaded in parallel), so each part carries its own. The buffer is
+        // per part for the same reason.
+        //
+        // This path used to fetch the chunk directly and only THEN call the
+        // preloader, which had no reader at all — so every chunk a split video
+        // preloaded was downloaded a second time and thrown away.
+        const buffer = bufferFor(splitGroupId, String(part.messageId), String(part.accountId ?? 0), part.size);
+        const chunkData = await buffer.take(partOffset, effectiveLimit);
 
         // Preload next PRELOAD_AHEAD chunks within the same part
-        preloadAhead(splitGroupId, String(part.messageId), String(part.accountId ?? 0), partOffset, effectiveLimit, part.size);
+        buffer.schedule(partOffset, effectiveLimit, part.size);
 
         const responseEndByte = rawRange.offset + chunkData.byteLength - 1;
         return new Response(chunkData, {
@@ -563,29 +520,18 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         console.log('[ServiceWorker] File size:', metadata.size, 'Available:', available);
         console.log('[ServiceWorker] Aligned Range - offset:', rawRange.offset, 'limit:', limit, '(aligned to 4KB, capped at 512KB)');
 
-        // Serve from lookahead buffer if already downloaded, else fetch now
-        const preloaded = consumePreloadedChunk(urlParams.fileId, urlParams.messageId, rawRange.offset);
-
-        let chunkData: ArrayBuffer;
-
-        if (preloaded) {
-          console.log('[ServiceWorker] Using preloaded chunk');
-          chunkData = preloaded;
-        } else {
-          console.log('[ServiceWorker] Requesting chunk from main app...');
-          chunkData = await requestChunkFromApp(
-            urlParams.fileId,
-            urlParams.messageId,
-            urlParams.accountId,
-            rawRange.offset,
-            limit,
-            metadata.size
-          );
-          console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
-        }
+        // Take the chunk from the lookahead — finished, still in flight, or not
+        // started, the buffer answers all three with the SINGLE request for
+        // that offset. Asking for a still-downloading offset used to count as a
+        // miss and fire a second GetFile for bytes already on their way, which
+        // doubled the load precisely when the connection was too slow to keep
+        // the lookahead ahead.
+        const buffer = bufferFor(urlParams.fileId, urlParams.messageId, urlParams.accountId, metadata.size);
+        const chunkData = await buffer.take(rawRange.offset, limit);
+        console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
 
         // Immediately kick off preloading the next PRELOAD_AHEAD chunks in parallel
-        preloadAhead(urlParams.fileId, urlParams.messageId, urlParams.accountId, rawRange.offset, limit, metadata.size);
+        buffer.schedule(rawRange.offset, limit, metadata.size);
 
         const responseEndByte = rawRange.offset + chunkData.byteLength - 1;
         

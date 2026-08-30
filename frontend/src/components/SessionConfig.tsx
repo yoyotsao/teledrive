@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import { loadJwt } from '../lib/gramjs';
 
 export default function SessionConfig() {
   const [status, setStatus] = useState<'checking' | 'connected' | 'error'>('checking');
@@ -11,7 +12,7 @@ export default function SessionConfig() {
     setStatus('checking');
     setErrorMessage('');
     try {
-      const token = localStorage.getItem('tg_jwt');
+      const token = loadJwt();
       await axios.get('/api/v1/files', {
         params: { page: 1, page_size: 1 },
         timeout: 10000,

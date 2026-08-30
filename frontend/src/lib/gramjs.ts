@@ -195,6 +195,13 @@ function fileLocationFor(ref: MediaRef, thumbSize: string): Api.TypeInputFileLoc
  * GramJS client wrapper for browser-based Telegram operations.
  * Manages direct MTProto connections to Telegram for file upload/download.
  */
+/**
+ * Called as a download advances, so a caller showing a spinner can show how far
+ * along it is instead. A preview that fetches the WHOLE file before it can
+ * render anything is otherwise indistinguishable from one that has hung.
+ */
+export type DownloadProgress = (receivedBytes: number, totalBytes: number) => void;
+
 export class TelegramClientManager {
   private client: TelegramClient | null = null;
   private session: StringSession | null = null;
@@ -863,7 +870,11 @@ export class TelegramClientManager {
    * @param mimeType - The MIME type of the file (for Blob type)
    * @returns Promise with Blob of the file
    */
-  async downloadFile(messageId: number, mimeType: string = 'application/octet-stream'): Promise<Blob> {
+  async downloadFile(
+    messageId: number,
+    mimeType: string = 'application/octet-stream',
+    onProgress?: DownloadProgress,
+  ): Promise<Blob> {
     console.log('[Download] downloadFile called, messageId:', messageId, 'mimeType:', mimeType);
     
     await this.waitUntilReady();
@@ -912,7 +923,7 @@ export class TelegramClientManager {
     // fails outright.
     try {
       console.log('[Download] Using parallel chunked download...');
-      return await this.downloadFileChunked(message, mimeType);
+      return await this.downloadFileChunked(message, mimeType, onProgress);
     } catch (err: any) {
       console.error('[Download] Chunked download failed, trying downloadMedia:', err.message);
       const buffer = await this.client.downloadMedia(message.media);
@@ -937,7 +948,11 @@ export class TelegramClientManager {
    * via the Service Worker and downloadFileChunkedByOffset() — so there is no
    * caller that wants a partial blob, and no flag left to forget to pass.
    */
-  async downloadFileChunked(message: Api.Message, mimeType: string = 'application/octet-stream'): Promise<Blob> {
+  async downloadFileChunked(
+    message: Api.Message,
+    mimeType: string = 'application/octet-stream',
+    onProgress?: DownloadProgress,
+  ): Promise<Blob> {
     // Extract file location from message media
     const ref = readMedia(message.media);
     if (!ref) throw new Error('Unsupported media type: ' + (message.media as any)?.className);
@@ -992,6 +1007,7 @@ export class TelegramClientManager {
       if (!fileResult?.bytes) throw new Error(`Chunk ${chunkIndex} returned no bytes`);
       assembly.put(chunkIndex, new Uint8Array(fileResult.bytes));
       armStall();
+      onProgress?.(assembly.receivedBytes, fileSize);
       console.log(`[Download] Chunk ${chunkIndex + 1}/${totalChunks} ready (${assembly.receivedBytes}/${fileSize} bytes)`);
     };
 
@@ -1219,22 +1235,11 @@ export class TelegramClientManager {
   /**
    * DM a login nonce to our bot. Telegram tells the backend who sent it, which
    * is the whole point: the session string never leaves the browser.
-   * @returns the sent message's id, so the caller can tidy it up afterwards
    */
-  async sendAuthChallenge(botUsername: string, nonce: string): Promise<number> {
+  async sendAuthChallenge(botUsername: string, nonce: string): Promise<void> {
     await this.waitUntilReady();
     if (!this.client) throw new Error('Client not initialized.');
-    const msg = await this.client.sendMessage(botUsername, { message: nonce });
-    return msg.id;
-  }
-
-  /** Remove the nonce message once it's been redeemed — cosmetic, never fatal. */
-  async deleteAuthChallenge(botUsername: string, messageId: number): Promise<void> {
-    try {
-      await this.client?.deleteMessages(botUsername, [messageId], { revoke: true });
-    } catch (err) {
-      console.warn('[GramJS] Could not delete challenge message:', err);
-    }
+    await this.client.sendMessage(botUsername, { message: nonce });
   }
 
   /**
@@ -1428,52 +1433,142 @@ export function resetAllClients(): void {
 }
 
 // ── Account credential storage ─────────────────────────────────────────────
-// 'tg_accounts': the sessions, one per linked account. 'tg_jwt': one per drive.
+// Sessions and the drive JWT live in IndexedDB, not localStorage. They must
+// remain available to same-origin JavaScript because GramJS uses the session;
+// CSP and dependency hygiene are therefore the XSS boundary.
 
 export type StoredAccount = { id: number; label: string; session: string };
+type CredentialRecord = { accounts: StoredAccount[]; jwt: string | null };
+
+const CREDENTIAL_DB = 'teledrive-credentials';
+const CREDENTIAL_STORE = 'credentials';
+const CREDENTIAL_KEY = 'active';
+let credentialCache: CredentialRecord = { accounts: [], jwt: null };
+let credentialInit: Promise<void> | null = null;
+
+function openCredentialDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(CREDENTIAL_DB, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(CREDENTIAL_STORE)) {
+        request.result.createObjectStore(CREDENTIAL_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('Credential database unavailable'));
+  });
+}
+
+async function readCredentialRecord(): Promise<CredentialRecord | null> {
+  const db = await openCredentialDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(CREDENTIAL_STORE).objectStore(CREDENTIAL_STORE).get(CREDENTIAL_KEY);
+      request.onsuccess = () => resolve((request.result as CredentialRecord | undefined) ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function writeCredentialRecord(record: CredentialRecord): Promise<void> {
+  const db = await openCredentialDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(CREDENTIAL_STORE, 'readwrite');
+      transaction.objectStore(CREDENTIAL_STORE).put(record, CREDENTIAL_KEY);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteCredentialRecord(): Promise<void> {
+  const db = await openCredentialDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(CREDENTIAL_STORE, 'readwrite');
+      transaction.objectStore(CREDENTIAL_STORE).delete(CREDENTIAL_KEY);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/** Load IndexedDB once and remove plaintext credentials from legacy storage. */
+export function initializeCredentialStore(): Promise<void> {
+  if (credentialInit) return credentialInit;
+  credentialInit = (async () => {
+    const stored = await readCredentialRecord();
+    if (stored) {
+      credentialCache = stored;
+    } else {
+      let accounts: StoredAccount[] = [];
+      const rawAccounts = localStorage.getItem('tg_accounts');
+      if (rawAccounts) {
+        try {
+          accounts = JSON.parse(rawAccounts) as StoredAccount[];
+        } catch {
+          accounts = [];
+        }
+      } else {
+        const legacySession = localStorage.getItem('tg_session');
+        if (legacySession) accounts = [{ id: 0, label: '', session: legacySession }];
+      }
+      credentialCache = { accounts, jwt: localStorage.getItem('tg_jwt') };
+      if (accounts.length || credentialCache.jwt) await writeCredentialRecord(credentialCache);
+    }
+    localStorage.removeItem('tg_accounts');
+    localStorage.removeItem('tg_session');
+    localStorage.removeItem('tg_jwt');
+  })();
+  return credentialInit;
+}
 
 export function loadAccounts(): StoredAccount[] {
-  const raw = localStorage.getItem('tg_accounts');
-  if (raw) {
-    try {
-      return JSON.parse(raw) as StoredAccount[];
-    } catch {
-      return [];
-    }
-  }
-  // Migrate the single-account era in place. id 0 is a placeholder — the real
-  // one is filled in by initialize()'s getMe() and re-saved.
-  const legacy = localStorage.getItem('tg_session');
-  if (!legacy) return [];
-  const migrated: StoredAccount[] = [{ id: 0, label: '', session: legacy }];
-  localStorage.setItem('tg_accounts', JSON.stringify(migrated));
-  localStorage.removeItem('tg_session');
-  return migrated;
+  return [...credentialCache.accounts];
 }
 
 /** Insert or update one account, keyed by id. */
-export function saveAccount(account: StoredAccount): void {
+export async function saveAccount(account: StoredAccount): Promise<void> {
+  await initializeCredentialStore();
   const accounts = loadAccounts().filter((a) => a.id !== account.id);
   accounts.push(account);
-  localStorage.setItem('tg_accounts', JSON.stringify(accounts));
+  credentialCache = { ...credentialCache, accounts };
+  await writeCredentialRecord(credentialCache);
 }
 
-export function removeAccount(id: number): void {
-  localStorage.setItem('tg_accounts', JSON.stringify(loadAccounts().filter((a) => a.id !== id)));
+export async function removeAccount(id: number): Promise<void> {
+  credentialCache = {
+    ...credentialCache,
+    accounts: loadAccounts().filter((a) => a.id !== id),
+  };
+  await writeCredentialRecord(credentialCache);
   clients.get(id)?.disconnect();
   clients.delete(id);
 }
 
-export function saveJwt(jwt: string): void {
-  localStorage.setItem('tg_jwt', jwt);
+export async function saveJwt(jwt: string): Promise<void> {
+  await initializeCredentialStore();
+  credentialCache = { ...credentialCache, jwt };
+  await writeCredentialRecord(credentialCache);
 }
 
 export function loadJwt(): string | null {
-  return localStorage.getItem('tg_jwt');
+  return credentialCache.jwt;
 }
 
-export function clearCredentialsFromStorage(): void {
+export async function clearCredentialsFromStorage(): Promise<void> {
+  credentialCache = { accounts: [], jwt: null };
   localStorage.removeItem('tg_accounts');
   localStorage.removeItem('tg_session');
   localStorage.removeItem('tg_jwt');
+  await deleteCredentialRecord();
 }

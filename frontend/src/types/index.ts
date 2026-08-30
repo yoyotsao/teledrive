@@ -40,12 +40,3 @@ export interface FileData {
   modDate?: Date;
   thumbnailUrl?: string;
 }
-
-export interface UploadResult {
-  message_id: number;
-  file_id: string;
-  access_hash: string;
-  size: number;
-  mime_type: string;
-  filename: string;
-}

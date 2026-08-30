@@ -176,22 +176,6 @@ class Database:
             FROM files WHERE telegram_user_id != 0
         """)
 
-        # Upload sessions table
-        await self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS upload_sessions (
-                file_id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                filesize INTEGER NOT NULL,
-                mime_type TEXT,
-                total_chunks INTEGER NOT NULL,
-                uploaded_chunks INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL,
-                telegram_file_id TEXT,
-                message_id INTEGER,
-                created_at TEXT NOT NULL
-            )
-        """)
-        
         # Force commit and verify
         await self._conn.commit()
         
@@ -486,6 +470,7 @@ class Database:
     async def update_file(
         self,
         file_id: str,
+        owner_id: int,
         parent_id: Optional[str] = None,
         set_parent_id: bool = False,
         filename: Optional[str] = None,
@@ -506,41 +491,17 @@ class Database:
             params.append(filename)
 
         if not updates:
-            return await self.get_file(file_id)
+            return await self.get_file(file_id, owner_id=owner_id)
         
-        params.append(file_id)
+        params.extend([file_id, owner_id])
         
         await self._conn.execute(
-            f"UPDATE files SET {', '.join(updates)} WHERE file_id = ?",
+            f"UPDATE files SET {', '.join(updates)} WHERE file_id = ? AND owner_id = ?",
             params
         )
         await self._conn.commit()
         
-        return await self.get_file(file_id)
-    
-    async def delete_file(self, file_id: str) -> bool:
-        """Delete a file."""
-        if not self._conn:
-            raise RuntimeError("Database not connected")
-        
-        cursor = await self._conn.execute(
-            "DELETE FROM files WHERE file_id = ?", (file_id,)
-        )
-        await self._conn.commit()
-        return cursor.rowcount > 0
-    
-    async def delete_all_files(self) -> int:
-        """Delete all files."""
-        if not self._conn:
-            raise RuntimeError("Database not connected")
-
-        cursor = await self._conn.execute("SELECT COUNT(*) FROM files")
-        row = await cursor.fetchone()
-        count = row[0] if row else 0
-
-        await self._conn.execute("DELETE FROM files")
-        await self._conn.commit()
-        return count
+        return await self.get_file(file_id, owner_id=owner_id)
 
     async def delete_user_files(self, owner_id: int) -> int:
         """Delete every file in a drive, across all its linked accounts."""
@@ -555,78 +516,32 @@ class Database:
         await self._conn.commit()
         return count
     
-    # ==================== Upload Session Operations ====================
-    
-    async def upsert_upload_session(
-        self,
-        file_id: str,
-        filename: str,
-        filesize: int,
-        mime_type: Optional[str],
-        total_chunks: int,
-        uploaded_chunks: int,
-        status: str,
-        telegram_file_id: Optional[str],
-        message_id: Optional[int],
-        created_at: str
-    ) -> None:
-        """Insert or update an upload session."""
-        if not self._conn:
-            raise RuntimeError("Database not connected")
-        
-        await self._conn.execute("""
-            INSERT OR REPLACE INTO upload_sessions (
-                file_id, filename, filesize, mime_type, total_chunks,
-                uploaded_chunks, status, telegram_file_id, message_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            file_id, filename, filesize, mime_type, total_chunks,
-            uploaded_chunks, status, telegram_file_id, message_id, created_at
-        ))
-        await self._conn.commit()
-    
-    async def get_upload_session(self, file_id: str) -> Optional[dict]:
-        """Get an upload session by file_id."""
-        if not self._conn:
-            raise RuntimeError("Database not connected")
-        
-        cursor = await self._conn.execute(
-            "SELECT * FROM upload_sessions WHERE file_id = ?", (file_id,)
-        )
-        row = await cursor.fetchone()
-        
-        if row:
-            return dict(row)
-        return None
-    
-    async def delete_upload_session(self, file_id: str) -> bool:
-        """Delete an upload session."""
-        if not self._conn:
-            raise RuntimeError("Database not connected")
-        
-        cursor = await self._conn.execute(
-            "DELETE FROM upload_sessions WHERE file_id = ?", (file_id,)
-        )
-        await self._conn.commit()
-        return cursor.rowcount > 0
-    
-    async def get_subtree(self, root_id: str) -> List[dict]:
-        """Get a file/folder row and every descendant underneath it (recursive)."""
+    async def get_subtree(self, root_id: str, owner_id: int) -> List[dict]:
+        """Get one drive's root row and descendants underneath it.
+
+        The owner predicate is part of both branches of the recursive CTE so a
+        corrupt or attacker-supplied cross-drive parent_id cannot make a trash
+        or purge operation cross the tenant boundary.
+        """
         if not self._conn:
             raise RuntimeError("Database not connected")
 
         cursor = await self._conn.execute("""
             WITH RECURSIVE subtree(file_id) AS (
-                SELECT file_id FROM files WHERE file_id = ?
+                SELECT file_id FROM files WHERE file_id = ? AND owner_id = ?
                 UNION
                 SELECT f.file_id FROM files f JOIN subtree s ON f.parent_id = s.file_id
+                WHERE f.owner_id = ?
             )
-            SELECT * FROM files WHERE file_id IN (SELECT file_id FROM subtree)
-        """, (root_id,))
+            SELECT * FROM files
+            WHERE owner_id = ? AND file_id IN (SELECT file_id FROM subtree)
+        """, (root_id, owner_id, owner_id, owner_id))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    async def set_trashed(self, file_ids: List[str], trashed_at: Optional[str]) -> int:
+    async def set_trashed(
+        self, file_ids: List[str], trashed_at: Optional[str], owner_id: int
+    ) -> int:
         """Set (or clear, if trashed_at is None) trashed_at on many rows. Returns rows changed."""
         if not self._conn:
             raise RuntimeError("Database not connected")
@@ -639,14 +554,14 @@ class Database:
             batch = file_ids[i:i + batch_size]
             placeholders = ",".join("?" * len(batch))
             cursor = await self._conn.execute(
-                f"UPDATE files SET trashed_at = ? WHERE file_id IN ({placeholders})",
-                [trashed_at, *batch],
+                f"UPDATE files SET trashed_at = ? WHERE owner_id = ? AND file_id IN ({placeholders})",
+                [trashed_at, owner_id, *batch],
             )
             changed += cursor.rowcount
         await self._conn.commit()
         return changed
 
-    async def delete_files_by_ids(self, file_ids: List[str]) -> int:
+    async def delete_files_by_ids(self, file_ids: List[str], owner_id: int) -> int:
         """Delete multiple file records in one transaction. Returns rows deleted."""
         if not self._conn:
             raise RuntimeError("Database not connected")
@@ -659,7 +574,8 @@ class Database:
             batch = file_ids[i:i + batch_size]
             placeholders = ",".join("?" * len(batch))
             cursor = await self._conn.execute(
-                f"DELETE FROM files WHERE file_id IN ({placeholders})", batch
+                f"DELETE FROM files WHERE owner_id = ? AND file_id IN ({placeholders})",
+                [owner_id, *batch],
             )
             deleted += cursor.rowcount
         await self._conn.commit()

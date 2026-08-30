@@ -4,4 +4,7 @@ __pycache__/
 *.pyo
 .env
 *.log
-teledrive.db
+*.session
+teledrive.db*
+tests/
+.pytest_cache/

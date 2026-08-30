@@ -1,11 +1,7 @@
-"""
-Telegram Cloud Storage - Backend API
+"""TeleDrive metadata and authentication API.
 
-FastAPI application for:
-- Uploading files to Telegram via Bot API
-- Direct downloads from Telegram CDN via MTProto
-- File chunking for large files (>2GB)
-- Gatekeeper endpoint for secure direct downloads
+Telegram file bytes travel directly between the browser's GramJS client and
+Telegram.  This process stores only SQLite metadata and never proxies files.
 """
 
 from contextlib import asynccontextmanager
@@ -43,15 +39,13 @@ async def lifespan(app: FastAPI):
     # Initialize database
     logger.info("Initializing SQLite database...")
     db = await get_database()
-    logger.info(f"Database initialized: {db.db_path}")
+    logger.info("SQLite metadata database initialized")
 
     # Startup
     settings = get_settings()
     logger.info(
         f"Server configuration: {settings.backend_host}:{settings.backend_port}"
     )
-    logger.info(f"Max file size: {settings.max_file_size / (1024**3):.2f} GB")
-    logger.info(f"Chunk size: {settings.chunk_size / (1024**2):.2f} MB")
 
     # Bot-challenge login: one global getUpdates cursor for the whole process.
     poll_task = None
@@ -77,22 +71,10 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI application
 app = FastAPI(
-    title="Telegram Cloud Storage API",
+    title="TeleDrive Metadata API",
     description="""
-    A proxy backend for Telegram Cloud Storage.
-    
-    ## Features:
-    - **Upload**: Upload files to Telegram via Bot API
-    - **Download**: Direct downloads from Telegram CDN (bypasses GCP egress)
-    - **Chunking**: Support for files >2GB via chunked uploads
-    - **Gatekeeper**: Secure time-limited download links
-    
-    ## Architecture:
-    - Uploads: Client -> Our Server -> Telegram Bot API
-    - Downloads: Client -> Gatekeeper -> Telegram CDN (direct)
-    
-    This architecture avoids GCP egress charges by having
-    the browser download directly from Telegram's CDN.
+    Authenticates Telegram users and stores per-drive SQLite metadata.
+    File transfers are handled only by GramJS in the browser.
     """,
     version="1.0.0",
     lifespan=lifespan,
@@ -104,23 +86,28 @@ settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
 # No-cache middleware to prevent browser caching
-class NoCacheMiddleware(BaseHTTPMiddleware):
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         return response
 
 
-app.add_middleware(NoCacheMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 # Include routers
@@ -133,7 +120,7 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "service": "Telegram Cloud Storage API",
+        "service": "TeleDrive Metadata API",
         "version": "1.0.0",
     }
 
@@ -143,19 +130,16 @@ async def health_check():
 async def root():
     """Root endpoint with API information."""
     return {
-        "name": "Telegram Cloud Storage API",
+        "name": "TeleDrive Metadata API",
         "version": "1.0.0",
         "docs": "/docs",
         "endpoints": {
-            "upload_init": "POST /api/v1/upload/init",
-            "upload_chunk": "POST /api/v1/upload/chunk/{file_id}",
-            "upload_simple": "POST /api/v1/upload/simple",
+            "auth_challenge": "POST /api/v1/auth/challenge",
+            "register_metadata": "POST /api/v1/files/register",
             "list_files": "GET /api/v1/files",
             "get_file": "GET /api/v1/files/{file_id}",
-            "delete_file": "DELETE /api/v1/files/{file_id}",
-            "download": "GET /api/v1/download/{file_id}",
-            "gatekeeper": "GET /api/v1/download/gatekeeper/{file_id}",
-            "create_link": "POST /api/v1/download/gatekeeper",
+            "trash_file": "DELETE /api/v1/files/{file_id}",
+            "purge_metadata": "DELETE /api/v1/files/{file_id}/purge",
         },
     }
 
@@ -167,10 +151,9 @@ async def http_exception_handler_with_logging(
 ):
     """Log every 5xx HTTPException with the traceback of what actually failed.
 
-    Routes report internal errors as `raise HTTPException(500, str(e))` from inside an
-    `except` block. That strips the traceback from the response but Python still keeps
-    the original exception on `__context__`, so we can recover it here instead of
-    adding a logger call to all 14 raise sites (and every future one).
+    Route-level 5xx responses are deliberately generic. Python still keeps the
+    original exception on `__context__`, allowing internal diagnostics without
+    disclosing database paths or exception messages to API callers.
 
     Without this, a 500 leaves nothing behind but a uvicorn access line: 199 of them on
     2026-08-01 turned out to be a dead `./backend` bind mount, and the only trace of
@@ -191,7 +174,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         f"Unhandled exception on {request.method} {request.url.path}: {exc}"
     )
     return JSONResponse(
-        status_code=500, content={"error": "Internal server error", "detail": str(exc)}
+        status_code=500, content={"detail": "Internal server error"}
     )
 
 

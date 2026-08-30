@@ -1,16 +1,13 @@
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
-from typing import Optional, Literal
-from pydantic import BaseModel, Field
-from datetime import datetime
-
-from app.models.schemas import FileListResponse, FileInfo, FileType
-from app.services import get_file_service, get_bot_service
+from typing import Annotated, Optional, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
+from app.models.schemas import FileListResponse, FileInfo
+from app.services import get_file_service
 from app.services.database import get_database
 from app.auth import get_current_user, create_jwt
 from app.services import bot_challenge
 from loguru import logger
-import asyncio
 
 # Thumbnails are served entirely browser-side: the frontend downloads each
 # file's embedded thumb via GramJS and caches it in IndexedDB (see
@@ -28,35 +25,63 @@ class LoginResponse(BaseModel):
 
 
 class CheckHashesRequest(BaseModel):
-    hashes: list[str] = Field(..., max_length=1000)
+    hashes: list[
+        Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")]
+    ] = Field(..., max_length=1000)
 
 
 class RegisterFileRequest(BaseModel):
-    filename: str
-    filesize: int
-    mime_type: Optional[str] = None
-    message_id: int
-    file_id: str
-    access_hash: Optional[str] = None
-    parent_id: Optional[str] = None
+    filename: str = Field(..., min_length=1, max_length=255)
+    filesize: int = Field(..., ge=0, le=9_223_372_036_854_775_807)
+    mime_type: Optional[str] = Field(None, max_length=255)
+    message_id: int = Field(..., gt=0)
+    file_id: str = Field(..., min_length=1, max_length=512)
+    access_hash: Optional[str] = Field(None, max_length=512)
+    parent_id: Optional[str] = Field(None, max_length=512)
     has_thumbnail: bool = False
     is_split_file: bool = False
-    original_name: Optional[str] = None
-    part_index: Optional[int] = None
-    total_parts: Optional[int] = None
-    split_group_id: Optional[str] = None
-    file_hash: Optional[str] = None
-    telegram_user_id: Optional[int] = None  # which linked account stores the message
+    original_name: Optional[str] = Field(None, max_length=255)
+    part_index: Optional[int] = Field(None, ge=0)
+    total_parts: Optional[int] = Field(None, gt=0)
+    split_group_id: Optional[str] = Field(None, max_length=512)
+    file_hash: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{64}$")
+    telegram_user_id: Optional[int] = Field(None, gt=0)
 
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        value = value.strip()
+        if not value or "/" in value or "\\" in value or "\x00" in value:
+            raise ValueError("Invalid filename")
+        return value
+
+    @model_validator(mode="after")
+    def validate_split_metadata(self):
+        if self.is_split_file:
+            if (
+                self.part_index is None
+                or self.total_parts is None
+                or not self.split_group_id
+                or self.part_index >= self.total_parts
+            ):
+                raise ValueError("Invalid split file metadata")
+        return self
 
 class CreateFolderRequest(BaseModel):
-    name: str
-    parent_id: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=255)
+    parent_id: Optional[str] = Field(None, max_length=512)
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value or "/" in value or "\\" in value or "\x00" in value:
+            raise ValueError("Invalid folder name")
+        return value
 
 class UpdateFileRequest(BaseModel):
-    parent_id: Optional[str] = None
-    filename: Optional[str] = None
+    parent_id: Optional[str] = Field(None, max_length=512)
+    filename: Optional[str] = Field(None, max_length=255)
 
 
 class ChallengeResponse(BaseModel):
@@ -66,7 +91,7 @@ class ChallengeResponse(BaseModel):
 
 
 class VerifyRequest(BaseModel):
-    nonce: str
+    nonce: str = Field(..., min_length=1, max_length=128)
 
 
 @router.post("/auth/challenge", response_model=ChallengeResponse)
@@ -77,8 +102,12 @@ async def auth_challenge():
             status_code=503,
             detail="Bot login unavailable — set TELEGRAM_BOT_TOKEN in .env (create a bot via @BotFather)",
         )
+    try:
+        nonce = bot_challenge.new_challenge()
+    except bot_challenge.ChallengeCapacityError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return ChallengeResponse(
-        nonce=bot_challenge.new_challenge(),
+        nonce=nonce,
         bot_username=bot_challenge.bot_username,
         expires_in=bot_challenge.TTL_SECONDS,
     )
@@ -123,8 +152,12 @@ async def account_challenge(current_user: int = Depends(get_current_user)):
     """Same one-time nonce flow as login — the account to be linked DMs it to the bot."""
     if not bot_challenge.bot_username:
         raise HTTPException(status_code=503, detail="Bot linking unavailable — set TELEGRAM_BOT_TOKEN in .env")
+    try:
+        nonce = bot_challenge.new_challenge()
+    except bot_challenge.ChallengeCapacityError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return ChallengeResponse(
-        nonce=bot_challenge.new_challenge(),
+        nonce=nonce,
         bot_username=bot_challenge.bot_username,
         expires_in=bot_challenge.TTL_SECONDS,
     )
@@ -180,7 +213,11 @@ async def unlink_account(tg_user_id: int, current_user: int = Depends(get_curren
 
 @router.get("/files/check-hash")
 async def check_file_hash(
-    hash: str = Query(..., description="SHA-256 hex digest of the file"),
+    hash: str = Query(
+        ...,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="SHA-256 hex digest of the file",
+    ),
     current_user: int = Depends(get_current_user),
 ):
     """Check if a file with this SHA-256 hash already exists for the current user."""
@@ -251,19 +288,10 @@ async def register_file(
             file_hash=request.file_hash,
         )
         return file_info
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/files/upload")
-async def upload_file_endpoint(file: UploadFile = File(...)):
-    """DEPRECATED: Use frontend GramJS to upload directly to Telegram, then call /files/register with metadata."""
-    # This endpoint is deprecated. Frontend should use GramJS for direct Telegram uploads.
-    # See AGENTS.md architecture: frontend -> Telegram (GramJS) -> backend (metadata only)
-    raise HTTPException(
-        status_code=410, 
-        detail="This endpoint is deprecated. Use frontend GramJS to upload directly to Telegram, then call /files/register with metadata."
-    )
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.get("/files", response_model=FileListResponse)
@@ -303,7 +331,7 @@ async def list_files(
             page_size=page_size
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.get("/files/{file_id}", response_model=FileInfo)
@@ -317,18 +345,7 @@ async def get_file_info(file_id: str, current_user: int = Depends(get_current_us
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def _delete_telegram_messages(message_ids: list) -> None:
-    """Best-effort deletion of Telegram messages — never fails the request."""
-    if not message_ids:
-        return
-    try:
-        bot_service = await get_bot_service()
-        await bot_service.delete_messages(message_ids)
-    except Exception as e:
-        logger.warning(f"Telegram message delete failed (non-fatal): {e}")
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.delete("/files/{file_id}")
@@ -345,7 +362,7 @@ async def delete_file(file_id: str, current_user: int = Depends(get_current_user
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.post("/files/{file_id}/restore", response_model=FileInfo)
@@ -363,36 +380,46 @@ async def restore_file(file_id: str, current_user: int = Depends(get_current_use
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.delete("/files/{file_id}/purge")
 async def purge_file(file_id: str, current_user: int = Depends(get_current_user)):
-    """Permanently delete a trashed item (and its subtree), including its Telegram messages."""
+    """Permanently delete only this drive's SQLite metadata.
+
+    Telegram Saved Messages are intentionally retained.  The metadata backend
+    never opens a Telegram user session and never deletes Telegram messages.
+    """
     try:
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id, owner_id=current_user)
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
 
-        deleted_count, message_ids = await file_service.purge_file(file_id, current_user)
-        await _delete_telegram_messages(message_ids)
-        return {"message": "Permanently deleted", "file_id": file_id, "records_deleted": deleted_count}
+        deleted_count = await file_service.purge_file(file_id, current_user)
+        return {
+            "message": "Metadata permanently deleted; Telegram messages retained",
+            "file_id": file_id,
+            "records_deleted": deleted_count,
+        }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.delete("/files")
 async def delete_all_files(current_user: int = Depends(get_current_user)):
-    """Delete all files and folders belonging to the authenticated user."""
+    """Delete one drive's metadata; Telegram messages are retained."""
     try:
         file_service = get_file_service()
         count = await file_service.delete_all(owner_id=current_user)
-        return {"message": "All files deleted", "count": count}
+        return {
+            "message": "All metadata deleted; Telegram messages retained",
+            "count": count,
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.patch("/files/{file_id}")
@@ -417,19 +444,23 @@ async def update_file(file_id: str, request: UpdateFileRequest, current_user: in
             if '/' in new_filename or '\\' in new_filename:
                 raise HTTPException(status_code=400, detail="Filename cannot contain / or \\")
 
-        updated_info = await file_service.update_file(
-            file_id,
-            parent_id=request.parent_id,
-            set_parent_id='parent_id' in request.model_fields_set,
-            filename=new_filename,
-        )
+        try:
+            updated_info = await file_service.update_file(
+                file_id,
+                current_user,
+                parent_id=request.parent_id,
+                set_parent_id='parent_id' in request.model_fields_set,
+                filename=new_filename,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve)) from ve
 
         logger.info(f"File updated successfully: {file_id}, parent_id set={'parent_id' in request.model_fields_set}, parent_id={request.parent_id}, filename={new_filename}")
         return updated_info
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 
@@ -458,7 +489,7 @@ async def get_download_info(file_id: str, current_user: int = Depends(get_curren
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.post("/folders", response_model=FileInfo)
@@ -467,8 +498,10 @@ async def create_folder(request: CreateFolderRequest, current_user: int = Depend
         file_service = get_file_service()
         folder = await file_service.create_folder(request.name, request.parent_id, owner_id=current_user)
         return folder
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.get("/folders", response_model=FileListResponse)
@@ -495,7 +528,7 @@ async def list_folders(
             page_size=len(folders)
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.delete("/folders/{folder_id}")
@@ -515,7 +548,7 @@ async def delete_folder(folder_id: str, current_user: int = Depends(get_current_
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.get("/files/by-split-group/{split_group_id}", response_model=FileListResponse)
@@ -544,4 +577,4 @@ async def get_files_by_split_group(split_group_id: str, current_user: int = Depe
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error") from e

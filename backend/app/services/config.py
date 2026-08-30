@@ -1,33 +1,34 @@
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 
 class Settings(BaseSettings):
-    # Telegram API (REQUIRED)
-    telegram_api_id: int
-    telegram_api_hash: str
-    
-    # Telegram Session String (REQUIRED for MTProto uploads)
-    telegram_session_string: Optional[str] = None
-    
     # Bot Token — required for login. The browser DMs a one-time nonce to this
     # bot to prove which Telegram account it is; without it /auth/challenge 503s.
     telegram_bot_token: Optional[str] = None
+
+    # Required and stable across restarts. Empty or short signing keys would
+    # allow forged sessions or invalidate every session after a restart.
+    jwt_secret: str
     
     # Server
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     
-    # Upload settings
-    max_file_size: int = 2 * 1024 * 1024 * 1024  # 2GB default
-    chunk_size: int = 10 * 1024 * 1024  # 10MB chunks
-    
     # CORS
-    cors_origins: list = ["*"]
-    
-    # File storage (in-memory for demo, use database in production)
-    enable_memory_storage: bool = True
+    cors_origins: list[str] = [
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ]
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def validate_jwt_secret(cls, value: str) -> str:
+        if len(value.encode("utf-8")) < 32:
+            raise ValueError("JWT_SECRET must contain at least 32 bytes")
+        return value
     
     model_config = SettingsConfigDict(
         env_file="../.env",

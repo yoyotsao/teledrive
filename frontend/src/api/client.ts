@@ -1,13 +1,14 @@
 import axios from 'axios';
-import { FileListResponse, FileInfo, UploadResult } from '../types';
+import { FileListResponse, FileInfo } from '../types';
+import { loadJwt } from '../lib/gramjs';
 
 const client = axios.create({
   baseURL: '/api/v1',
-  timeout: 300000, // 5 min for large uploads
+  timeout: 30000, // metadata requests only; file bytes never use this client
 });
 
 client.interceptors.request.use((config) => {
-  const token = localStorage.getItem('tg_jwt');
+  const token = loadJwt();
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
@@ -129,18 +130,6 @@ export const api = {
 
   getFile: async (fileId: string): Promise<FileInfo> => {
     const response = await client.get<FileInfo>(`/files/${fileId}`);
-    return response.data;
-  },
-
-  uploadFile: async (file: File, parentId?: string): Promise<UploadResult> => {
-    const formData = new FormData();
-    formData.append('file', file);
-    if (parentId !== undefined) {
-      formData.append('parent_id', parentId);
-    }
-    const response = await client.post<UploadResult>('/files/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
     return response.data;
   },
 

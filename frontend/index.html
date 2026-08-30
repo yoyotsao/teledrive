@@ -26,73 +26,15 @@
          "Cannot read properties of undefined (reading 'isBuffer')" before React ever renders.
          Regenerate via `node scripts/build-buffer-polyfill.mjs` if the `buffer` dependency changes. -->
     <script src="/buffer-polyfill.js"></script>
-    <!-- Runs synchronously before any ES module so GramJS W3CWebSocket captures the patched constructor.
-         On HTTPS, browsers block ws:// (mixed content). Maps Telegram DC IPs to their official
-         wss:// domain endpoints (pluto/venus/aurora/vesta/flora.web.telegram.org) so the browser
-         connects directly to Telegram with valid TLS — no backend proxy needed. -->
-    <script>
-    // GramJS calls alert() when it receives a Telegram update type it doesn't know.
-    // These are non-fatal (new API objects the installed GramJS version lacks TL definitions for).
-    // Intercept and log as console.warn instead of blocking the user with a dialog.
-    (function () {
-      var _nativeAlert = window.alert;
-      window.alert = function (msg) {
-        if (typeof msg === 'string' && (
-          msg.indexOf('Missing MTProto Entity') !== -1 ||
-          msg.indexOf('Could not find a matching Constructor ID') !== -1
-        )) {
-          console.warn('[GramJS unknown TL] ' + msg);
-          return;
-        }
-        return _nativeAlert.call(window, msg);
-      };
-    })();
-    </script>
-    <script>
-    (function () {
-      if (window.location.protocol !== 'https:') return;
-
-      // Maps Telegram DC IP prefixes to official wss:// domain endpoints.
-      // These domains have valid TLS certs — same endpoints used by web.telegram.org.
-      function getTelegramDomain(hostname) {
-        if (hostname.startsWith('149.154.175.')) {
-          var last = parseInt(hostname.split('.')[3], 10);
-          return last >= 100 ? 'aurora.web.telegram.org' : 'pluto.web.telegram.org';
-        }
-        if (hostname.startsWith('149.154.167.') || hostname.startsWith('149.154.166.')) {
-          var last = parseInt(hostname.split('.')[3], 10);
-          return last >= 91 ? 'vesta.web.telegram.org' : 'venus.web.telegram.org';
-        }
-        if (hostname.startsWith('91.108.56.') || hostname.startsWith('91.108.4.')) {
-          return 'flora.web.telegram.org';
-        }
-        return null;
-      }
-
-      var NativeWS = window.WebSocket;
-      function PatchedWebSocket(url, protocols) {
-        if (typeof url === 'string' && url.indexOf('/apiws') !== -1) {
-          try {
-            var p = new URL(url);
-            // If it's a raw DC IP, map to named domain. Otherwise keep the hostname.
-            // Always upgrade to wss:// — *.web.telegram.org supports WSS directly.
-            var domain = getTelegramDomain(p.hostname) || p.hostname;
-            url = 'wss://' + domain + '/apiws';
-          } catch (e) {}
-        }
-        if (protocols !== undefined) {
-          return new NativeWS(url, protocols);
-        }
-        return new NativeWS(url);
-      }
-      PatchedWebSocket.prototype = NativeWS.prototype;
-      PatchedWebSocket.CONNECTING = NativeWS.CONNECTING;
-      PatchedWebSocket.OPEN       = NativeWS.OPEN;
-      PatchedWebSocket.CLOSING    = NativeWS.CLOSING;
-      PatchedWebSocket.CLOSED     = NativeWS.CLOSED;
-      window.WebSocket = PatchedWebSocket;
-    })();
-    </script>
+    <!-- Both run synchronously before any ES module. Separate files, not inline
+         blocks: the production CSP is `script-src 'self'` (security-headers.conf),
+         which refuses inline scripts — and the WebSocket patch below is what keeps
+         MTProto reachable over HTTPS at all. -->
+    <script src="/gramjs-alert-filter.js"></script>
+    <!-- On HTTPS, browsers block ws:// (mixed content). Maps Telegram DC IPs to their
+         official wss:// domain endpoints (pluto/venus/aurora/vesta/flora.web.telegram.org)
+         so the browser connects directly to Telegram with valid TLS — no backend proxy. -->
+    <script src="/telegram-wss-patch.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

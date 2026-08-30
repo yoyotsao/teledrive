@@ -1,14 +1,13 @@
-import os
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, Header
-from jose import JWTError, jwt
+import jwt
+from app.services.config import get_settings
 
-JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+JWT_SECRET = get_settings().jwt_secret
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_DAYS = 30
+JWT_EXPIRE_HOURS = 24
 
 
 def create_jwt(owner_id: int, acting_account_id: Optional[int] = None) -> str:
@@ -18,16 +17,21 @@ def create_jwt(owner_id: int, acting_account_id: Optional[int] = None) -> str:
     payload = {
         "user_id": owner_id,
         "acting_account_id": acting_account_id if acting_account_id is not None else owner_id,
-        "exp": datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def decode_jwt(token: str) -> int:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["exp", "user_id"]},
+        )
         return int(payload["user_id"])
-    except (JWTError, KeyError, ValueError):
+    except (jwt.PyJWTError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 

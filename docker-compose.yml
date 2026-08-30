@@ -4,12 +4,16 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
-    env_file: .env
+      - "127.0.0.1:8000:8000"
     environment:
       # Keep SQLite off the ./backend bind mount — see DB_PATH in
       # app/services/database.py for why that combination breaks.
-      - TELEDRIVE_DB_PATH=/data/teledrive.db
+      TELEDRIVE_DB_PATH: /data/teledrive.db
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: 8000
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      JWT_SECRET: ${JWT_SECRET}
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:3000","http://127.0.0.1:3000"]}'
     volumes:
       - ./backend:/app
       - /app/venv

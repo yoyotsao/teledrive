@@ -1,29 +1,17 @@
-import os
 import hashlib
 from typing import Optional, List, Dict
 from datetime import datetime
 from pathlib import Path
 from loguru import logger
 
-from app.models.schemas import (
-    FileInfo, FileType, UploadSession, 
-    UploadStatus, UploadInitRequest
-)
-from app.services.config import get_settings
+from app.models.schemas import FileInfo, FileType
 from app.services.database import get_database, Database
 
 
 class FileService:
-    """Service for file operations, chunking, and metadata storage."""
+    """SQLite metadata operations for browser-managed Telegram files."""
     
     def __init__(self):
-        settings = get_settings()
-        self.chunk_size = settings.chunk_size
-        self.max_file_size = settings.max_file_size
-        
-        # In-memory cache for upload sessions (short-lived, no need to persist)
-        self._upload_sessions: Dict[str, UploadSession] = {}
-        
         # Database instance for persistent file metadata
         self._db: Optional[Database] = None
         
@@ -115,107 +103,6 @@ class FileService:
         unique_str = f"{filename}:{filesize}:{datetime.utcnow().timestamp()}"
         return hashlib.sha256(unique_str.encode()).hexdigest()[:16]
     
-    async def init_upload(
-        self, 
-        request: UploadInitRequest
-    ) -> tuple[str, bool]:
-        """
-        Initialize an upload session.
-        Returns (file_id, requires_chunking).
-        """
-        file_id = self._generate_file_id(request.filename, request.filesize)
-        
-        # Check if chunking is required
-        requires_chunking = request.filesize > self.chunk_size
-        total_chunks = (request.filesize + self.chunk_size - 1) // self.chunk_size
-        
-        session = UploadSession(
-            file_id=file_id,
-            filename=request.filename,
-            filesize=request.filesize,
-            mime_type=request.mime_type,
-            total_chunks=total_chunks if requires_chunking else 1,
-            status=UploadStatus.PENDING
-        )
-        
-        self._upload_sessions[file_id] = session
-        
-        logger.info(
-            f"Upload initialized: {file_id}, "
-            f"filename: {request.filename}, "
-            f"size: {request.filesize}, "
-            f"requires_chunking: {requires_chunking}"
-        )
-        
-        return file_id, requires_chunking
-    
-    async def process_chunk(
-        self,
-        file_id: str,
-        chunk_data: bytes,
-        chunk_index: int,
-        is_final: bool
-    ) -> dict:
-        """
-        Process an uploaded chunk.
-        Returns progress info.
-        """
-        if file_id not in self._upload_sessions:
-            raise ValueError(f"Upload session not found: {file_id}")
-        
-        session = self._upload_sessions[file_id]
-        
-        # In a real implementation, you'd store chunks to disk or memory
-        # and assemble them. Here we track progress.
-        session.uploaded_chunks += 1
-        
-        if is_final:
-            session.status = UploadStatus.COMPLETED
-            
-            # Create file metadata
-            db = await self._get_db()
-            file_type = self._detect_file_type(session.mime_type, session.filename)
-            
-            file_info = FileInfo(
-                file_id=session.telegram_file_id or file_id,
-                filename=session.filename,
-                filesize=session.filesize,
-                mime_type=session.mime_type,
-                file_type=file_type,
-                telegram_message_id=session.message_id,
-                created_at=session.created_at,
-                direct_url=None,
-                access_hash=None,
-                parent_id=None,
-                isDir=False
-            )
-            
-            # Store in SQLite
-            await db.insert_file(
-                file_id=file_info.file_id,
-                filename=file_info.filename,
-                filesize=file_info.filesize,
-                mime_type=file_info.mime_type,
-                file_type=file_info.file_type.value,
-            telegram_message_id=file_info.telegram_message_id,
-            has_thumbnail=file_info.has_thumbnail,
-            created_at=file_info.created_at.isoformat(),
-            direct_url=file_info.direct_url,
-                access_hash=file_info.access_hash,
-                parent_id=file_info.parent_id,
-                is_dir=file_info.isDir
-            )
-
-            logger.info(f"Upload completed: {file_id}")
-        
-        return {
-            "file_id": file_id,
-            "chunk_index": chunk_index,
-            "uploaded_chunks": session.uploaded_chunks,
-            "total_chunks": session.total_chunks,
-            "is_complete": is_final
-        }
-    
     async def register_uploaded_file(
         self,
         filename: str,
@@ -245,6 +132,11 @@ class FileService:
         file_type = self._detect_file_type(mime_type, filename)
         created_at = datetime.utcnow()
 
+        if parent_id:
+            parent = await db.get_file(parent_id, owner_id=owner_id)
+            if not parent or not parent.get("isDir") or parent.get("trashed_at"):
+                raise ValueError("Parent folder not found")
+
         # Replace any live file with the same name+parent — split uploads included.
         # Split files used to be skipped here, which is how one folder accumulated the
         # same multi-GB video five or six times: every re-upload appended a whole new
@@ -266,7 +158,9 @@ class FileService:
                     f"Replacing existing file: {filename}, {len(stale)} row(s) "
                     f"in {len(old_groups)} group(s): {old_groups}"
                 )
-                await db.delete_files_by_ids([r['file_id'] for r in stale])
+                await db.delete_files_by_ids(
+                    [r['file_id'] for r in stale], owner_id=owner_id
+                )
 
         file_info = FileInfo(
             file_id=file_id,
@@ -283,20 +177,6 @@ class FileService:
             isDir=False
         )
 
-        session = UploadSession(
-            file_id=file_id,
-            filename=filename,
-            filesize=filesize,
-            mime_type=mime_type,
-            total_chunks=1,
-            uploaded_chunks=1,
-            status=UploadStatus.COMPLETED,
-            telegram_file_id=file_id,
-            message_id=message_id,
-            created_at=created_at
-        )
-        self._upload_sessions[file_id] = session
-        
         # Store in SQLite instead of memory
         await db.insert_file(
             file_id=file_info.file_id,
@@ -325,62 +205,6 @@ class FileService:
             f"Registered MTProto upload: {filename}, file_id: {file_id}, "
             f"has_thumbnail: {has_thumbnail}, stored on account {telegram_user_id}"
         )
-        
-        return file_info
-    
-    async def finalize_upload(
-        self,
-        file_id: str,
-        telegram_file_id: str,
-        message_id: int
-    ) -> FileInfo:
-        """Finalize an upload and create file metadata."""
-        db = await self._get_db()
-        session = self._upload_sessions.get(file_id)
-        
-        if not session:
-            raise ValueError(f"Upload session not found: {file_id}")
-        
-        session.status = UploadStatus.COMPLETED
-        session.telegram_file_id = telegram_file_id
-        session.message_id = message_id
-        
-        file_type = self._detect_file_type(session.mime_type, session.filename)
-        
-        file_info = FileInfo(
-            file_id=telegram_file_id,
-            filename=session.filename,
-            filesize=session.filesize,
-            mime_type=session.mime_type,
-            file_type=file_type,
-            telegram_message_id=message_id,
-            created_at=session.created_at,
-            direct_url=None,
-            access_hash=None,
-            parent_id=None,
-            isDir=False
-        )
-        
-        # Store in SQLite
-        await db.insert_file(
-            file_id=file_info.file_id,
-            filename=file_info.filename,
-            filesize=file_info.filesize,
-            mime_type=file_info.mime_type,
-            file_type=file_info.file_type.value,
-            telegram_message_id=file_info.telegram_message_id,
-                has_thumbnail=file_info.has_thumbnail,
-                created_at=file_info.created_at.isoformat(),
-            direct_url=file_info.direct_url,
-            access_hash=file_info.access_hash,
-            parent_id=file_info.parent_id,
-            is_dir=file_info.isDir
-        )
-        
-        # Clean up session
-        del self._upload_sessions[file_id]
-        
-        logger.info(f"Upload finalized: {file_id}, telegram_file_id: {telegram_file_id}")
         
         return file_info
     
@@ -464,7 +288,10 @@ class FileService:
         """Create a folder entry in the database, reusing existing record if same name+parent already exists."""
         logger.info(f"create_folder called: name={name}, parent_id={parent_id}")
         db = await self._get_db()
-        logger.info(f"Got database: {db.db_path}")
+        if parent_id:
+            parent = await db.get_file(parent_id, owner_id=owner_id)
+            if not parent or not parent.get("isDir") or parent.get("trashed_at"):
+                raise ValueError("Parent folder not found")
 
         existing = await db.find_folder_by_name_and_parent(name, parent_id, owner_id=owner_id)
         if existing:
@@ -510,40 +337,10 @@ class FileService:
         
         return folder_info
 
-    async def delete_file(self, file_id: str) -> bool:
-        """Delete a file from metadata."""
-        db = await self._get_db()
-        result = await db.delete_file(file_id)
-        if result:
-            logger.info(f"File deleted: {file_id}")
-        return result
-
-    async def delete_folder(self, folder_id: str) -> tuple[int, List[int]]:
-        """Recursively delete a folder and everything inside it.
-
-        Returns (deleted_record_count, telegram_message_ids) so the caller can
-        clean up the Telegram messages of the contained files.
-        """
-        db = await self._get_db()
-        row = await db.get_file(folder_id)
-        if not row or not row.get('isDir'):
-            return 0, []
-
-        subtree = await db.get_subtree(folder_id)
-        message_ids = [
-            mid
-            for r in subtree
-            for mid in (r.get('telegram_message_id'),)
-            if mid
-        ]
-        deleted = await db.delete_files_by_ids([r['file_id'] for r in subtree])
-        logger.info(f"Folder deleted recursively: {folder_id} ({deleted} records)")
-        return deleted, message_ids
-
     async def _collect_subtree_rows(self, root_id: str, owner_id: int) -> List[dict]:
         """Root row + all descendants, with every split part expanded in."""
         db = await self._get_db()
-        rows = await db.get_subtree(root_id)
+        rows = await db.get_subtree(root_id, owner_id)
         seen = {r['file_id'] for r in rows}
         group_ids = {r.get('split_group_id') for r in rows if r.get('split_group_id')}
         for gid in group_ids:
@@ -558,7 +355,7 @@ class FileService:
         db = await self._get_db()
         rows = await self._collect_subtree_rows(file_id, owner_id)
         ids = [r['file_id'] for r in rows]
-        await db.set_trashed(ids, datetime.utcnow().isoformat())
+        await db.set_trashed(ids, datetime.utcnow().isoformat(), owner_id)
         logger.info(f"Trashed {len(ids)} item(s) under {file_id}")
         return len(ids)
 
@@ -572,45 +369,63 @@ class FileService:
             raise ValueError("Item is not in the trash")
 
         rows = await self._collect_subtree_rows(file_id, owner_id)
-        await db.set_trashed([r['file_id'] for r in rows], None)
+        await db.set_trashed([r['file_id'] for r in rows], None, owner_id)
 
         parent_id = row.get('parent_id')
         if parent_id:
             parent = await db.get_file(parent_id, owner_id=owner_id)
             if not parent or parent.get('trashed_at'):
-                await db.update_file(file_id, parent_id=None, set_parent_id=True)
+                await db.update_file(
+                    file_id, owner_id, parent_id=None, set_parent_id=True
+                )
 
         restored = await db.get_file(file_id, owner_id=owner_id)
         logger.info(f"Restored {len(rows)} item(s) under {file_id}")
         return self._row_to_file_info(restored)
 
-    async def purge_file(self, file_id: str, owner_id: int) -> tuple[int, List[int]]:
-        """Permanently delete a subtree. Returns (records_deleted, telegram_message_ids) for cleanup."""
+    async def purge_file(self, file_id: str, owner_id: int) -> int:
+        """Permanently delete a subtree's metadata for one drive.
+
+        Telegram messages are deliberately retained.  Returning message IDs
+        would invite callers to reintroduce a Telegram deletion side effect,
+        so this boundary returns only the number of metadata rows removed.
+        """
         db = await self._get_db()
         rows = await self._collect_subtree_rows(file_id, owner_id)
         ids = [r['file_id'] for r in rows]
-        message_ids = [r['telegram_message_id'] for r in rows if r.get('telegram_message_id')]
-        deleted = await db.delete_files_by_ids(ids)
-        logger.info(f"Purged {deleted} record(s) under {file_id}")
-        return deleted, message_ids
+        deleted = await db.delete_files_by_ids(ids, owner_id)
+        logger.info(f"Purged {deleted} metadata record(s) under {file_id}; Telegram messages retained")
+        return deleted
 
-    async def delete_all(self, owner_id: int = 0) -> int:
-        """Delete every file and folder in the drive (or all drives if 0)."""
+    async def delete_all(self, owner_id: int) -> int:
+        """Delete every metadata row in one drive."""
         db = await self._get_db()
-        if owner_id:
-            count = await db.delete_user_files(owner_id)
-        else:
-            count = await db.delete_all_files()
-        logger.info(f"All files deleted: {count} items")
+        count = await db.delete_user_files(owner_id)
+        logger.info(f"Deleted {count} metadata record(s); Telegram messages retained")
         return count
 
-    async def update_file(self, file_id: str, parent_id: Optional[str] = None, set_parent_id: bool = False, filename: Optional[str] = None) -> Optional[FileInfo]:
+    async def update_file(self, file_id: str, owner_id: int, parent_id: Optional[str] = None, set_parent_id: bool = False, filename: Optional[str] = None) -> Optional[FileInfo]:
         """Update file metadata."""
         db = await self._get_db()
         logger.info(f"update_file called: file_id={file_id}, parent_id={parent_id}, set_parent_id={set_parent_id}, filename={filename}")
 
+        current = await db.get_file(file_id, owner_id=owner_id)
+        if not current:
+            return None
+        if set_parent_id and parent_id is not None:
+            parent = await db.get_file(parent_id, owner_id=owner_id)
+            if not parent or not parent.get("isDir") or parent.get("trashed_at"):
+                raise ValueError("Parent folder not found")
+            if parent_id == file_id:
+                raise ValueError("An item cannot be its own parent")
+            if current.get("isDir"):
+                descendants = await db.get_subtree(file_id, owner_id)
+                if parent_id in {row["file_id"] for row in descendants}:
+                    raise ValueError("A folder cannot be moved into its descendant")
+
         updated_row = await db.update_file(
             file_id,
+            owner_id,
             parent_id=parent_id,
             set_parent_id=set_parent_id,
             filename=filename,
@@ -623,11 +438,6 @@ class FileService:
         logger.info(f"File updated in database: {file_id}")
         return self._row_to_file_info(updated_row)
     
-    def get_chunk_size(self) -> int:
-        """Get the configured chunk size."""
-        return self.chunk_size
-
-
 # Singleton instance
 _file_service: Optional[FileService] = None
 

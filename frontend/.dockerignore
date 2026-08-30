@@ -2,3 +2,7 @@ node_modules/
 dist/
 .vite/
 .env
+tests/
+test-results/
+playwright-report/
+**/storageState.json

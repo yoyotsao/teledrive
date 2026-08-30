@@ -1,18 +1,10 @@
 # FastAPI and server
 fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.9
-
-# Telethon for MTProto (direct uploads/downloads - no Docker needed)
-telethon>=1.34.0
+uvicorn>=0.30.0
 
 # Pydantic models (compatible with Python 3.13)
 pydantic>=2.10.0
 pydantic-settings>=2.7.0
-
-# File handling
-python-magic>=0.4.27
-aiofiles>=24.1.0
 
 # Environment variables
 python-dotenv>=1.0.0
@@ -26,8 +18,5 @@ loguru>=0.7.2
 # Database
 aiosqlite>=0.20.0
 
-# WebSocket proxy (for HTTPS — browsers block ws:// from https:// pages)
-websockets>=12.0
-
-# JWT authentication
-python-jose[cryptography]>=3.3.0
+# JWT authentication (avoid python-jose's unfixed ecdsa dependency)
+PyJWT[crypto]>=2.10.1

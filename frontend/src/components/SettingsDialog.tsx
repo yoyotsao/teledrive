@@ -47,7 +47,7 @@ export default function SettingsDialog({ onClose }: Props) {
     setLinking('等待 Telegram 驗證...');
     try {
       const { nonce, bot_username } = await api.requestAccountChallenge();
-      const messageId = await client.sendAuthChallenge(bot_username, nonce);
+      await client.sendAuthChallenge(bot_username, nonce);
 
       let linked: LinkedAccount | null = null;
       for (let i = 0; i < 60 && !linked; i++) {
@@ -56,9 +56,8 @@ export default function SettingsDialog({ onClose }: Props) {
       }
       if (!linked) throw new Error('Telegram 驗證逾時，請重試');
 
-      client.deleteAuthChallenge(bot_username, messageId);
       adoptClient(linked.telegram_user_id, client);
-      saveAccount({
+      await saveAccount({
         id: linked.telegram_user_id,
         label: linked.label ?? String(linked.telegram_user_id),
         session: sessionString,
@@ -77,7 +76,7 @@ export default function SettingsDialog({ onClose }: Props) {
     setError('');
     try {
       await api.unlinkAccount(row.telegram_user_id);
-      removeAccount(row.telegram_user_id);
+      await removeAccount(row.telegram_user_id);
       await reload();
     } catch (err: any) {
       // 409 carries the reason (usually "still stores N files") — show it verbatim.

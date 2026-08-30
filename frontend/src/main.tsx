@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import { getPrimaryClient, getClientFor, getAllClients } from './lib/gramjs';
+import { getPrimaryClient, getClientFor, getAllClients, loadJwt } from './lib/gramjs';
 import { StreamGate } from './lib/streamGate';
 
 // Global state for keepalive mechanism
@@ -345,7 +345,7 @@ async function handleGetSplitMetadata(event: MessageEvent) {
   const { splitGroupId } = event.data;
   const port = event.ports[0];
   try {
-    const token = localStorage.getItem('tg_jwt');
+    const token = loadJwt();
     const response = await fetch(`/api/v1/files?split_group_id=${encodeURIComponent(splitGroupId)}&page_size=100`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });

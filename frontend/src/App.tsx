@@ -11,7 +11,8 @@ import { useTheme } from './hooks/useTheme';
 import { api } from './api/client';
 import {
   TelegramClientManager, adoptClient, getClientFor, resetAllClients,
-  loadAccounts, saveAccount, loadJwt, saveJwt, clearCredentialsFromStorage,
+  initializeCredentialStore, loadAccounts, saveAccount, loadJwt, saveJwt,
+  clearCredentialsFromStorage,
 } from './lib/gramjs';
 
 type AuthState = 'loading' | 'unauthenticated' | 'authenticated';
@@ -27,40 +28,45 @@ function App() {
   const { theme, toggleTheme } = useTheme();
 
   useEffect(() => {
-    const accounts = loadAccounts();
-    if (accounts.length === 0 || !loadJwt()) {
-      setAuthState('unauthenticated');
-      return;
-    }
-    // Show the file browser immediately — the file list only needs the backend JWT.
-    // The Telegram MTProto handshake runs in the background; GramJS-dependent actions
-    // (thumbnails, upload, download, preview) await client.waitUntilReady() internally.
-    setAuthState('authenticated');
-    for (const account of accounts) {
-      const client = getClientFor(account.id);
-      client.initialize(API_ID, API_HASH, account.session)
-        .then(() => {
-          // Sessions migrated from the single-account era arrive with a
-          // placeholder id; initialize() resolves the real one via getMe().
-          if (client.accountId !== account.id) {
-            adoptClient(client.accountId, client);
-            saveAccount({ ...account, id: client.accountId });
-          }
-        })
-        // One account failing must not log the whole drive out — the others
-        // still work, and the settings dialog shows which one is offline.
-        .catch((err) => {
-          console.warn('[App] Account', account.id, 'failed to connect:', err);
-          client.offline = true;
-        });
-    }
+    let cancelled = false;
+    void initializeCredentialStore()
+      .then(() => {
+        if (cancelled) return;
+        const accounts = loadAccounts();
+        if (accounts.length === 0 || !loadJwt()) {
+          setAuthState('unauthenticated');
+          return;
+        }
+        // Show the file browser immediately — the file list only needs the backend JWT.
+        // GramJS-dependent actions await their own client handshake.
+        setAuthState('authenticated');
+        for (const account of accounts) {
+          const client = getClientFor(account.id);
+          client.initialize(API_ID, API_HASH, account.session)
+            .then(() => {
+              if (client.accountId !== account.id) {
+                adoptClient(client.accountId, client);
+                void saveAccount({ ...account, id: client.accountId });
+              }
+            })
+            .catch((err) => {
+              console.warn('[App] Account', account.id, 'failed to connect:', err);
+              client.offline = true;
+            });
+        }
+      })
+      .catch((err) => {
+        console.error('[App] Credential store unavailable:', err);
+        if (!cancelled) setAuthState('unauthenticated');
+      });
+    return () => { cancelled = true; };
   }, []);
 
   // Prove our identity to the backend by DMing a one-time nonce to its bot —
   // Telegram reports who sent it, so the session string stays in this browser.
   const handleLogin = async (sessionString: string, client: TelegramClientManager) => {
     const { nonce, bot_username } = await api.requestChallenge();
-    const messageId = await client.sendAuthChallenge(bot_username, nonce);
+    await client.sendAuthChallenge(bot_username, nonce);
 
     let loginResp = null;
     for (let i = 0; i < 60 && !loginResp; i++) {
@@ -69,17 +75,16 @@ function App() {
     }
     if (!loginResp) throw new Error('Telegram 驗證逾時，請重試');
 
-    client.deleteAuthChallenge(bot_username, messageId);
     const label = loginResp.username || loginResp.first_name || String(loginResp.user_id);
     adoptClient(loginResp.user_id, client);
-    saveAccount({ id: loginResp.user_id, label, session: sessionString });
-    saveJwt(loginResp.token);
+    await saveAccount({ id: loginResp.user_id, label, session: sessionString });
+    await saveJwt(loginResp.token);
     setUserName(loginResp.first_name || loginResp.username || String(loginResp.user_id));
     setAuthState('authenticated');
   };
 
-  const handleLogout = () => {
-    clearCredentialsFromStorage();
+  const handleLogout = async () => {
+    await clearCredentialsFromStorage();
     resetAllClients();
     setUserName('');
     setAuthState('unauthenticated');

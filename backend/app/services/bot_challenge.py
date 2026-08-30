@@ -18,6 +18,8 @@ from loguru import logger
 from app.services.config import get_settings
 
 TTL_SECONDS = 120
+MAX_PENDING_CHALLENGES = 1000
+MAX_VERIFIED_CHALLENGES = 1000
 _API = "https://api.telegram.org/bot{token}/{method}"
 
 _pending: dict[str, float] = {}   # nonce -> expiry timestamp
@@ -26,11 +28,26 @@ _verified: dict[str, dict] = {}   # nonce -> {user_id, username, first_name, exp
 bot_username: Optional[str] = None
 
 
+class ChallengeCapacityError(RuntimeError):
+    """The bounded in-memory challenge store is temporarily full."""
+
+
+def _prune_expired(now: Optional[float] = None) -> None:
+    """Remove expired entries from both stores before enforcing their caps."""
+    current = time.time() if now is None else now
+    for nonce, expiry in list(_pending.items()):
+        if expiry <= current:
+            del _pending[nonce]
+    for nonce, entry in list(_verified.items()):
+        if entry["expires"] <= current:
+            del _verified[nonce]
+
+
 def new_challenge() -> str:
     now = time.time()
-    for nonce, expiry in list(_pending.items()):
-        if expiry < now:
-            del _pending[nonce]
+    _prune_expired(now)
+    if len(_pending) >= MAX_PENDING_CHALLENGES:
+        raise ChallengeCapacityError("Too many active login challenges")
     nonce = secrets.token_urlsafe(16)
     _pending[nonce] = now + TTL_SECONDS
     return nonce
@@ -38,17 +55,22 @@ def new_challenge() -> str:
 
 def is_pending(nonce: str) -> bool:
     """True while we're still waiting for this nonce's message to arrive."""
-    return _pending.get(nonce, 0) > time.time()
+    _prune_expired()
+    return nonce in _pending
 
 
 def ingest_updates(updates: list) -> None:
     """Promote any pending nonce that arrived as a message text to verified."""
+    _prune_expired()
     for update in updates:
         msg = update.get("message") or {}
         text = (msg.get("text") or "").strip()
         sender = msg.get("from") or {}
         expiry = _pending.get(text)
         if expiry is None or not sender.get("id"):
+            continue
+        if len(_verified) >= MAX_VERIFIED_CHALLENGES:
+            logger.warning("Verified login challenge capacity reached; update ignored")
             continue
         del _pending[text]
         _verified[text] = {
@@ -61,8 +83,9 @@ def ingest_updates(updates: list) -> None:
 
 def take_verified(nonce: str) -> Optional[dict]:
     """Pop — a nonce buys exactly one JWT, and only inside its TTL."""
+    _prune_expired()
     entry = _verified.pop(nonce, None)
-    if entry is None or entry["expires"] < time.time():
+    if entry is None:
         return None
     return entry
 

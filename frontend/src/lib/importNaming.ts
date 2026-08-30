@@ -7,7 +7,7 @@
  * id and the (name, size, mime) triple Telegram reports, and the only signals
  * for "what do I call this?" are the names already taken in the target folder.
  *
- * Deliberately imports nothing so importNaming.selfcheck.ts can bundle it for
+ * Deliberately imports nothing so importNaming.test.ts can run it under
  * node. Scope is one import folder: an index is built from that folder's rows
  * and updated in place as the run registers files, so a name taken mid-run
  * counts exactly like a name that was already in the drive.

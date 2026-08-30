@@ -24,14 +24,38 @@ docker compose logs -f frontend  # follow frontend logs
 docker compose up --build
 ```
 
-### Frontend Build & Test
+### Tests
+
+Four layers; see `TESTING.md` for the full map. The default suite touches no
+Telegram account, no network, and leaves nothing behind.
+
+```bash
+node scripts/run-tests.mjs           # backend pytest + frontend vitest + isolated Playwright (~45s)
+node scripts/run-tests.mjs --smoke   # …plus the live-site @real suite (needs an interactive login)
+node scripts/run-tests.mjs --only=backend   # or unit / ui / smoke
+```
+
+Per layer:
+
+```bash
+cd backend  && python -m pytest      # API + service; temp SQLite, Telegram faked
+cd frontend && npm run test:unit     # Vitest over the pure logic in src/lib
+cd frontend && npm run test:e2e      # Playwright against an in-memory backend
+cd frontend && npm run test:e2e:smoke  # Playwright against the live site
+```
+
+Two rules that keep the layers honest:
+- **Nothing below layer 3 may reach Telegram.** `backend/tests/conftest.py` turns
+  a real MTProto/Bot-API call into a failed assertion, and the isolated
+  Playwright fixtures cut HTTP *and* WebSockets.
+- **A new endpoint without `Depends(get_current_user)` fails the suite** —
+  `test_api_authz.py` enumerates the router at runtime.
+
+### Frontend Build
 
 ```bash
 cd frontend
 npm run build           # Production build → frontend/dist
-npm run test:e2e        # Playwright E2E tests (headless)
-npm run test:e2e:ui     # Playwright with UI
-npm run test:e2e:debug  # Debug mode
 ```
 
 ### Session Setup

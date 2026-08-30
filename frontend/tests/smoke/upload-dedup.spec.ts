@@ -6,7 +6,7 @@
  * Prerequisites: same as upload_perf.spec.ts (app running, session configured).
  *
  * Run:
- *   cd frontend && npx playwright test upload_dedup --project=chromium --reporter=line
+ *   cd frontend && npm run test:e2e:smoke
  */
 
 import { test, expect } from '@playwright/test';
@@ -17,7 +17,7 @@ const FILE_KB = 5;
 
 test.setTimeout(120_000);
 
-test('re-uploading the same files skips Telegram upload and completes instantly', async ({ page, context }) => {
+test('re-uploading the same files skips Telegram upload and completes instantly @real', async ({ page, context }) => {
   const cdp = await context.newCDPSession(page);
   await cdp.send('Network.enable');
 

@@ -80,7 +80,7 @@ logs/
 test-results/
 
 # Playwright auth state (contains credentials — never commit)
-frontend/tests/storageState.json
+frontend/tests/smoke/storageState.json
 
 # Test files (test data for E2E tests)
 test-files/
@@ -100,3 +100,6 @@ direct-telegram-wss.png
 test-01-landing.png
 test-02-video.png
 ws-proxy-fixed.png
+
+# Vitest coverage output
+frontend/coverage/

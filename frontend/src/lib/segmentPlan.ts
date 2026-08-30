@@ -2,7 +2,7 @@
  * How a large file is cut into Telegram-message-sized segments.
  *
  * Kept free of any runtime import (no GramJS, no client pool) for one reason:
- * splitUpload.selfcheck.ts must be able to run this bare in node. A mistake
+ * segmentPlan.test.ts must be able to run this bare in node. A mistake
  * here corrupts files silently, so the check has to actually be runnable.
  */
 import { CHUNK_SIZE, MAX_PARTS_PER_FILE } from '../config';

@@ -1,0 +1,8 @@
+# Test-only dependencies. Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# Deliberately NOT here: pytest-asyncio. tests/conftest.py drives coroutines on
+# one shared event loop of its own (see _get_loop / pytest_pyfunc_call), so the
+# suite needs nothing beyond pytest itself. httpx (already a runtime dependency)
+# is what starlette's TestClient runs on.
+pytest>=8.0

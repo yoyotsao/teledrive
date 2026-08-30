@@ -1,7 +1,7 @@
 /**
  * Pure media-shape helpers, shared by the download paths in gramjs.ts and by
  * chat import. Deliberately imports nothing — not even `telegram` — so it can
- * be bundled and run under node by telegramMedia.selfcheck.ts. Everything is
+ * be run under node by telegramMedia.test.ts. Everything is
  * duck-typed because gramjs hands the download paths `any`.
  */
 

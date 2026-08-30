@@ -2,10 +2,10 @@
  * Import every media message of a chat into the drive.
  *
  * Everything Telegram- or backend-facing arrives through ImportDeps so the
- * loop itself can be exercised under node by chatImport.selfcheck.ts. This
+ * loop itself can be exercised under node by chatImport.test.ts. This
  * file therefore imports nothing browser-only — liveDeps(), which wires up
  * the real client and the real API, lives in chatImportDeps.ts instead, so
- * the selfcheck's node bundle never has to resolve `telegram` or `axios`.
+ * the unit test's node run never has to resolve `telegram` or `axios`.
  */
 import { readMedia, deriveFilename } from './telegramMedia';
 import { buildFolderIndex, rememberImported, resolveImport, type FolderEntry } from './importNaming';

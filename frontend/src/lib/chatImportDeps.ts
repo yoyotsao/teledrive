@@ -1,7 +1,7 @@
 /**
  * The real ImportDeps: wires runImport (chatImport.ts) up to the actual
  * Telegram client and the actual backend API. Split out of chatImport.ts so
- * that file — and chatImport.selfcheck.ts, which bundles it for node — never
+ * that file — and chatImport.test.ts, which runs it under node — never
  * has to resolve `telegram` or `axios`, both of which are browser-only.
  *
  * Deliberately branch-free beyond the folder-reuse lookup and the listing

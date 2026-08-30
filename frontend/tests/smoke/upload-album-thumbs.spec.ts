@@ -8,7 +8,7 @@
  * (2) a single dropped image gets an embedded thumbnail (only the single-file
  * upload path attaches a thumb — multi-file drops do not).
  *
- * Run: cd frontend && npx playwright test upload_album_thumbs --project=chromium --reporter=line
+ * Run: cd frontend && npm run test:e2e:smoke
  */
 import { test, expect } from '@playwright/test';
 
@@ -16,7 +16,7 @@ const SMALL_FILE_COUNT = 25;
 
 test.setTimeout(180_000);
 
-test('multiple small files upload successfully and a single image gets an embedded thumbnail', async ({ page }) => {
+test('multiple small files upload successfully and a single image gets an embedded thumbnail @real', async ({ page }) => {
   const consoleMessages: string[] = [];
   page.on('console', (msg) => consoleMessages.push(msg.text()));
 

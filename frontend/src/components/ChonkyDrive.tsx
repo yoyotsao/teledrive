@@ -25,6 +25,48 @@ const isTouch = typeof window !== 'undefined' && window.matchMedia?.('(pointer: 
 
 const previewLoadingStyle: React.CSSProperties = { padding: 40, textAlign: 'center', color: 'var(--td-text-muted)', minWidth: 200 };
 
+function previewBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+/**
+ * What a preview shows before it has anything to render.
+ *
+ * A preview has to download the WHOLE file first (an image with a hole in it
+ * is not an image, and a PDF's cross-reference table is at the END), so a big
+ * file legitimately sits here for a while. Showing the byte count is what
+ * separates "still coming" from "hung", and showing the error is what stops a
+ * failed download — which only ever reached console.error — from looking like
+ * an eternal spinner.
+ */
+function PreviewStatus({ error, progress }: {
+  error: string | null;
+  progress: { received: number; total: number } | null;
+}) {
+  if (error) {
+    return (
+      <div style={{ ...previewLoadingStyle, maxWidth: 460 }}>
+        <div style={{ color: '#dc2626', fontWeight: 500, marginBottom: 8 }}>預覽失敗</div>
+        <div style={{ fontSize: 12, wordBreak: 'break-word' }}>{error}</div>
+      </div>
+    );
+  }
+  const showPercent = progress !== null && progress.total > 0;
+  return (
+    <div style={previewLoadingStyle}>
+      <div>載入中...</div>
+      {showPercent && (
+        <div style={{ fontSize: 12, marginTop: 8 }}>
+          {Math.floor((progress.received / progress.total) * 100)}%
+          {` (${previewBytes(progress.received)} / ${previewBytes(progress.total)})`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function navArrowStyle(side: 'left' | 'right'): React.CSSProperties {
   return {
     position: 'fixed', [side]: 16, top: '50%', transform: 'translateY(-50%)',
@@ -254,6 +296,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   // Custom confirm modal for deletion — replaces window.confirm() so automated
   // browser tools (e.g. Playwright) don't get stuck on a native dialog.
   const [deleteConfirm, setDeleteConfirm] = useState<{ ids: Set<string>; hasFolder: boolean } | null>(null);
+  const [purgeConfirm, setPurgeConfirm] = useState<{ ids: Set<string> } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetId: string | null } | null>(null);
   const [renameTarget, setRenameTarget] = useState<FileInfo | null>(null);
   const [newFolderOpen, setNewFolderOpen] = useState(false);
@@ -262,6 +305,12 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   const [emptyTrashConfirm, setEmptyTrashConfirm] = useState(false);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const [previewText, setPreviewText] = useState<string | null>(null);
+  // A preview downloads the WHOLE file before it can render anything, so
+  // without these two the modal sits on "載入中..." forever — both while a
+  // large file is legitimately still arriving and after the download has
+  // failed outright, since the failure used to go to the console only.
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewProgress, setPreviewProgress] = useState<{ received: number; total: number } | null>(null);
   // Recent image blob URLs for the gallery — revoked on close to avoid leaks.
   const galleryUrlsRef = useRef<Map<string, string>>(new Map());
 
@@ -1336,13 +1385,17 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     setPreviewFile(original);
     setPreviewUrl(null);
     setPreviewText(null);
+    setPreviewError(null);
+    setPreviewProgress(null);
     const kind = fileKind(original.mime_type, original.filename);
     setPreviewIndex(kind === 'image' ? galleryImages.findIndex((f) => f.file_id === original.file_id) : null);
 
     if (kind === 'video') return; // video streams via Service Worker, no blob download
     try {
       const cachedUrl = galleryUrlsRef.current.get(original.file_id);
-      const blob = cachedUrl ? null : await fetchFileBlob(original);
+      const blob = cachedUrl
+        ? null
+        : await fetchFileBlob(original, (received, total) => setPreviewProgress({ received, total }));
       if (kind === 'text') {
         if (blob && blob.size > 1024 * 1024) setPreviewText('（檔案過大，無法預覽）');
         else if (blob) setPreviewText(await blob.text());
@@ -1365,6 +1418,9 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       }
     } catch (err) {
       console.error('[Preview] Failed to download file:', err);
+      setPreviewError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPreviewProgress(null);
     }
   }, [galleryImages]);
 
@@ -1548,6 +1604,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     setPreviewUrl(null);
     setPreviewText(null);
     setPreviewIndex(null);
+    setPreviewError(null);
+    setPreviewProgress(null);
   }, [previewUrl, previewFile]);
 
   // Preview keyboard: Esc closes, ←/→ steps the image gallery.
@@ -1611,7 +1669,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     if (isTrash) {
       return [
         { label: '還原', icon: '♻️', onClick: () => performRestore(ids) },
-        { label: '永久刪除', icon: '🗑️', danger: true, onClick: () => performPurge(ids) },
+        { label: '永久刪除', icon: '🗑️', danger: true, onClick: () => setPurgeConfirm({ ids }) },
       ];
     }
 
@@ -1720,7 +1778,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
             {isTrash ? (
               <>
                 <TbBtn onClick={() => performRestore(new Set(selectedFiles))}>♻️ 還原</TbBtn>
-                <TbBtn onClick={() => performPurge(new Set(selectedFiles))} danger>🗑️ 永久刪除</TbBtn>
+                <TbBtn onClick={() => setPurgeConfirm({ ids: new Set(selectedFiles) })} danger>🗑️ 永久刪除</TbBtn>
               </>
             ) : (
               <>
@@ -1859,6 +1917,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
       <div
         ref={scrollContainerRef}
+        data-testid="drive-scroll"
         onMouseDown={viewMode === 'grid' && canModify ? handleGridMouseDown : undefined}
         onContextMenu={handleEmptyContextMenu}
         {...longPress}
@@ -2093,9 +2152,19 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
         />
       )}
 
+      {purgeConfirm && (
+        <ConfirmDialog
+          message={`確定要永久移除 ${purgeConfirm.ids.size} 個 TeleDrive 紀錄嗎？Telegram Saved Messages 中的原始訊息會保留；此動作無法復原。`}
+          confirmLabel="永久移除紀錄"
+          danger
+          onConfirm={() => { const ids = purgeConfirm.ids; setPurgeConfirm(null); performPurge(ids); }}
+          onCancel={() => setPurgeConfirm(null)}
+        />
+      )}
+
       {emptyTrashConfirm && (
         <ConfirmDialog
-          message="確定要清空垃圾桶嗎？此動作會永久刪除所有項目，無法復原。"
+          message="確定要清空垃圾桶嗎？這只會永久移除 TeleDrive 紀錄，Telegram Saved Messages 中的原始訊息會保留；此動作無法復原。"
           confirmLabel="清空垃圾桶"
           danger
           onConfirm={emptyTrash}
@@ -2166,8 +2235,10 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
             <div style={{ padding: 8, overflow: 'auto' }}>
               {kind === 'image' ? (
-                <img src={previewUrl ?? undefined} alt={previewFile.filename} decoding="async"
-                  style={{ minWidth: 200, minHeight: 200, maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', objectFit: 'contain' }} />
+                previewUrl
+                  ? <img src={previewUrl} alt={previewFile.filename} decoding="async"
+                      style={{ minWidth: 200, minHeight: 200, maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', objectFit: 'contain' }} />
+                  : <PreviewStatus error={previewError} progress={previewProgress} />
               ) : kind === 'video' ? (
                 <video
                   src={previewFile.is_split_file && previewFile.split_group_id
@@ -2176,14 +2247,14 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   controls autoPlay style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }} />
               ) : kind === 'pdf' ? (
                 previewUrl ? <iframe src={previewUrl} title={previewFile.filename} style={{ width: '80vw', height: 'calc(90vh - 100px)', border: 'none' }} />
-                  : <div style={previewLoadingStyle}>載入中...</div>
+                  : <PreviewStatus error={previewError} progress={previewProgress} />
               ) : kind === 'audio' ? (
                 previewUrl ? <div style={{ padding: 40 }}><audio src={previewUrl} controls autoPlay style={{ width: 360, maxWidth: '80vw' }} /></div>
-                  : <div style={previewLoadingStyle}>載入中...</div>
+                  : <PreviewStatus error={previewError} progress={previewProgress} />
               ) : kind === 'text' ? (
                 previewText !== null
                   ? <pre style={{ margin: 0, padding: 16, maxWidth: '80vw', maxHeight: 'calc(90vh - 120px)', overflow: 'auto', fontSize: 13, color: 'var(--td-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{previewText}</pre>
-                  : <div style={previewLoadingStyle}>載入中...</div>
+                  : <PreviewStatus error={previewError} progress={previewProgress} />
               ) : (
                 <div style={{ padding: 40, textAlign: 'center', color: 'var(--td-text-muted)' }}>此檔案類型無法預覽</div>
               )}

@@ -1,5 +1,15 @@
 {
   "dependencies": {
     "playwright": "^1.58.2"
+  },
+  "name": "teledrive",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "test:smoke": "node scripts/run-tests.mjs --smoke",
+    "test:backend": "node scripts/run-tests.mjs --only=backend",
+    "test:unit": "node scripts/run-tests.mjs --only=unit",
+    "test:ui": "node scripts/run-tests.mjs --only=ui"
   }
 }

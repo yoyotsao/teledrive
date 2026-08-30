@@ -66,3 +66,37 @@ def test_unknown_nonce_never_becomes_verified():
 
     assert bot_challenge._verified == {}
     assert bot_challenge.take_verified("not-a-real-nonce") is None
+
+
+def test_pending_store_is_bounded(monkeypatch):
+    monkeypatch.setattr(bot_challenge, "MAX_PENDING_CHALLENGES", 2)
+    bot_challenge.new_challenge()
+    bot_challenge.new_challenge()
+
+    with pytest.raises(bot_challenge.ChallengeCapacityError):
+        bot_challenge.new_challenge()
+
+
+def test_expired_entries_are_pruned_from_both_stores():
+    now = time.time()
+    bot_challenge._pending["expired-pending"] = now - 1
+    bot_challenge._verified["expired-verified"] = {
+        "user_id": 1,
+        "expires": now - 1,
+    }
+
+    bot_challenge.new_challenge()
+
+    assert "expired-pending" not in bot_challenge._pending
+    assert "expired-verified" not in bot_challenge._verified
+
+
+def test_verified_store_is_bounded(monkeypatch):
+    monkeypatch.setattr(bot_challenge, "MAX_VERIFIED_CHALLENGES", 1)
+    first = bot_challenge.new_challenge()
+    second = bot_challenge.new_challenge()
+
+    bot_challenge.ingest_updates([update(first), update(second, user_id=43)])
+
+    assert list(bot_challenge._verified) == [first]
+    assert second in bot_challenge._pending

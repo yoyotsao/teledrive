@@ -39,6 +39,7 @@ export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; it
   return (
     <div
       ref={ref}
+      data-testid="context-menu"
       onClick={(e) => e.stopPropagation()}
       style={{
         position: 'fixed', left: pos.left, top: pos.top, zIndex: 3000,

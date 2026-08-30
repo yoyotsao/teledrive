@@ -11,7 +11,9 @@ const __dirname = path.dirname(__filename);
 const TEST_FILE_NAME = 'test-upload.txt';
 const TEST_FILE_CONTENT = 'Playwright E2E Test File';
 
-test.describe('teleDrive E2E Tests', () => {
+// @real — drives the live site with a real Telegram session. Never part of
+// the default run; see playwright.config.ts and TESTING.md.
+test.describe('teleDrive E2E Tests @real', () => {
   let page: Page;
 
   test.beforeEach(async ({ page: pageInstance }) => {
@@ -22,7 +24,7 @@ test.describe('teleDrive E2E Tests', () => {
    * Helper: Create a temporary test file for upload
    */
   async function createTestFile(fileName: string, content: string): Promise<string> {
-    const testDir = path.join(__dirname, 'fixtures');
+    const testDir = path.join(__dirname, '..', 'fixtures');
     if (!fs.existsSync(testDir)) {
       fs.mkdirSync(testDir, { recursive: true });
     }
@@ -90,7 +92,7 @@ test.describe('teleDrive E2E Tests', () => {
   });
 
   test('should upload and verify image preview', async ({ page }) => {
-    const testFilesDir = path.join(__dirname, '..', '..', 'test-files');
+    const testFilesDir = path.join(__dirname, '..', '..', '..', 'test-files');
     const imagePath = path.join(testFilesDir, 'test.png');
     
     if (!fs.existsSync(imagePath)) {
@@ -210,7 +212,7 @@ test.describe('teleDrive E2E Tests', () => {
   });
 
   test('should upload and verify short video', async ({ page }) => {
-    const testFilesDir = path.join(__dirname, '..', '..', 'test-files');
+    const testFilesDir = path.join(__dirname, '..', '..', '..', 'test-files');
     const videoPath = path.join(testFilesDir, 'test_small.mp4');
     
     // DEBUG: Log the path and existence check
@@ -376,7 +378,7 @@ test.describe('teleDrive E2E Tests', () => {
   });
 
   test('should upload and verify long video streaming', async ({ page }) => {
-    const testFilesDir = path.join(__dirname, '..', '..', 'test-files');
+    const testFilesDir = path.join(__dirname, '..', '..', '..', 'test-files');
     const videoPath = path.join(testFilesDir, 'test_large.mp4');
     
     // DEBUG: Log the path and existence check

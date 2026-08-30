@@ -1,7 +1,7 @@
 /**
  * Pure helper for reading gramjs's forwardMessages result. Deliberately imports
  * nothing — not even `telegram` — so it can be bundled and run under node by
- * forwardResult.selfcheck.ts.
+ * forwardResult.test.ts.
  */
 
 /**

@@ -45,7 +45,7 @@ function App() {
           client.initialize(API_ID, API_HASH, account.session)
             .then(() => {
               if (client.accountId !== account.id) {
-                adoptClient(client.accountId, client);
+                adoptClient(client.accountId, client, account.label);
                 void saveAccount({ ...account, id: client.accountId });
               }
             })
@@ -76,7 +76,7 @@ function App() {
     if (!loginResp) throw new Error('Telegram 驗證逾時，請重試');
 
     const label = loginResp.username || loginResp.first_name || String(loginResp.user_id);
-    adoptClient(loginResp.user_id, client);
+    adoptClient(loginResp.user_id, client, label);
     await saveAccount({ id: loginResp.user_id, label, session: sessionString });
     await saveJwt(loginResp.token);
     setUserName(loginResp.first_name || loginResp.username || String(loginResp.user_id));

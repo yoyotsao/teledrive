@@ -56,10 +56,11 @@ export default function SettingsDialog({ onClose }: Props) {
       }
       if (!linked) throw new Error('Telegram 驗證逾時，請重試');
 
-      adoptClient(linked.telegram_user_id, client);
+      const accountName = linked.label ?? String(linked.telegram_user_id);
+      adoptClient(linked.telegram_user_id, client, accountName);
       await saveAccount({
         id: linked.telegram_user_id,
-        label: linked.label ?? String(linked.telegram_user_id),
+        label: accountName,
         session: sessionString,
       });
       setAdding(false);

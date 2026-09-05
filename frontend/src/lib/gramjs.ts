@@ -220,11 +220,18 @@ export class TelegramClientManager {
 
   /** Telegram account this client acts as. 0 until initialize()/login identifies it. */
   accountId: number;
+  accountName: string;
   /** Set when the MTProto handshake failed — the pool skips it for uploads. */
   offline = false;
 
-  constructor(accountId = 0) {
+  constructor(accountId = 0, accountName = '') {
     this.accountId = accountId;
+    this.accountName = accountName.trim();
+  }
+
+  setAccountIdentity(accountId: number, accountName?: string | null): void {
+    this.accountId = accountId;
+    if (accountName?.trim()) this.accountName = accountName.trim();
   }
 
   private get chunkPacer(): AdaptiveRateLimiter {
@@ -394,7 +401,12 @@ export class TelegramClientManager {
       const myself = await this.client.getMe() as { id?: unknown; username?: string; firstName?: string };
       // Self-identify: sessions migrated from the single-account era arrive with
       // accountId 0, and the pool is keyed by it.
-      if (myself.id != null) this.accountId = Number(myself.id);
+      if (myself.id != null) {
+        this.setAccountIdentity(
+          Number(myself.id),
+          myself.username || myself.firstName || String(myself.id),
+        );
+      }
       console.log(`[GramJS:${this.accountId}] Connected as:`, myself.username || myself.firstName);
     } catch (err) {
       console.warn('[GramJS] Session might need re-authentication:', err);
@@ -1403,15 +1415,20 @@ const clients = new Map<number, TelegramClientManager>();
 export function getClientFor(accountId: number): TelegramClientManager {
   let c = clients.get(accountId);
   if (!c) {
-    c = new TelegramClientManager(accountId);
+    const stored = loadAccounts().find((account) => account.id === accountId);
+    c = new TelegramClientManager(accountId, stored?.label ?? '');
     clients.set(accountId, c);
   }
   return c;
 }
 
 /** Register a manager built outside the pool (the login flow, which only learns its account id afterwards). */
-export function adoptClient(accountId: number, manager: TelegramClientManager): void {
-  manager.accountId = accountId;
+export function adoptClient(
+  accountId: number,
+  manager: TelegramClientManager,
+  accountName?: string | null,
+): void {
+  manager.setAccountIdentity(accountId, accountName);
   clients.set(accountId, manager);
 }
 

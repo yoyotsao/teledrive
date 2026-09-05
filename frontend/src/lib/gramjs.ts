@@ -85,7 +85,7 @@ const isPremiumFloodError = isPremiumFlood;
  * One pacer per account, and the learned ceiling is stored per account too: a
  * premium account's ceiling must not be dragged down by a free one's.
  */
-function createChunkPacer(accountId: number): AdaptiveRateLimiter {
+function createChunkPacer(accountId: number, accountName: string): AdaptiveRateLimiter {
   return new AdaptiveRateLimiter({
   initialRate: CHUNK_RATE_INIT,
   minRate: CHUNK_RATE_MIN,
@@ -101,6 +101,8 @@ function createChunkPacer(accountId: number): AdaptiveRateLimiter {
   // would pin a fresh session at CHUNK_RATE_MIN and never exercise the
   // firstBackoff convergence, so the old learning is deliberately discarded.
   storageKey: `teledrive_chunk_rate_v3_${accountId}`,
+  accountId,
+  accountName,
   label: `ChunkRate:${accountId}`,
   // Ceiling memory: remember the flood-triggering rate and converge just below
   // it, instead of re-probing past the account limit every cycle (the sawtooth
@@ -235,7 +237,12 @@ export class TelegramClientManager {
   }
 
   private get chunkPacer(): AdaptiveRateLimiter {
-    if (!this._chunkPacer) this._chunkPacer = createChunkPacer(this.accountId);
+    if (!this._chunkPacer) {
+      this._chunkPacer = createChunkPacer(
+        this.accountId,
+        resolveAccountLogName(this.accountName, this.accountId),
+      );
+    }
     return this._chunkPacer;
   }
 

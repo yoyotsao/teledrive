@@ -10,8 +10,13 @@
  * These tests move real wall-clock time (the limiter schedules with setTimeout
  * against Date.now()); the waits are kept to a few seconds.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AdaptiveRateLimiter } from './adaptiveRateLimiter.ts';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 // No storageKey → never touches window.localStorage, so this runs bare in node.
 const opts = {
@@ -42,6 +47,31 @@ const opts = {
     escalationResetMs: 600_000,
   },
 };
+
+describe('account-aware diagnostics', () => {
+  it('prefixes initialization and ramp logs with the account name', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const limiter = new AdaptiveRateLimiter({
+      ...opts,
+      accountId: 8773541354,
+      accountName: 'test1',
+      label: 'ChunkRate:8773541354',
+    });
+
+    limiter.reportSuccess();
+    vi.advanceTimersByTime(opts.increaseIntervalMs);
+    limiter.reportSuccess();
+
+    expect(log).toHaveBeenCalledWith(
+      '[test1][Perf][ChunkRate:8773541354] init rate=4.0 parts/s (source=default)',
+    );
+    expect(log).toHaveBeenCalledWith(
+      '[test1][Perf][ChunkRate:8773541354] ramp → 4.5 parts/s',
+    );
+  });
+});
 
 describe('pause() — the FLOOD_PREMIUM_WAIT path', () => {
   it('does not self-throttle, however often it fires', () => {

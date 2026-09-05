@@ -1,3 +1,5 @@
+import { formatAccountLog } from './accountLog';
+
 export interface CeilingOptions {
   /** On flood, ceiling ≤ backoff × the rate that triggered it. */
   backoff: number;
@@ -48,6 +50,8 @@ export interface AdaptiveRateLimiterOptions {
   burst: number;
   storageKey?: string;
   label?: string;
+  accountId?: number;
+  accountName?: string;
   /**
    * Ceiling-memory tuning. When omitted, reportFlood/reportSuccess behave as a
    * plain AIMD pacer (no ceiling learning) — keeps the class generic.
@@ -103,8 +107,29 @@ export class AdaptiveRateLimiter {
     this.rate = this.loadInitialRate();
   }
 
+  private formatLog(message: string): string {
+    const label = this.opts.label ?? 'RateLimiter';
+    if (this.opts.accountId === undefined) {
+      return `[Perf][${label}] ${message}`;
+    }
+    return formatAccountLog(
+      this.opts.accountName,
+      this.opts.accountId,
+      ['Perf', label],
+      message,
+    );
+  }
+
+  private log(message: string): void {
+    console.log(this.formatLog(message));
+  }
+
+  private warn(message: string): void {
+    console.warn(this.formatLog(message));
+  }
+
   private loadInitialRate(): number {
-    const { storageKey, initialRate, minRate, maxRate, label, ceiling: ceilOpts } = this.opts;
+    const { storageKey, initialRate, minRate, maxRate, ceiling: ceilOpts } = this.opts;
     const clampRate = (r: number) => Math.min(maxRate, Math.max(minRate, r));
     const clampCeiling = (c: number) =>
       Math.min(maxRate, Math.max(ceilOpts?.floor ?? minRate, c));
@@ -126,9 +151,7 @@ export class AdaptiveRateLimiter {
             // gently instead of overshooting into a flood on the first ramp.
             const cap = this.ceiling ?? maxRate;
             const rate = clampRate(Math.min(parsed.rate, cap) * PERSIST_LOAD_DISCOUNT);
-            console.log(
-              `[Perf][${label ?? 'RateLimiter'}] init rate=${rate.toFixed(1)} parts/s ceiling=${this.ceiling?.toFixed(1) ?? 'none'} (source=storage)`,
-            );
+            this.log(`init rate=${rate.toFixed(1)} parts/s ceiling=${this.ceiling?.toFixed(1) ?? 'none'} (source=storage)`);
             return rate;
           }
         }
@@ -136,7 +159,7 @@ export class AdaptiveRateLimiter {
         // ignore malformed/inaccessible storage, fall through to default
       }
     }
-    console.log(`[Perf][${label ?? 'RateLimiter'}] init rate=${initialRate.toFixed(1)} parts/s (source=default)`);
+    this.log(`init rate=${initialRate.toFixed(1)} parts/s (source=default)`);
     return initialRate;
   }
 
@@ -258,13 +281,13 @@ export class AdaptiveRateLimiter {
           const factor = escalate ? ceilOpts.escalatedDecreaseFactor : this.opts.decreaseFactor;
           this.rate = Math.max(this.opts.minRate, this.rate * factor);
         }
-        console.warn(
-          `[Perf][${this.opts.label ?? 'RateLimiter'}] FLOOD_WAIT #${this.floods}: wait=${waitSeconds}s rate ${prevRate.toFixed(1)}→${this.rate.toFixed(1)} ceiling=${this.ceiling.toFixed(1)}${escalate ? ' [escalated]' : ''}${wasProbe ? ' [probe-fail]' : ''} parts/s`,
+        this.warn(
+          `FLOOD_WAIT #${this.floods}: wait=${waitSeconds}s rate ${prevRate.toFixed(1)}→${this.rate.toFixed(1)} ceiling=${this.ceiling.toFixed(1)}${escalate ? ' [escalated]' : ''}${wasProbe ? ' [probe-fail]' : ''} parts/s`,
         );
       } else {
         this.rate = Math.max(this.opts.minRate, this.rate * this.opts.decreaseFactor);
-        console.warn(
-          `[Perf][${this.opts.label ?? 'RateLimiter'}] FLOOD_WAIT #${this.floods}: wait=${waitSeconds}s rate ${prevRate.toFixed(1)}→${this.rate.toFixed(1)} parts/s`,
+        this.warn(
+          `FLOOD_WAIT #${this.floods}: wait=${waitSeconds}s rate ${prevRate.toFixed(1)}→${this.rate.toFixed(1)} parts/s`,
         );
       }
       this.persist(true);
@@ -288,8 +311,8 @@ export class AdaptiveRateLimiter {
       if (now - this.lastIncreaseAt < this.opts.increaseIntervalMs) return;
       this.lastIncreaseAt = now;
       this.rate = Math.min(this.opts.maxRate, this.rate + this.opts.increaseStep);
-      console.log(
-        `[Perf][${this.opts.label ?? 'RateLimiter'}] ramp → ${this.rate.toFixed(1)} parts/s${this.ceiling !== null ? ` (ceiling=${(this.ceiling as number).toFixed(1)})` : ''}`,
+      this.log(
+        `ramp → ${this.rate.toFixed(1)} parts/s${this.ceiling !== null ? ` (ceiling=${(this.ceiling as number).toFixed(1)})` : ''}`,
       );
       this.persist(false);
       return;
@@ -302,7 +325,7 @@ export class AdaptiveRateLimiter {
       this.probeStartedAt = null;
       this.lastProbeEndedAt = now;
       this.probeCooldownMs = ceilOpts.probeCooldownMs;
-      console.log(`[Perf][${this.opts.label ?? 'RateLimiter'}] probe confirmed → ceiling=${this.ceiling.toFixed(1)} parts/s`);
+      this.log(`probe confirmed → ceiling=${this.ceiling.toFixed(1)} parts/s`);
       this.persist(false);
       return;
     }
@@ -313,14 +336,14 @@ export class AdaptiveRateLimiter {
       if (now - this.lastIncreaseAt < this.opts.increaseIntervalMs) return;
       this.lastIncreaseAt = now;
       this.rate = Math.min(slowStart, this.rate + this.opts.increaseStep);
-      console.log(`[Perf][${this.opts.label ?? 'RateLimiter'}] ramp → ${this.rate.toFixed(1)} parts/s (ceiling=${this.ceiling.toFixed(1)})`);
+      this.log(`ramp → ${this.rate.toFixed(1)} parts/s (ceiling=${this.ceiling.toFixed(1)})`);
       this.persist(false);
     } else if (this.rate < this.ceiling) {
       // Slow zone: creep toward the ceiling.
       if (now - this.lastIncreaseAt < ceilOpts.slowIntervalMs) return;
       this.lastIncreaseAt = now;
       this.rate = Math.min(this.ceiling, this.rate + ceilOpts.slowStep);
-      console.log(`[Perf][${this.opts.label ?? 'RateLimiter'}] creep → ${this.rate.toFixed(1)} parts/s (ceiling=${this.ceiling.toFixed(1)})`);
+      this.log(`creep → ${this.rate.toFixed(1)} parts/s (ceiling=${this.ceiling.toFixed(1)})`);
       this.persist(false);
     } else {
       // Holding at the ceiling. Probe past it only after a long clean period.
@@ -330,7 +353,7 @@ export class AdaptiveRateLimiter {
       this.rate = Math.min(this.opts.maxRate, this.rate + ceilOpts.probeStep);
       this.probeStartedAt = now;
       this.lastIncreaseAt = now;
-      console.log(`[Perf][${this.opts.label ?? 'RateLimiter'}] probe → ${this.rate.toFixed(1)} parts/s (ceiling=${this.ceiling.toFixed(1)})`);
+      this.log(`probe → ${this.rate.toFixed(1)} parts/s (ceiling=${this.ceiling.toFixed(1)})`);
       this.persist(false);
     }
   }

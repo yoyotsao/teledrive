@@ -11,6 +11,7 @@
  * against Date.now()); the waits are kept to a few seconds.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { CHUNK_RATE_MAX, MAX_CONCURRENT_CHUNKS } from '../config.ts';
 import { AdaptiveRateLimiter } from './adaptiveRateLimiter.ts';
 
 afterEach(() => {
@@ -70,6 +71,28 @@ describe('account-aware diagnostics', () => {
     expect(log).toHaveBeenCalledWith(
       '[test1][Perf][ChunkRate:8773541354] ramp → 4.5 parts/s',
     );
+  });
+});
+
+describe('production exploration ceiling', () => {
+  it('can ramp beyond 12 parts/s while retaining the 12-request concurrency guard', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const limiter = new AdaptiveRateLimiter({
+      ...opts,
+      initialRate: 12,
+      maxRate: CHUNK_RATE_MAX,
+      increaseIntervalMs: 10_000,
+      ceiling: undefined,
+      label: 'ChunkRate:test',
+    });
+
+    vi.advanceTimersByTime(10_000);
+    limiter.reportSuccess();
+
+    expect(CHUNK_RATE_MAX).toBe(32);
+    expect(MAX_CONCURRENT_CHUNKS).toBe(12);
+    expect(limiter.stats().rate).toBe(12.5);
   });
 });
 

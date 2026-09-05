@@ -99,8 +99,12 @@ export const CHUNK_RATE_INIT = 4;
 /** Floor rate in parts/s — worst case still makes forward progress. */
 export const CHUNK_RATE_MIN = 0.5;
 
-/** Ceiling rate in parts/s — above this, MAX_CONCURRENT_CHUNKS is the real bottleneck. */
-export const CHUNK_RATE_MAX = 12;
+/**
+ * Absolute safety ceiling for the adaptive per-account pacer. This must sit
+ * above the normal operating range so FLOOD feedback and learned ceilings,
+ * rather than this constant, determine each account's sustainable rate.
+ */
+export const CHUNK_RATE_MAX = 32;
 
 /** Multiplicative decrease factor applied to the rate on each FLOOD_WAIT. */
 export const CHUNK_RATE_DECREASE_FACTOR = 0.5;

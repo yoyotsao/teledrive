@@ -42,6 +42,7 @@ import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
 import { readMedia, isOwnAccount, senderDcFor, type MediaRef } from "./telegramMedia";
 import { unwrapForwardedMessage } from "./forwardResult";
 import { installPremiumFloodTag, isPremiumFlood } from "./gramjsFloodPatch";
+import { formatAccountLog, resolveAccountLogName } from "./accountLog";
 
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
@@ -534,8 +535,6 @@ export class TelegramClientManager {
     if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
 
     const fileId = generateRandomBigInt();
-    console.log(`[SplitUpload:${this.accountId}] segment ${segment.index}: ${segment.parts} parts at offset ${segment.offset}`);
-
     await Promise.all(Array.from({ length: segment.parts }, (_, partIdx) =>
       this.uploadSemaphore.withSlot(async () => {
         const offset = segment.offset + partIdx * PART_SIZE;
@@ -576,7 +575,12 @@ export class TelegramClientManager {
       accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
     }
 
-    console.log(`[SplitUpload:${this.accountId}] segment ${segment.index} sent, message_id:`, msg.id);
+    console.log(formatAccountLog(
+      this.accountName,
+      this.accountId,
+      [`SplitUpload:${this.accountId}`],
+      `segment ${segment.index} sent, message_id: ${msg.id}`,
+    ));
     return {
       index: segment.index,
       message_id: msg.id,

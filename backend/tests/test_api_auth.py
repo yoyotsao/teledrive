@@ -1,9 +1,11 @@
-"""POST /auth/challenge and /auth/verify over HTTP, plus the Bearer-token gate.
+"""Authentication endpoints over HTTP, plus the Bearer-token gate.
 
 test_bot_challenge.py pins the nonce lifecycle as pure logic. This file pins
 what the *endpoints* do with it: who gets a JWT, who gets 401, and what a
 first-ever login leaves behind in the database.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 import jwt
 
@@ -147,3 +149,56 @@ def test_a_correctly_signed_token_without_expiry_is_rejected(make_client):
     response = client.get("/api/v1/files")
 
     assert response.status_code == 401
+
+
+def _token_expired_at(owner_id: int, expired_at: datetime, *, acting_account_id: int | None = None):
+    return jwt.encode(
+        {
+            "user_id": owner_id,
+            "acting_account_id": acting_account_id if acting_account_id is not None else owner_id,
+            "exp": expired_at,
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def test_a_recently_expired_token_can_be_refreshed(anon_client):
+    stale = _token_expired_at(
+        777,
+        datetime.now(timezone.utc) - timedelta(hours=1),
+        acting_account_id=778,
+    )
+
+    resp = anon_client.post(
+        "/api/v1/auth/refresh",
+        headers={"Authorization": "Bearer " + stale},
+    )
+
+    assert resp.status_code == 200, resp.text
+    payload = jwt.decode(resp.json()["token"], JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    assert payload["user_id"] == 777
+    assert payload["acting_account_id"] == 778
+
+
+def test_refresh_rejects_a_token_outside_the_grace_period(anon_client):
+    stale = _token_expired_at(
+        777,
+        datetime.now(timezone.utc) - timedelta(days=31),
+    )
+
+    resp = anon_client.post(
+        "/api/v1/auth/refresh",
+        headers={"Authorization": "Bearer " + stale},
+    )
+
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("header", [None, "", "Bearer garbage", "Basic abc"])
+def test_refresh_never_accepts_a_missing_or_invalid_bearer_token(anon_client, header):
+    headers = {"Authorization": header} if header is not None else {}
+
+    resp = anon_client.post("/api/v1/auth/refresh", headers=headers)
+
+    assert resp.status_code == 401

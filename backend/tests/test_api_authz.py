@@ -45,6 +45,9 @@ PROTECTED = [
 PUBLIC_PATHS = {
     "/api/v1/auth/challenge",
     "/api/v1/auth/verify",
+    # Uses its own stricter guard: get_current_user deliberately rejects the
+    # expired-but-still-signed token this endpoint must inspect.
+    "/api/v1/auth/refresh",
 }
 
 

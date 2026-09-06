@@ -88,3 +88,32 @@ def test_the_batch_endpoint_stops_at_the_drive_boundary_too(client, make_file):
     results = client.post("/api/v1/files/check-hashes", json={"hashes": [HASH_A]}).json()["results"]
 
     assert results == {}
+
+
+# The browser looks up exactly the hash it will later register, and that hash
+# carries a `:<original size>` suffix (see test_api_files_register.py). A 422
+# here is invisible in the UI — the frontend swallows the failure and silently
+# re-uploads bytes the drive already has.
+SIZED_HASH = "a" * 64 + ":8838273312"
+
+
+def test_check_hash_accepts_the_browsers_sized_hash(client, make_file):
+    make_file("f1", file_hash=SIZED_HASH)
+
+    body = client.get("/api/v1/files/check-hash", params={"hash": SIZED_HASH}).json()
+
+    assert body["found"] is True
+    assert [f["file_id"] for f in body["files"]] == ["f1"]
+
+
+def test_the_batch_endpoint_accepts_sized_hashes_too(client, make_file):
+    make_file("f1", file_hash=SIZED_HASH)
+
+    results = client.post("/api/v1/files/check-hashes", json={"hashes": [SIZED_HASH]}).json()["results"]
+
+    assert [f["file_id"] for f in results[SIZED_HASH]] == ["f1"]
+
+
+def test_a_malformed_hash_is_still_rejected_by_both_endpoints(client):
+    assert client.get("/api/v1/files/check-hash", params={"hash": "nope"}).status_code == 422
+    assert client.post("/api/v1/files/check-hashes", json={"hashes": ["nope"]}).status_code == 422

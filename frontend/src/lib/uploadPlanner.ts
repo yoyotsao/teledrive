@@ -37,6 +37,18 @@ export async function checkFileHashBounded(
   );
 }
 
+/** Batch lookup with the same connection bound used by folder hash checks.
+ * A streaming picker upload calls this with one newly-computed hash at a time;
+ * keeping the batch endpoint means callers still get the backend's hash-keyed
+ * response without waiting for every selected file to finish hashing first. */
+export async function checkFileHashesBounded(
+  hashes: string[],
+): Promise<Record<string, FileInfo[]>> {
+  return hashCheckSemaphore.withSlot(() =>
+    api.checkFileHashes(hashes).catch(() => ({} as Record<string, FileInfo[]>)),
+  );
+}
+
 export interface PlannedFile {
   file: File;
   hash: string | null;

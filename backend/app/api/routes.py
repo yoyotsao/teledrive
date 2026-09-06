@@ -1,11 +1,11 @@
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends, Header
 from fastapi.responses import JSONResponse
 from typing import Annotated, Optional, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from app.models.schemas import FileListResponse, FileInfo
 from app.services import get_file_service
 from app.services.database import get_database
-from app.auth import get_current_user, create_jwt
+from app.auth import get_current_user, create_jwt, refresh_jwt
 from app.services import bot_challenge
 from loguru import logger
 
@@ -24,9 +24,22 @@ class LoginResponse(BaseModel):
     first_name: Optional[str] = None
 
 
+class RefreshResponse(BaseModel):
+    token: str
+
+
+# A file_hash is a SHA-256 hex digest, optionally followed by `:<original size>`.
+# The browser hashes only the first 100MB of a large file (sha256File in
+# hashFile.ts), so a truncated copy shares the complete file's digest and only
+# the size tells them apart — dedup needs the suffix to be part of the key.
+# Anything beyond that stays rejected: this is a lookup key, and a free-form
+# string lets a caller collide with rows they cannot otherwise name.
+FILE_HASH_PATTERN = r"^[0-9a-fA-F]{64}(:[0-9]{1,20})?$"
+
+
 class CheckHashesRequest(BaseModel):
     hashes: list[
-        Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")]
+        Annotated[str, Field(pattern=FILE_HASH_PATTERN)]
     ] = Field(..., max_length=1000)
 
 
@@ -44,7 +57,7 @@ class RegisterFileRequest(BaseModel):
     part_index: Optional[int] = Field(None, ge=0)
     total_parts: Optional[int] = Field(None, gt=0)
     split_group_id: Optional[str] = Field(None, max_length=512)
-    file_hash: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{64}$")
+    file_hash: Optional[str] = Field(None, pattern=FILE_HASH_PATTERN)
     telegram_user_id: Optional[int] = Field(None, gt=0)
 
     @field_validator("filename")
@@ -140,6 +153,19 @@ async def auth_verify(request: VerifyRequest):
     )
 
 
+@router.post("/auth/refresh", response_model=RefreshResponse)
+async def auth_refresh(authorization: Optional[str] = Header(None)):
+    """Renew a recently expired JWT without interrupting an active upload.
+
+    This endpoint cannot use ``get_current_user`` because token expiry is the
+    condition it exists to recover from. ``refresh_jwt`` still verifies the
+    signature and enforces a bounded grace period before minting anything.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return RefreshResponse(token=refresh_jwt(authorization.removeprefix("Bearer ")))
+
+
 @router.get("/accounts")
 async def list_accounts(current_user: int = Depends(get_current_user)):
     """Telegram accounts linked to this drive."""
@@ -215,8 +241,8 @@ async def unlink_account(tg_user_id: int, current_user: int = Depends(get_curren
 async def check_file_hash(
     hash: str = Query(
         ...,
-        pattern=r"^[0-9a-fA-F]{64}$",
-        description="SHA-256 hex digest of the file",
+        pattern=FILE_HASH_PATTERN,
+        description="SHA-256 hex digest of the file, optionally `:<original size>`",
     ),
     current_user: int = Depends(get_current_user),
 ):

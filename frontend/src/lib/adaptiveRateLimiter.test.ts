@@ -90,7 +90,7 @@ describe('production exploration ceiling', () => {
     vi.advanceTimersByTime(10_000);
     limiter.reportSuccess();
 
-    expect(CHUNK_RATE_MAX).toBe(32);
+    expect(CHUNK_RATE_MAX).toBe(64);
     expect(MAX_CONCURRENT_CHUNKS).toBe(12);
     expect(limiter.stats().rate).toBe(12.5);
   });

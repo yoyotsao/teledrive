@@ -204,3 +204,38 @@ def test_re_registering_one_split_part_is_not_a_conflict(client, db, run):
 
     assert resp.status_code == 200, resp.text
     assert run(db.get_file("big_part0"))["owner_id"] == OWNER_A
+
+
+# --- file_hash format ---------------------------------------------------------
+#
+# The browser's hash is NOT a bare digest: sha256File() hashes only the first
+# 100MB and appends `:<original size>`, because a truncated copy shares the
+# prefix digest of the complete file and only the size distinguishes them. The
+# endpoint must accept that shape — the backend treats file_hash as an opaque
+# key (equality lookups only), so the suffix costs it nothing.
+
+SIZED_HASH = "a" * 64 + ":8838273312"
+
+
+def test_the_browsers_sized_hash_is_accepted_and_stored(client, db, run):
+    resp = client.post("/api/v1/files/register", json=register_payload(file_hash=SIZED_HASH))
+
+    assert resp.status_code == 200, resp.text
+    assert run(db.get_file("doc1"))["file_hash"] == SIZED_HASH
+
+
+def test_a_bare_digest_is_still_accepted(client, db, run):
+    """Imported files carry no size suffix (see importNaming.ts)."""
+    resp = client.post("/api/v1/files/register", json=register_payload(file_hash="b" * 64))
+
+    assert resp.status_code == 200, resp.text
+    assert run(db.get_file("doc1"))["file_hash"] == "b" * 64
+
+
+def test_a_malformed_hash_is_rejected(client, db, run):
+    """The shape stays constrained — file_hash is a dedup key, and a free-form
+    string lets a caller collide with a row they cannot otherwise name."""
+    for bad in ["not-a-hash", "a" * 63, "a" * 64 + ":", "a" * 64 + ":abc", "a" * 65]:
+        resp = client.post("/api/v1/files/register", json=register_payload(file_hash=bad))
+        assert resp.status_code == 422, f"{bad!r} was accepted: {resp.text}"
+    assert run(db.get_file("doc1")) is None

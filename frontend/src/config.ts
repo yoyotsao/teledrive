@@ -37,6 +37,27 @@ export const MAX_PARTS_PER_FILE = 1000;
 export const CHUNK_RETRY_COUNT = 3;
 
 /**
+ * Deadline for one upload.SaveFilePart / SaveBigFilePart round trip, in ms.
+ *
+ * gramjs's raw `sender.send()` never rejects when the connection breaks — it
+ * abandons the pending request silently — and each part send holds an
+ * uploadSemaphore slot for the whole await. Without this bound a single DC
+ * blip retires a concurrency slot permanently, and the account's upload queue
+ * wedges instead of failing. Sized far above any legitimate 512KB round trip
+ * (pacing already happened before the send) and far below "forever".
+ */
+export const CHUNK_SEND_TIMEOUT_MS = 120_000;
+
+/**
+ * Re-sends allowed per part for faults that are Telegram's, not the file's:
+ * `-500 No workers running`, `-503 Timeout`, a broken sender, or our own send
+ * deadline. Separate from CHUNK_RETRY_COUNT because these resolve by simply
+ * asking again, while that outer budget covers genuine failures. Exhausting it
+ * fails the part loudly — which is the point: a failed part frees its slot.
+ */
+export const CHUNK_TRANSIENT_RETRY_LIMIT = 5;
+
+/**
  * Max Telegram messages (sendFile / SendMultiMedia) sent per second.
  * An album batch of up to 10 files counts as ONE message, so this throttles
  * small-file/album uploads without limiting large-file chunk throughput.
@@ -52,11 +73,12 @@ export const MESSAGE_SENDS_PER_SECOND = 3;
 export const MESSAGE_SEND_BURST = 6;
 
 /**
- * Concurrency for hash pre-pass (reading up to 100MB sample per file).
- * The pre-pass blocks all uploads, so for many-small-file drops higher
- * concurrency shortens the dead time before the first byte reaches Telegram.
+ * Concurrency for hashing (reading up to a 100MB sample per file). Upload
+ * planning is pipelined per file, so a completed hash can start uploading while
+ * the next samples are still being read. Two readers keep that pipeline fed
+ * without allowing eight 100MB WebCrypto inputs to be resident at once.
  */
-export const HASH_CONCURRENCY = 8;
+export const HASH_CONCURRENCY = 2;
 
 /**
  * Max concurrent in-flight /files/check-hash requests during folder uploads.
@@ -104,7 +126,7 @@ export const CHUNK_RATE_MIN = 0.5;
  * above the normal operating range so FLOOD feedback and learned ceilings,
  * rather than this constant, determine each account's sustainable rate.
  */
-export const CHUNK_RATE_MAX = 32;
+export const CHUNK_RATE_MAX = 64;
 
 /** Multiplicative decrease factor applied to the rate on each FLOOD_WAIT. */
 export const CHUNK_RATE_DECREASE_FACTOR = 0.5;

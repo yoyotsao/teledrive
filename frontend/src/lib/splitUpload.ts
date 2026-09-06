@@ -59,8 +59,6 @@ export async function uploadFileSpread(
     onProgress?.(Math.min(99, Math.round((completedChunks / totalChunks) * 100)));
   };
 
-  console.log(`[SplitUpload] ${file.name}: ${segments.length} segment(s), ${totalChunks} parts`);
-
   const results = await Promise.all(segments.map((segment) =>
     // The thumb rides on segment 0 only — it represents the whole file, and the
     // listing reads it from the first part.

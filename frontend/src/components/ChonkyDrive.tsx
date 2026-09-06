@@ -4,13 +4,13 @@ import { sha256File } from '../lib/hashFile';
 import { getPrimaryClient, getClientFor, getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
 import { uploadFileSpread } from '../lib/splitUpload';
 import { withSlotOn, nextAccount } from '../lib/accountPool';
-import { captureThumb, isMediaFile } from '../lib/thumbCapture';
+import { captureThumb, isMediaFile, type ThumbCaptureResult } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { ThumbBatchQueue } from '../lib/thumbQueue';
 import { ALBUM_BATCH } from '../config';
-import { planUploads, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, canonicalExistingParts, assertPartsCoverFile, PlannedFile, RegisterableExistingPart } from '../lib/uploadPlanner';
+import { registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, checkFileHashesBounded, canonicalExistingParts, assertPartsCoverFile, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { ContextMenu, MenuItem } from './ContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -148,12 +148,13 @@ function isAlbumEligibleMedia(file: File): boolean {
  * instead of idling on message sends or backend registration round trips.
  */
 function createAlbumPipeline() {
+  type RoutedAlbumResult = AlbumFileResult & { account_id: number };
   type PendingEntry = {
     prepared: PreparedAlbumFile;
     hash: string | null;
     parentId: string | null;
     onProgress?: (pct: number) => void;
-    resolve: (result: AlbumFileResult | null) => void;
+    resolve: (result: RoutedAlbumResult | null) => void;
   };
 
   // One queue per account. A prepared file's bytes live on the account that
@@ -209,7 +210,7 @@ function createAlbumPipeline() {
           fileHash: entry.hash ?? undefined,
           telegramUserId: client.accountId,
         }).then(
-          () => { entry.onProgress?.(100); entry.resolve({ message_id: res.message_id, file_id: res.file_id, access_hash: res.access_hash, size: res.size, has_thumbnail: res.has_thumbnail }); },
+          () => { entry.onProgress?.(100); entry.resolve({ message_id: res.message_id, file_id: res.file_id, access_hash: res.access_hash, size: res.size, has_thumbnail: res.has_thumbnail, account_id: client.accountId }); },
           (err) => { console.error('[AlbumPipeline] registerFile failed:', err); entry.onProgress?.(100); entry.resolve(null); },
         );
       }));
@@ -222,7 +223,7 @@ function createAlbumPipeline() {
      * bytes are on Telegram's servers. Resolves once the file's batch has
      * been sent and registered (which may happen well after this call returns
      * — the caller awaits the returned promise to know the final outcome). */
-    enqueue(file: File, hash: string | null, parentId: string | null, onProgress?: (pct: number) => void): Promise<AlbumFileResult | null> {
+    enqueue(file: File, hash: string | null, parentId: string | null, onProgress?: (pct: number) => void): Promise<RoutedAlbumResult | null> {
       return new Promise((resolve) => {
         const tQueued = performance.now();
         // The account is chosen here and stays with this file all the way
@@ -230,11 +231,14 @@ function createAlbumPipeline() {
         const client = nextAccount();
         const p = withSlotOn(client, async () => {
           const tSlot = performance.now();
-          const thumb = await captureThumb(file);
+          const { thumb, undecodable } = await captureThumb(file);
           // The album path only ever handles media files, which MUST carry a
           // thumbnail — a null capture (even after retries) fails the upload
-          // rather than silently landing a thumbless file in the drive.
-          if (!thumb) throw new Error(`Thumbnail capture failed for ${file.name}`);
+          // rather than silently landing a thumbless file in the drive. The one
+          // exception is a video the browser cannot decode: no retry produces a
+          // frame, so it goes up as a plain thumbless document instead of being
+          // permanently unstorable.
+          if (!thumb && !undecodable) throw new Error(`Thumbnail capture failed for ${file.name}`);
           const tThumb = performance.now();
           const prepared = await client.prepareAlbumFile(file, thumb);
           console.log(`[Perf] enqueue ${file.name} on account ${client.accountId}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
@@ -331,6 +335,12 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   const isLoadingMoreRef = useRef(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  // Monotonically increasing id for list requests. Upload-time polling and a
+  // normal navigation refresh can overlap; only the newest response may update
+  // the grid, otherwise a slower, older response can make a just-uploaded file
+  // disappear again until the next refresh.
+  const contentsRequestRef = useRef(0);
+  const uploadRefreshInFlightRef = useRef(false);
   const [uploadingFiles, setUploadingFiles] = useState<
     Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>
   >([]);
@@ -454,6 +464,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   }, [fetchPage, loadThumbnails]);
 
   const loadContents = useCallback(async () => {
+    const requestId = ++contentsRequestRef.current;
     thumbnailAbortRef.current?.abort();
     const thumbAbort = new AbortController();
     thumbnailAbortRef.current = thumbAbort;
@@ -466,6 +477,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     setError(null);
     try {
       const { items, total } = await fetchPage(1);
+      if (requestId !== contentsRequestRef.current) return;
       hasMoreRef.current = total > PAGE_SIZE;
 
       const fileEntries: FileData[] = [
@@ -479,18 +491,54 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       loadThumbnails(items, thumbAbort.signal);
       if (hasMoreRef.current) prefetchPage(2, thumbAbort.signal);
     } catch (err) {
+      if (requestId !== contentsRequestRef.current) return;
       setError(err instanceof Error ? err.message : 'Failed to load files');
       setFiles([]);
       setOriginalFiles([]);
     } finally {
-      setLoading(false);
+      if (requestId === contentsRequestRef.current) setLoading(false);
     }
   }, [fetchPage, loadThumbnails, prefetchPage]);
 
+  // During a multi-file upload, metadata is registered one file at a time but
+  // the old code refreshed only after the entire batch settled. Poll the first
+  // page quietly while work is active so completed files appear promptly. The
+  // in-flight guard bounds this to one list request at a time even on a slow
+  // backend, and the final loadContents() still performs a full authoritative
+  // refresh when the batch ends.
+  const refreshUploadedContents = useCallback(async () => {
+    if (uploadRefreshInFlightRef.current) return;
+    uploadRefreshInFlightRef.current = true;
+    const requestId = ++contentsRequestRef.current;
+    try {
+      const { items, total } = await fetchPage(1);
+      if (requestId !== contentsRequestRef.current) return;
+
+      currentPageRef.current = 1;
+      hasMoreRef.current = total > PAGE_SIZE;
+      prefetchRef.current = null;
+      setFiles([
+        ...items.filter((f) => f.isDir).map(toFileData),
+        ...items.filter((f) => !f.isDir).map(toFileData),
+      ]);
+      setOriginalFiles(items);
+
+      const signal = thumbnailAbortRef.current?.signal;
+      loadThumbnails(items, signal);
+      if (hasMoreRef.current) prefetchPage(2, signal);
+    } catch (err) {
+      // An upload should keep running even if one background list refresh
+      // fails. The next tick (or the final full refresh) will retry.
+      console.warn('[Upload] Failed to refresh file list:', err);
+    } finally {
+      uploadRefreshInFlightRef.current = false;
+    }
+  }, [fetchPage, loadThumbnails, prefetchPage]);
   const loadMoreFiles = useCallback(async () => {
     if (isLoadingMoreRef.current || !hasMoreRef.current) return;
     isLoadingMoreRef.current = true;
     setIsLoadingMore(true);
+    const requestId = contentsRequestRef.current;
     const nextPage = currentPageRef.current + 1;
     const signal = thumbnailAbortRef.current?.signal;
     // Already prefetched? Take that fetch (and its already-queued thumbnails).
@@ -498,6 +546,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     prefetchRef.current = null;
     try {
       const { items, total } = await (prefetched ? prefetched.promise : fetchPage(nextPage));
+      if (requestId !== contentsRequestRef.current) return;
       currentPageRef.current = nextPage;
       hasMoreRef.current = nextPage * PAGE_SIZE < total;
       setOriginalFiles((prev) => [...prev, ...items]);
@@ -533,6 +582,15 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     loadContents();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadContents]);
+
+  const uploadInProgress = uploadingFiles.some((file) => file.status === 'uploading');
+  useEffect(() => {
+    if (!canModify || !uploadInProgress) return;
+    const timer = window.setInterval(() => {
+      void refreshUploadedContents();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [canModify, uploadInProgress, refreshUploadedContents]);
 
   // Rebuild the breadcrumb from the parent_id chain so deep-links / reloads work.
   useEffect(() => {
@@ -748,7 +806,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     event.preventDefault();
   }, []);
 
-  // precomputedHash: string when planUploads() already proved the file is fresh (skip
+  // precomputedHash: string when the streaming planner already proved the file is fresh (skip
   // internal dedup check); null when hashing failed at plan time (upload without dedup);
   // undefined when called without a pre-pass (legacy fallback: check for duplicates here).
   //
@@ -768,7 +826,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     // Start thumbnail capture NOW from the local file so it runs concurrently with
     // the dedup check. Capturing a frame from a local file takes < 1 second
     // regardless of file size.
-    const thumbPromise: Promise<Blob | null> = captureThumb(file, 60000);
+    const thumbPromise: Promise<ThumbCaptureResult> = captureThumb(file, 60000);
 
     let fileHash: string | null = precomputedHash ?? null;
     if (precomputedHash === undefined) {
@@ -784,10 +842,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           ? canonicalExistingParts(hashCheck.files, file.size)
           : [];
         if (asExisting.length > 0) {
-          console.log('[Upload] Duplicate detected by hash, skipping Telegram upload for:', file.name);
           onProgress?.(100);
           await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
-          console.log('[Upload] Dedup: registered', asExisting.length, 'parts from existing upload');
           return {
             // file_id is unused here — alreadyRegistered=true tells the caller to
             // skip registerUploadedParts, which is the only consumer that needs it.
@@ -799,11 +855,13 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       }
     }
 
-    const thumbBlob = await thumbPromise;
+    const { thumb: thumbBlob, undecodable } = await thumbPromise;
     // Media files must carry a thumbnail — if capture failed (even after retries)
     // the upload fails instead of registering a thumbless media file. Non-media
-    // files legitimately have no thumbnail.
-    if (isMediaFile(file) && !thumbBlob) {
+    // files legitimately have no thumbnail, and so does a video whose codec the
+    // browser has no decoder for (`undecodable`) — there is no frame to capture
+    // on any attempt, so it registers thumbless rather than never uploading.
+    if (isMediaFile(file) && !thumbBlob && !undecodable) {
       throw new Error(`Thumbnail capture failed for ${file.name}`);
     }
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
@@ -858,9 +916,9 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   type UploadRow = { name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string };
 
   /**
-   * Shared upload entry point for drag-drop and the file picker. Runs the dedup
-   * pre-pass BEFORE any file touches fileSemaphore, so duplicates (which never
-   * hit Telegram) can't hold a concurrency slot that a real upload needs.
+   * Shared upload entry point for drag-drop and the file picker. Each file
+   * passes its dedup check before it touches an upload slot, while already
+   * checked files can upload in parallel with the remaining hash work.
    */
   const startUploadBatch = async (selectedFiles: File[]): Promise<void> => {
     const initialFiles: UploadRow[] = selectedFiles.map((f) => ({
@@ -881,101 +939,127 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       setUploadingFiles([...results]);
     };
 
-    const plan = await planUploads(selectedFiles);
+    // Route each file independently: hash -> dedup lookup -> upload/register.
+    // There is no whole-batch planning barrier, so the first fresh file starts
+    // sending while later files are still hashing. Browser File objects are
+    // lazy handles; hashing reads only the first 100MB and large uploads later
+    // read 512KB slices on demand.
+    const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
+    const albumPipeline = createAlbumPipeline();
+    const uploadPromises: Promise<void>[] = [];
 
-    // Duplicates already in the DB: register immediately, never touch fileSemaphore.
-    const registerSemaphore = new Semaphore(8);
-    const duplicatePromises = plan.duplicates.map((dup) =>
-      registerSemaphore.withSlot(() =>
-        // dup.parts, never dup.existing: /check-hash returns every row sharing
-        // the hash, so registering them one-for-one multiplies the record count
-        // on each re-upload. planUploads has already collapsed them to one part
-        // per index and proven they cover the file.
-        registerDuplicateParts(dup.file, dup.hash, dup.parts, currentFolderId)
-      ).then(() => {
-        setRowStatus(dup.file, { progress: 100, status: 'complete' });
-      }).catch((err: any) => {
-        setRowStatus(dup.file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : '註冊失敗' });
-      })
-    );
+    // The first fresh file with a hash publishes its registered Telegram parts.
+    // Later identical files in this selection wait for that promise and create
+    // metadata only, preserving batch-local dedup without an upfront pre-pass.
+    const claimedHashes = new Map<string, Promise<RegisterableExistingPart[] | null>>();
 
-    // Files sharing a hash within this selection: only the representative
-    // uploads for real; dependents register against its result once it's done.
-    const registerDependents = async (
-      planned: PlannedFile,
-      parts: Array<{ message_id: number; access_hash?: string; size: number }> | null,
-      mimeType: string,
-    ) => {
-      if (planned.dependents.length === 0) return;
-      if (!parts || parts.length === 0) {
-        planned.dependents.forEach((dep) => setRowStatus(dep, { progress: 0, status: 'error', error: '來源檔案上傳失敗' }));
+    const routingPromises = selectedFiles.map(async (file) => {
+      const fileHash = await hashFileBounded(file);
+
+      if (fileHash) {
+        const checked = await checkFileHashesBounded([fileHash]);
+        const existing = checked[fileHash] ?? [];
+        const reusable = canonicalExistingParts(existing, file.size);
+        if (reusable.length > 0) {
+          uploadPromises.push(
+            registerDuplicateParts(file, fileHash, reusable, currentFolderId)
+              .then(() => setRowStatus(file, { progress: 100, status: 'complete' }))
+              .catch((err: unknown) => setRowStatus(file, {
+                progress: 0,
+                status: 'error',
+                error: err instanceof Error ? err.message : 'Registration failed',
+              })),
+          );
+          return;
+        }
+        if (existing.length > 0) {
+          console.warn('[Upload] Hash matched but stored copy is incomplete, re-uploading:', file.name);
+        }
+      }
+
+      let publishParts: (parts: RegisterableExistingPart[] | null) => void = () => {};
+      if (fileHash) {
+        const claimed = claimedHashes.get(fileHash);
+        if (claimed) {
+          uploadPromises.push(
+            claimed.then(async (parts) => {
+              if (!parts || parts.length === 0) throw new Error('Matching upload failed');
+              await registerDuplicateParts(file, fileHash, parts, currentFolderId);
+              setRowStatus(file, { progress: 100, status: 'complete' });
+            }).catch((err: unknown) => setRowStatus(file, {
+              progress: 0,
+              status: 'error',
+              error: err instanceof Error ? err.message : 'Registration failed',
+            })),
+          );
+          return;
+        }
+        claimedHashes.set(
+          fileHash,
+          new Promise<RegisterableExistingPart[] | null>((resolve) => { publishParts = resolve; }),
+        );
+      }
+
+      if (isAlbumEligibleMedia(file) && file.size <= SINGLE_PATH_SIZE_LIMIT) {
+        uploadPromises.push(
+          albumPipeline.enqueue(file, fileHash, currentFolderId, (pct) => setRowStatus(file, { progress: pct }))
+            .then((res) => {
+              if (!res) throw new Error('Upload failed');
+              publishParts([{
+                filesize: res.size,
+                mime_type: file.type || null,
+                telegram_message_id: res.message_id,
+                access_hash: res.access_hash,
+                part_index: 0,
+                has_thumbnail: res.has_thumbnail,
+                telegram_user_id: res.account_id,
+              }]);
+              setRowStatus(file, { progress: 100, status: 'complete' });
+            }).catch((err: unknown) => {
+              publishParts(null);
+              setRowStatus(file, {
+                progress: 0,
+                status: 'error',
+                error: err instanceof Error ? err.message : 'Upload failed',
+              });
+            }),
+        );
         return;
       }
-      const asExisting = parts.map((p, i) => ({
-        filesize: p.size,
-        mime_type: mimeType,
-        telegram_message_id: p.message_id,
-        access_hash: p.access_hash,
-        part_index: i,
-        has_thumbnail: i === 0 ? (p as any).has_thumbnail ?? false : false,
-      }));
-      await Promise.all(planned.dependents.map((dep) =>
-        registerDuplicateParts(dep, planned.hash, asExisting, currentFolderId)
-          .then(() => setRowStatus(dep, { progress: 100, status: 'complete' }))
-          .catch((err: any) => setRowStatus(dep, { progress: 0, status: 'error', error: err instanceof Error ? err.message : '註冊失敗' }))
-      ));
-    };
 
-    // Only images/videos are eligible for Telegram album grouping. Large media
-    // (needs the split/chunked upload path) and every other file type always
-    // go through the classic single-file path.
-    const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
-    const albumEligible: PlannedFile[] = [];
-    const singleFileOnly: PlannedFile[] = [];
-    plan.fresh.forEach((p) => {
-      if (isAlbumEligibleMedia(p.file) && p.file.size <= SINGLE_PATH_SIZE_LIMIT) {
-        albumEligible.push(p);
-      } else {
-        singleFileOnly.push(p);
-      }
+      // uploadFileSpread claims an account slot only after the hash check.
+      // Its large-file path reads and sends bounded chunks incrementally.
+      uploadPromises.push(
+        uploadFileToTelegram(file, (pct) => setRowStatus(file, { progress: pct }), fileHash)
+          .then(async (result) => {
+            if (!result.alreadyRegistered) {
+              await registerUploadedParts(file, result.fileHash, result.parts, currentFolderId);
+            }
+            publishParts(result.parts.map((part, i) => ({
+              filesize: part.size,
+              mime_type: file.type || null,
+              telegram_message_id: part.message_id,
+              access_hash: part.access_hash,
+              part_index: i,
+              has_thumbnail: i === 0 && part.has_thumbnail,
+              telegram_user_id: part.account_id,
+            })));
+            setRowStatus(file, { progress: 100, status: 'complete' });
+          }).catch((err: unknown) => {
+            publishParts(null);
+            setRowStatus(file, {
+              progress: 0,
+              status: 'error',
+              error: err instanceof Error ? err.message : 'Upload failed',
+            });
+          }),
+      );
     });
 
-    // No global gate any more: uploadFileSpread claims a slot on whichever
-    // account it dispatches to, so N accounts give N independent budgets.
-    const albumPipeline = createAlbumPipeline();
-
-    const singlePromises = singleFileOnly.map((planned) => {
-      const file = planned.file;
-      return uploadFileToTelegram(file, (pct) => setRowStatus(file, { progress: pct }), planned.hash)
-      .then(async (result) => {
-        if (!result.alreadyRegistered) {
-          await registerUploadedParts(file, result.fileHash, result.parts, currentFolderId);
-        }
-        setRowStatus(file, { progress: 100, status: 'complete' });
-        await registerDependents(planned, result.parts, file.type);
-      }).catch(async (err: any) => {
-        setRowStatus(file, { progress: 0, status: 'error', error: err instanceof Error ? err.message : 'Upload failed' });
-        await registerDependents(planned, null, file.type);
-      });
-    });
-
-    // Each album-eligible file is enqueued individually — the pipeline groups
-    // them into ALBUM_BATCH-sized albums itself once enough have prepared, so
-    // fileSemaphore only ever gates the byte-upload step (see createAlbumPipeline).
-    const albumFilePromises = albumEligible.map((planned) =>
-      albumPipeline.enqueue(planned.file, planned.hash, currentFolderId, (pct) => setRowStatus(planned.file, { progress: pct }))
-        .then(async (res) => {
-          if (res) {
-            setRowStatus(planned.file, { progress: 100, status: 'complete' });
-            await registerDependents(planned, [res], planned.file.type);
-          } else {
-            setRowStatus(planned.file, { progress: 0, status: 'error', error: 'Upload failed' });
-            await registerDependents(planned, null, planned.file.type);
-          }
-        })
-    );
-
-    await Promise.allSettled([...duplicatePromises, ...singlePromises, ...albumFilePromises, albumPipeline.flush()]);
+    // flush() must see every album enqueue. Uploads have already started while
+    // these routing promises settle, so this wait is not an upload barrier.
+    await Promise.allSettled(routingPromises);
+    await Promise.allSettled([...uploadPromises, albumPipeline.flush()]);
 
     logChunkRates('batch done');
 
@@ -1114,10 +1198,11 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>;
       hasThumbnail: boolean;
     }> => {
-      const thumbBlob = await captureThumb(file);
+      const { thumb: thumbBlob, undecodable } = await captureThumb(file);
       // Media files must carry a thumbnail — fail rather than register a
-      // thumbless media file. Non-media files legitimately have none.
-      if (isMediaFile(file) && !thumbBlob) {
+      // thumbless media file. Non-media files legitimately have none, and so
+      // does a video the browser cannot decode (`undecodable`).
+      if (isMediaFile(file) && !thumbBlob && !undecodable) {
         throw new Error(`Thumbnail capture failed for ${file.name}`);
       }
       const uploadResult = await uploadFileSpread(file, undefined, thumbBlob);
@@ -1160,8 +1245,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
     const albumPipeline = createAlbumPipeline();
 
-    // Batch-scoped content dedup. The folder walk streams files, so planUploads'
-    // upfront hash grouping can't be used here: two identical files both miss
+    // Batch-scoped content dedup. The folder walk streams files, so two
+    // identical files can both miss
     // /check-hash (neither is registered yet) and each uploads its own copy —
     // that is how a single folder ended up holding 110 physical copies of the
     // same 324KB image under 110 different names. The first file to claim a hash
@@ -1222,7 +1307,6 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   ? canonicalExistingParts(hashCheck.files, file.size)
                   : [];
                 if (asExisting.length > 0) {
-                  console.log('[Upload] Duplicate detected by hash (folder upload):', file.name);
                   const folderId = await ensureFolder(folderPath);
                   await registerDuplicateParts(file, fileHash, asExisting, folderId);
                   completed++;
@@ -1241,7 +1325,6 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
               if (fileHash) {
                 const claimed = claimedHashes.get(fileHash);
                 if (claimed) {
-                  console.log('[Upload] Duplicate detected within batch (folder upload):', file.name);
                   const folderId = await ensureFolder(folderPath);
                   // Queued as an upload promise instead of awaited here: waiting on
                   // the claim inside a discovery promise would deadlock the album
@@ -1286,6 +1369,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                           access_hash: res.access_hash,
                           part_index: 0,
                           has_thumbnail: res.has_thumbnail,
+                          telegram_user_id: res.account_id,
                         }]);
                         completed++;
                         updateVisible(file.name, { progress: 100, status: 'complete' });

@@ -62,6 +62,15 @@ function App() {
     return () => { cancelled = true; };
   }, []);
 
+  // A token older than the backend's bounded refresh window needs a fresh
+  // Telegram proof. Keep the saved MTProto sessions intact so this does not
+  // disconnect accounts merely because backend authorization expired.
+  useEffect(() => {
+    const handleExpiredAuth = () => setAuthState('unauthenticated');
+    window.addEventListener('teledrive:auth-expired', handleExpiredAuth);
+    return () => window.removeEventListener('teledrive:auth-expired', handleExpiredAuth);
+  }, []);
+
   // Prove our identity to the backend by DMing a one-time nonce to its bot —
   // Telegram reports who sent it, so the session string stays in this browser.
   const handleLogin = async (sessionString: string, client: TelegramClientManager) => {

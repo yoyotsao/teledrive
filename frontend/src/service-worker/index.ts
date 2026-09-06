@@ -359,10 +359,7 @@ async function requestFileMetadata(fileId: string, messageId: string, accountId:
 self.addEventListener('fetch', (event: FetchEvent) => {
   const url = new URL(event.request.url);
 
-  console.log('[ServiceWorker] Fetch intercepted:', url.pathname);
-
   if (!url.pathname.startsWith(VIDEO_PREVIEW_PATH)) {
-    console.log('[ServiceWorker] Non-video route - passing through:', url.pathname);
     return;
   }
 

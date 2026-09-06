@@ -1,12 +1,38 @@
 import axios from 'axios';
 import { FileListResponse, FileInfo } from '../types';
-import { loadJwt } from '../lib/gramjs';
+import { loadJwt, saveJwt } from '../lib/gramjs';
 
 const client = axios.create({
   baseURL: '/api/v1',
   timeout: 30000, // metadata requests only; file bytes never use this client
 });
 
+type RetryableRequest = NonNullable<Parameters<typeof client.request>[0]> & {
+  _teledriveAuthRetried?: boolean;
+};
+
+let refreshPromise: Promise<string> | null = null;
+
+/**
+ * Refresh all concurrent metadata requests through one shared exchange. A
+ * batch upload can have dozens of check/register calls in flight when the JWT
+ * expires; without the single-flight promise they would all race to refresh.
+ */
+async function refreshAccessToken(staleToken: string): Promise<string> {
+  if (!refreshPromise) {
+    refreshPromise = axios.post<{ token: string }>(
+      '/api/v1/auth/refresh',
+      undefined,
+      { headers: { Authorization: `Bearer ${staleToken}` }, timeout: 15000 },
+    ).then(async (response) => {
+      await saveJwt(response.data.token);
+      return response.data.token;
+    }).finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
 client.interceptors.request.use((config) => {
   const token = loadJwt();
   if (token) {
@@ -14,6 +40,37 @@ client.interceptors.request.use((config) => {
   }
   return config;
 });
+
+client.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const request = error?.config as RetryableRequest | undefined;
+    const currentToken = loadJwt();
+    if (error?.response?.status !== 401 || !request || request._teledriveAuthRetried || !currentToken) {
+      throw error;
+    }
+
+    request._teledriveAuthRetried = true;
+    try {
+      // A slower request may return its 401 after another request has already
+      // refreshed the credential. In that case retry with the current token;
+      // refreshing again would turn one expiry into a refresh storm.
+      const sentAuthorization = request.headers?.Authorization ?? request.headers?.authorization;
+      const sentToken = typeof sentAuthorization === 'string' && sentAuthorization.startsWith('Bearer ')
+        ? sentAuthorization.slice('Bearer '.length)
+        : null;
+      const token = sentToken && sentToken !== currentToken
+        ? currentToken
+        : await refreshAccessToken(currentToken);
+      request.headers = request.headers ?? {};
+      request.headers.Authorization = `Bearer ${token}`;
+      return client.request(request);
+    } catch (refreshError) {
+      window.dispatchEvent(new CustomEvent('teledrive:auth-expired'));
+      throw refreshError;
+    }
+  },
+);
 
 export interface LoginResponse {
   token: string;

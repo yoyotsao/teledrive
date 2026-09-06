@@ -6,6 +6,8 @@ import bigInt from "big-integer";
 import {
   MAX_CONCURRENT_CHUNKS,
   CHUNK_RETRY_COUNT,
+  CHUNK_SEND_TIMEOUT_MS,
+  CHUNK_TRANSIENT_RETRY_LIMIT,
   MESSAGE_SENDS_PER_SECOND,
   MESSAGE_SEND_BURST,
   ALBUM_SEND_TIMEOUT_MS,
@@ -40,6 +42,7 @@ import { Semaphore } from "./semaphore";
 import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
 import { readMedia, isOwnAccount, senderDcFor, type MediaRef } from "./telegramMedia";
+import { sendWithDeadline, isTransientServerError } from './chunkSendGuard';
 import { unwrapForwardedMessage } from "./forwardResult";
 import { installPremiumFloodTag, isPremiumFlood } from "./gramjsFloodPatch";
 import { formatAccountLog, resolveAccountLogName } from "./accountLog";
@@ -288,7 +291,16 @@ export class TelegramClientManager {
    * invoke's floodSleepThreshold auto-sleep is per-request and silent, so
    * concurrent parts each sleep and retry on their own schedule — exactly the
    * herd behavior the pacer's virtual-time scheduling avoids.
-   * Non-flood errors are thrown to the caller (which has its own retry loop).
+   *
+   * Both the sender handoff and the send itself run under a deadline. Neither
+   * can be trusted to settle on its own: getSender's _connectSender retries in
+   * an unbounded while(true), and MTProtoSender.send() returns a promise that
+   * gramjs abandons — never rejects — when the connection breaks. The caller
+   * holds an uploadSemaphore slot for this whole call, so an unbounded wait
+   * here costs the account that slot permanently.
+   *
+   * Non-flood, non-transient errors are thrown to the caller (which has its
+   * own retry loop).
    */
   private async sendFilePartGated(
     request: InstanceType<typeof Api.upload.SaveFilePart> | InstanceType<typeof Api.upload.SaveBigFilePart>,
@@ -296,12 +308,15 @@ export class TelegramClientManager {
   ): Promise<void> {
     const client = this.client!;
     let floodRetries = 0;
+    let transientRetries = 0;
     for (;;) {
       await this.chunkPacer.wait();
       let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
       try {
-        sender = await (client as any).getSender((client.session as any).dcId);
-        await sender!.send(request);
+        await sendWithDeadline(async () => {
+          sender = await (client as any).getSender((client.session as any).dcId);
+          return await sender!.send(request);
+        }, CHUNK_SEND_TIMEOUT_MS, label);
         this.chunkPacer.reportSuccess();
         return;
       } catch (err) {
@@ -320,8 +335,20 @@ export class TelegramClientManager {
           }
           continue;
         }
-        if (sender && sender.isConnected && !sender.isConnected()) {
-          await new Promise((r) => setTimeout(r, 1000));
+        // Telegram's fault, not this part's: a DC that briefly cannot serve
+        // (-500/-503), a sender that went away, or a send that blew its
+        // deadline. Re-sending the identical part is the right answer to all
+        // three — but only a bounded number of times. The old code spun here
+        // forever while the sender stayed down, and since the caller holds an
+        // uploadSemaphore slot for the whole call, that spin retired the slot
+        // for good. Failing loudly gives the slot back.
+        const senderDown = !!(sender && sender.isConnected && !sender.isConnected());
+        if (isTransientServerError(err) || senderDown) {
+          if (++transientRetries > CHUNK_TRANSIENT_RETRY_LIMIT) throw err;
+          console.warn(
+            `[GramJS:${this.accountId}] ${label} transient failure (${(err as Error)?.message ?? err}) — resend ${transientRetries}/${CHUNK_TRANSIENT_RETRY_LIMIT}`,
+          );
+          await new Promise((r) => setTimeout(r, Math.min(8000, 1000 * 2 ** (transientRetries - 1))));
           continue;
         }
         throw err;
@@ -696,6 +723,14 @@ export class TelegramClientManager {
         } catch (err) {
           if (isFloodError(err) && attempt < CHUNK_RETRY_COUNT - 1) {
             this.penalizeForFlood(`UploadMedia(${file.name})`, err);
+            continue;
+          }
+          // A DC that answers -500/-503 has not rejected the media; it is
+          // momentarily unable to serve. Failing the whole file here threw away
+          // parts that had already been uploaded successfully.
+          if (isTransientServerError(err) && attempt < CHUNK_RETRY_COUNT - 1) {
+            console.warn(`[GramJS:${this.accountId}] UploadMedia(${file.name}) transient failure — retrying:`, err);
+            await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
             continue;
           }
           throw err;

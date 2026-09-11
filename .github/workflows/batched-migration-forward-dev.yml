@@ -13,6 +13,7 @@ on:
       - frontend/src/maintenance/migrateSavedMessagesToChannel.ts
       - frontend/src/maintenance/migrateSavedMessagesToChannel.test.ts
       - frontend/src/maintenance/migrateSavedMessagesToChannel.photo.test.ts
+      - frontend/src/maintenance/migrateSavedMessagesToChannel.batch.test.ts
 
 permissions:
   contents: read
@@ -41,5 +42,8 @@ jobs:
         run: >-
           npx vitest run
           src/lib/forwardResult.test.ts
+          src/lib/gramjs.forwardBatch.test.ts
+          src/lib/gramjsTargetAware.test.ts
           src/maintenance/migrateSavedMessagesToChannel.test.ts
           src/maintenance/migrateSavedMessagesToChannel.photo.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.batch.test.ts

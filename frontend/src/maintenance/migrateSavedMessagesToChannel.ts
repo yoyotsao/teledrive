@@ -1,5 +1,6 @@
 import {
   api,
+  type StorageMigrationGroup,
   type StorageMigrationItem,
   type StorageMigrationJob,
   type TelegramOperation,
@@ -41,6 +42,18 @@ type MigrationTelegramHook = {
   }): Promise<MigrationMediaResult | null>;
 };
 
+export type MigrationRunProgress = {
+  phase: 'running' | 'paused' | 'idle';
+  currentGroupId?: string;
+  currentSourceAccount?: number;
+  lastError?: string;
+};
+
+type RunControl = {
+  runId: string;
+  pauseRequested: boolean;
+};
+
 declare global {
   interface Window {
     __TELEDRIVE_MIGRATION_TELEGRAM__?: MigrationTelegramHook;
@@ -48,6 +61,8 @@ declare global {
 }
 
 const LEASE_SECONDS = 60;
+const GROUP_PAGE_SIZE = 25;
+const activeRuns = new Map<string, RunControl>();
 
 function isConflict(error: unknown): boolean {
   return Number((error as any)?.response?.status) === 409;
@@ -176,7 +191,7 @@ function resultMapping(operation: TelegramOperation, result: MigrationMediaResul
 async function ensureOperation(job: StorageMigrationJob, item: StorageMigrationItem): Promise<TelegramOperation> {
   if (item.operation_id) return api.getTelegramOperation(item.operation_id);
   const sourceAccountId = sourceNumber(item, 'telegram_user_id');
-  const operation = await api.createTelegramOperation({
+  return api.createTelegramOperation({
     operation_id: generateOperationId(item),
     kind: 'migration',
     logical_file_id: item.file_id,
@@ -192,7 +207,6 @@ async function ensureOperation(job: StorageMigrationJob, item: StorageMigrationI
     rpc_kind: 'messages.forwardMessages',
     request_metadata: { source: item.source_location },
   });
-  return operation;
 }
 
 async function markOperationSending(operation: TelegramOperation): Promise<TelegramOperation> {
@@ -208,23 +222,21 @@ async function markOperationSending(operation: TelegramOperation): Promise<Teleg
 async function attachAndLease(
   item: StorageMigrationItem,
   operation: TelegramOperation,
+  leaseOwner: string,
   requestedState?: string,
 ): Promise<StorageMigrationItem> {
   return api.claimMigrationItem({
     migrationId: item.migration_id,
     itemId: item.item_id,
     expectedVersion: item.version,
-    leaseOwner: `browser:${operation.uploader_id}`,
+    leaseOwner,
     leaseSeconds: LEASE_SECONDS,
     operationId: operation.operation_id,
     state: requestedState,
   });
 }
 
-async function persistResult(
-  operation: TelegramOperation,
-  result: MigrationMediaResult,
-): Promise<TelegramOperation> {
+async function persistResult(operation: TelegramOperation, result: MigrationMediaResult): Promise<TelegramOperation> {
   const { mapping, mediaIdentity } = resultMapping(operation, result);
   return api.persistReconciledOperationResult({
     operationId: operation.operation_id,
@@ -239,8 +251,7 @@ async function recoverWithoutBlindSend(
   item: StorageMigrationItem,
   operation: TelegramOperation,
 ): Promise<StorageMigrationItem> {
-  const adapter = telegramAdapter();
-  const result = await adapter.readDestination({
+  const result = await telegramAdapter().readDestination({
     accountId: operation.uploader_id,
     targetChannelId: job.target_channel_id,
     randomId: operation.random_id,
@@ -260,11 +271,12 @@ async function recoverWithoutBlindSend(
 async function forwardItem(
   job: StorageMigrationJob,
   item: StorageMigrationItem,
+  leaseOwner: string,
 ): Promise<StorageMigrationItem> {
   let operation = await ensureOperation(job, item);
   let leased = item;
   if (!item.operation_id || !['sending', 'recovering'].includes(item.state)) {
-    leased = await attachAndLease(item, operation);
+    leased = await attachAndLease(item, operation, leaseOwner);
   }
   operation = await markOperationSending(operation);
 
@@ -303,10 +315,7 @@ function sameMedia(result: MigrationMediaResult, operation: TelegramOperation): 
     && (result.photoVariant ?? null) === (operation.destination_photo_variant ?? null);
 }
 
-async function collectEvidence(
-  job: StorageMigrationJob,
-  item: StorageMigrationItem,
-): Promise<StorageMigrationItem> {
+async function collectEvidence(job: StorageMigrationJob, item: StorageMigrationItem): Promise<StorageMigrationItem> {
   if (!item.operation_id) return item;
   const operation = await api.getTelegramOperation(item.operation_id);
   if (operation.result_version == null || operation.destination_message_id == null) return item;
@@ -349,7 +358,11 @@ async function collectEvidence(
   return current;
 }
 
-async function processItem(job: StorageMigrationJob, item: StorageMigrationItem): Promise<StorageMigrationItem> {
+async function processItem(
+  job: StorageMigrationJob,
+  item: StorageMigrationItem,
+  leaseOwner: string,
+): Promise<StorageMigrationItem> {
   if (['applied', 'rolled_back', 'blocked', 'failed'].includes(item.state)) return item;
   let current = item;
   if (item.state === 'uncertain') {
@@ -357,14 +370,14 @@ async function processItem(job: StorageMigrationJob, item: StorageMigrationItem)
     current = await recoverWithoutBlindSend(job, item, await api.getTelegramOperation(item.operation_id));
     if (current.state === 'uncertain') return current;
   } else if (['planned', 'retryable'].includes(item.state)) {
-    current = await forwardItem(job, item);
+    current = await forwardItem(job, item, leaseOwner);
   } else if (['sending', 'recovering'].includes(item.state)) {
     if (!item.operation_id) return item;
     const operation = await api.getTelegramOperation(item.operation_id);
     current = await recoverWithoutBlindSend(job, item, operation);
     if (current.state === item.state) {
-      // Sending/recovering may safely replay the *same persisted random id*.
-      current = await forwardItem(job, item);
+      // Sending/recovering may safely replay the same persisted random id only.
+      current = await forwardItem(job, item, leaseOwner);
     }
   }
   if (['forwarded', 'pending_quorum', 'verified'].includes(current.state)) {
@@ -373,54 +386,197 @@ async function processItem(job: StorageMigrationJob, item: StorageMigrationItem)
   return current;
 }
 
-export async function runMigrationJob(jobId: string): Promise<StorageMigrationJob> {
+function expectedVersions(group: StorageMigrationGroup): Record<string, number> {
+  return Object.fromEntries(group.items.map(item => [item.item_id, item.version]));
+}
+
+export function pauseMigrationJob(jobId: string): void {
+  const control = activeRuns.get(jobId);
+  if (control) control.pauseRequested = true;
+}
+
+export async function runMigrationJob(
+  jobId: string,
+  onProgress?: (progress: MigrationRunProgress) => void,
+): Promise<StorageMigrationJob> {
   let job = await api.getMigrationJob(jobId);
   if (job.dry_run || ['completed', 'rolled_back'].includes(job.state)) return job;
-  const groupIds = [...new Set(job.items.map(item => item.group_id))];
+
+  const control: RunControl = { runId: `browser:${crypto.randomUUID()}`, pauseRequested: false };
+  activeRuns.set(jobId, control);
+  onProgress?.({ phase: 'running' });
 
   try {
-    for (const groupId of groupIds) {
-      const group = job.items.filter(item => item.group_id === groupId);
-      for (const item of group) await processItem(job, item);
-      job = await api.getMigrationJob(jobId);
-      const freshGroup = job.items.filter(item => item.group_id === groupId);
-      if (freshGroup.length > 0 && freshGroup.every(item => item.state === 'verified')) {
-        job = await api.commitMigrationGroup({
-          migrationId: jobId,
-          groupId,
-          expectedJobVersion: job.version,
-          expectedItemVersions: Object.fromEntries(freshGroup.map(item => [item.item_id, item.version])),
+    while (!control.pauseRequested) {
+      const page = await api.listMigrationGroups({
+        migrationId: jobId,
+        scope: 'runnable',
+        limit: GROUP_PAGE_SIZE,
+      });
+      if (page.groups.length === 0) break;
+
+      let claimed: StorageMigrationGroup | null = null;
+      for (const candidate of page.groups) {
+        if (control.pauseRequested) break;
+        try {
+          const result = await api.claimMigrationGroup({
+            migrationId: jobId,
+            groupId: candidate.group_id,
+            expectedItemVersions: expectedVersions(candidate),
+            leaseOwner: control.runId,
+            leaseSeconds: LEASE_SECONDS,
+          });
+          claimed = result.group;
+          job = result.job;
+          break;
+        } catch (error) {
+          if (!isConflict(error)) throw error;
+          job = await api.getMigrationJob(jobId);
+        }
+      }
+      if (!claimed) break;
+
+      onProgress?.({ phase: 'running', currentGroupId: claimed.group_id });
+      const processed: StorageMigrationItem[] = [];
+      for (const item of claimed.items) {
+        if (control.pauseRequested) break;
+        onProgress?.({
+          phase: 'running',
+          currentGroupId: claimed.group_id,
+          currentSourceAccount: sourceNumber(item, 'telegram_user_id'),
         });
+        processed.push(await processItem(job, item, control.runId));
+      }
+
+      if (control.pauseRequested) break;
+      if (processed.length !== claimed.items.length) break;
+
+      // Item/evidence mutations each bump the job version. Refresh only the bounded
+      // summary before commit; never hydrate the entire manifest.
+      job = await api.getMigrationJob(jobId);
+      if (processed.length > 0 && processed.every(item => item.state === 'verified')) {
+        try {
+          const result = await api.commitMigrationGroup({
+            migrationId: jobId,
+            groupId: claimed.group_id,
+            expectedJobVersion: job.version,
+            expectedItemVersions: Object.fromEntries(processed.map(item => [item.item_id, item.version])),
+          });
+          job = result.job;
+          if (job.state === 'completed') break;
+        } catch (error) {
+          if (!isConflict(error)) throw error;
+          job = await api.getMigrationJob(jobId);
+        }
+      } else {
+        // This group is waiting on quorum/recovery/retry. Its active lease keeps
+        // it out of the next runnable page; do not spin on it in this browser run.
+        break;
       }
     }
-    return await api.getMigrationJob(jobId);
+    job = await api.getMigrationJob(jobId);
+    if (control.pauseRequested) onProgress?.({ phase: 'paused' });
+    else onProgress?.({ phase: 'idle' });
+    return job;
   } catch (error) {
+    onProgress?.({
+      phase: control.pauseRequested ? 'paused' : 'idle',
+      lastError: (error as any)?.response?.data?.detail ?? (error as Error)?.message ?? String(error),
+    });
     if (isConflict(error)) return api.getMigrationJob(jobId);
     throw error;
+  } finally {
+    if (activeRuns.get(jobId) === control) activeRuns.delete(jobId);
   }
 }
 
-export function resumeMigrationJob(jobId: string): Promise<StorageMigrationJob> {
-  return runMigrationJob(jobId);
+export function resumeMigrationJob(
+  jobId: string,
+  onProgress?: (progress: MigrationRunProgress) => void,
+): Promise<StorageMigrationJob> {
+  return runMigrationJob(jobId, onProgress);
 }
 
-export async function rollbackMigrationJob(jobId: string): Promise<StorageMigrationJob> {
+async function refreshRollbackEvidence(
+  job: StorageMigrationJob,
+  item: StorageMigrationItem,
+): Promise<StorageMigrationItem> {
+  if (!item.operation_id) throw new Error(`Applied migration item ${item.item_id} has no operation`);
+  const operation = await api.getTelegramOperation(item.operation_id);
+  if (operation.result_version == null || operation.destination_message_id == null) {
+    throw new Error(`Applied migration item ${item.item_id} has no durable result`);
+  }
+  const sourceAccount = sourceNumber(item, 'telegram_user_id');
+  const adapter = telegramAdapter();
+  const destination = await adapter.verifyReader({
+    accountId: sourceAccount,
+    targetChannelId: job.target_channel_id,
+    messageId: operation.destination_message_id,
+  });
+  const source = await adapter.readSource({
+    accountId: sourceAccount,
+    sourceMessageId: sourceNumber(item, 'telegram_message_id'),
+  });
+  if (!destination || !sameMedia(destination, operation) || !source.ok) {
+    throw new Error(`Rollback source verification failed for ${item.item_id}`);
+  }
+  return api.putMigrationEvidence({
+    migrationId: job.migration_id,
+    itemId: item.item_id,
+    telegramUserId: sourceAccount,
+    evidence: {
+      expected_item_version: item.version,
+      result_version: operation.result_version,
+      target_channel_id: job.target_channel_id,
+      destination_message_id: operation.destination_message_id,
+      media_kind: operation.destination_media_kind as 'document' | 'photo',
+      media_id: operation.destination_media_id!,
+      size_bytes: operation.destination_size!,
+      photo_variant: destination.photoVariant ?? null,
+      read_probe_ok: true,
+      checked_at: new Date().toISOString(),
+      source_read_probe_ok: true,
+    },
+  });
+}
+
+export async function rollbackMigrationJob(
+  jobId: string,
+  onProgress?: (progress: MigrationRunProgress) => void,
+): Promise<StorageMigrationJob> {
   let job = await api.getMigrationJob(jobId);
-  const groupIds = [...new Set(job.items.filter(item => item.state === 'applied').map(item => item.group_id))];
+  let after: string | undefined;
+  onProgress?.({ phase: 'running' });
   try {
-    for (const groupId of groupIds) {
-      const items = job.items.filter(item => item.group_id === groupId && item.state === 'applied');
-      job = await api.rollbackMigrationGroup({
+    while (true) {
+      const page = await api.listMigrationGroups({
         migrationId: jobId,
-        groupId,
-        expectedLocationVersions: Object.fromEntries(items.map(item => [
-          item.item_id,
-          item.applied_location_version ?? item.expected_location_version + 1,
-        ])),
+        scope: 'applied',
+        limit: GROUP_PAGE_SIZE,
+        after,
       });
+      if (page.groups.length === 0) break;
+      for (const group of page.groups) {
+        onProgress?.({ phase: 'running', currentGroupId: group.group_id });
+        const verified: StorageMigrationItem[] = [];
+        for (const item of group.items) verified.push(await refreshRollbackEvidence(job, item));
+        const result = await api.rollbackMigrationGroup({
+          migrationId: jobId,
+          groupId: group.group_id,
+          expectedLocationVersions: Object.fromEntries(verified.map(item => [
+            item.item_id,
+            item.applied_location_version ?? item.expected_location_version + 1,
+          ])),
+        });
+        job = result.job;
+      }
+      if (!page.next_after) break;
+      after = page.next_after;
     }
+    onProgress?.({ phase: 'idle' });
     return await api.getMigrationJob(jobId);
   } catch (error) {
+    onProgress?.({ phase: 'idle', lastError: (error as Error)?.message ?? String(error) });
     if (isConflict(error)) return api.getMigrationJob(jobId);
     throw error;
   }

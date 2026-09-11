@@ -273,6 +273,13 @@ class EvidenceRequest(BaseModel):
         return value.astimezone(timezone.utc)
 
 
+class ClaimGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_item_versions: Dict[str, int] = Field(..., min_length=1)
+    lease_owner: str = Field(..., min_length=1, max_length=128)
+    lease_seconds: int = Field(..., ge=1, le=300)
+
+
 class CommitGroupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_job_version: int = Field(..., ge=1)

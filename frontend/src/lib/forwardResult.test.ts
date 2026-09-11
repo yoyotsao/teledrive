@@ -7,10 +7,29 @@
  * in fact succeeded on Telegram's side. These asserts pin the real shape.
  */
 import { describe, expect, it } from 'vitest';
-import { unwrapForwardedMessage } from './forwardResult.ts';
+import { unwrapForwardedMessage, unwrapForwardedMessages } from './forwardResult.ts';
 
 const SOURCE_ID = 1288;
 const msg = { id: 5001, media: { className: 'MessageMediaDocument' } };
+const msg2 = { id: 5002, media: { className: 'MessageMediaDocument' } };
+
+describe('unwrapForwardedMessages', () => {
+  it('unwraps the nested [[msg1, msg2]] shape gramjs returns for one source chat', () => {
+    expect(unwrapForwardedMessages([[msg, msg2]], [SOURCE_ID, SOURCE_ID + 1])).toEqual([msg, msg2]);
+  });
+
+  it('accepts the flat [msg1, msg2] shape its TypeScript signature promises', () => {
+    expect(unwrapForwardedMessages([msg, msg2], [SOURCE_ID, SOURCE_ID + 1])).toEqual([msg, msg2]);
+  });
+
+  it('rejects a missing mapped slot instead of shifting later results onto the wrong source item', () => {
+    expect(() => unwrapForwardedMessages([[msg, undefined, msg2]], [10, 11, 12])).toThrow('11');
+  });
+
+  it('rejects a result-count mismatch before assigning any result', () => {
+    expect(() => unwrapForwardedMessages([[msg]], [10, 11])).toThrow(/2.*1|1.*2/);
+  });
+});
 
 describe('unwrapForwardedMessage', () => {
   // --- gramjs 的實際形狀：每個來源 chat 一個陣列 -------------------------------

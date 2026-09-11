@@ -25,7 +25,21 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Apply patch
-        run: python .github/scripts/apply_batched_migration_verification.py
+        run: |
+          python .github/scripts/apply_batched_migration_verification.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('frontend/src/maintenance/migrateSavedMessagesToChannel.ts')
+          text = path.read_text()
+          wrapper = """async function collectEvidence(job: StorageMigrationJob, item: StorageMigrationItem): Promise<StorageMigrationItem> {
+            return (await collectEvidenceBatch(job, [item]))[0];
+          }
+
+          """
+          if wrapper not in text:
+              raise SystemExit('unused collectEvidence wrapper not found')
+          path.write_text(text.replace(wrapper, '', 1))
+          PY
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci

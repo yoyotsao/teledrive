@@ -126,7 +126,7 @@ export const CHUNK_RATE_MIN = 0.5;
  * above the normal operating range so FLOOD feedback and learned ceilings,
  * rather than this constant, determine each account's sustainable rate.
  */
-export const CHUNK_RATE_MAX = 64;
+export const CHUNK_RATE_MAX = 32;
 
 /** Multiplicative decrease factor applied to the rate on each FLOOD_WAIT. */
 export const CHUNK_RATE_DECREASE_FACTOR = 0.5;
@@ -208,3 +208,11 @@ export const CHUNK_ESCALATED_CLEAN_WINDOW_MS = 60_000;
 
 /** Flood-free time required to de-escalate back to normal handling. */
 export const CHUNK_ESCALATION_RESET_MS = 600_000;
+
+export const FAILOVER_SPEED_WINDOW_MS = 30_000;
+export const FAILOVER_ATTEMPT_MIN_AGE_MS = 30_000;
+export const FAILOVER_IDLE_SNAPSHOT_TTL_MS = 5 * 60_000;
+export const FAILOVER_SCORE_THRESHOLD = 2;
+export const PREMIUM_FLOOD_CLEAN_WINDOW_MS = 60_000;
+export const PREMIUM_FLOOD_CAUTIOUS_INTERVAL_MS = 30_000;
+export const PREMIUM_FLOOD_CAUTIOUS_STEP = 0.1;

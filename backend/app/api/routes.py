@@ -8,6 +8,7 @@ from app.services.database import get_database
 from app.auth import get_current_user, create_jwt, refresh_jwt
 from app.services import bot_challenge
 from loguru import logger
+from datetime import date, datetime, timedelta, timezone
 
 # Thumbnails are served entirely browser-side: the frontend downloads each
 # file's embedded thumb via GramJS and caches it in IndexedDB (see
@@ -604,3 +605,43 @@ async def get_files_by_split_group(split_group_id: str, current_user: int = Depe
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Internal server error") from e
+
+
+# Upload telemetry contains counts only, never file content or Telegram sessions.
+class UploadStatisticsReport(BaseModel):
+    stream_id: str = Field(min_length=1, max_length=64, pattern=r'^[a-zA-Z0-9-]+$')
+    telegram_user_id: int = Field(gt=0)
+    day: date
+    bytes: int = Field(ge=0, le=9_007_199_254_740_991, strict=True)
+
+    @field_validator('day')
+    @classmethod
+    def valid_day(cls, value: date) -> date:
+        today = datetime.now(timezone(timedelta(hours=8))).date()
+        if value > today:
+            raise ValueError('Upload day cannot be in the future')
+        return value
+
+
+@router.post('/statistics/uploads')
+async def record_upload_statistics(body: UploadStatisticsReport, user_id: int = Depends(get_current_user)):
+    db = await get_database()
+    if not await db.get_linked_account(user_id, body.telegram_user_id):
+        raise HTTPException(status_code=403, detail='Account is not linked to this drive')
+    await db.record_upload_statistics(user_id, body.stream_id, body.telegram_user_id, body.day.isoformat(), body.bytes)
+    return {'ok': True}
+
+
+@router.get('/statistics/uploads')
+async def upload_statistics(end: Optional[date] = None, user_id: int = Depends(get_current_user)):
+    end = end or datetime.now(timezone(timedelta(hours=8))).date()
+    start = end - timedelta(days=29)
+    db = await get_database()
+    result = await db.get_upload_statistics(user_id, start.isoformat(), end.isoformat())
+    by_day = {row['day']: row['bytes'] for row in result['days']}
+    result['days'] = [
+        {'day': (end - timedelta(days=i)).isoformat(),
+         'bytes': by_day.get((end - timedelta(days=i)).isoformat(), 0)}
+        for i in range(30)
+    ]
+    return {**result, 'timezone': 'Asia/Taipei', 'today': end.isoformat()}

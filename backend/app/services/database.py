@@ -176,6 +176,23 @@ class Database:
             FROM files WHERE telegram_user_id != 0
         """)
 
+        # Cumulative counters per browser stream, account and Taipei calendar day.
+        # MAX on upsert makes response-loss retries and concurrent tab recovery
+        # idempotent. Keep history even if an account is later unlinked.
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS upload_statistics (
+                owner_id INTEGER NOT NULL,
+                stream_id TEXT NOT NULL,
+                telegram_user_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                bytes INTEGER NOT NULL CHECK (bytes >= 0),
+                PRIMARY KEY (owner_id, stream_id, telegram_user_id, day)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_statistics_day ON upload_statistics(owner_id, day)"
+        )
+
         # Force commit and verify
         await self._conn.commit()
         
@@ -186,6 +203,41 @@ class Database:
         
         logger.info("Database schema initialized")
     
+    async def record_upload_statistics(self, owner_id: int, stream_id: str,
+                                       telegram_user_id: int, day: str, size: int) -> None:
+        await self._conn.execute("""
+            INSERT INTO upload_statistics (owner_id, stream_id, telegram_user_id, day, bytes)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id, stream_id, telegram_user_id, day)
+            DO UPDATE SET bytes = MAX(upload_statistics.bytes, excluded.bytes)
+        """, (owner_id, stream_id, telegram_user_id, day, size))
+        await self._conn.commit()
+
+    async def get_upload_statistics(self, owner_id: int, start: str, end: str) -> dict:
+        cursor = await self._conn.execute("""
+            SELECT day, SUM(bytes) AS bytes FROM upload_statistics
+            WHERE owner_id = ? AND day BETWEEN ? AND ? GROUP BY day
+        """, (owner_id, start, end))
+        days = [dict(row) for row in await cursor.fetchall()]
+        cursor = await self._conn.execute("""
+            SELECT ids.telegram_user_id, la.label, COALESCE(SUM(s.bytes), 0) AS bytes
+            FROM (
+                SELECT telegram_user_id FROM linked_accounts WHERE owner_id = ?
+                UNION
+                SELECT telegram_user_id FROM upload_statistics WHERE owner_id = ? AND day = ?
+            ) ids
+            LEFT JOIN linked_accounts la ON la.owner_id = ? AND la.telegram_user_id = ids.telegram_user_id
+            LEFT JOIN upload_statistics s ON s.owner_id = ? AND s.telegram_user_id = ids.telegram_user_id AND s.day = ?
+            GROUP BY ids.telegram_user_id, la.label
+            ORDER BY bytes DESC, ids.telegram_user_id
+        """, (owner_id, owner_id, end, owner_id, owner_id, end))
+        accounts = [dict(row) for row in await cursor.fetchall()]
+        cursor = await self._conn.execute(
+            "SELECT MIN(day) FROM upload_statistics WHERE owner_id = ?", (owner_id,)
+        )
+        first_day = (await cursor.fetchone())[0]
+        return {"days": days, "accounts": accounts, "first_day": first_day}
+
     # ==================== File Operations ====================
     
     async def insert_file(

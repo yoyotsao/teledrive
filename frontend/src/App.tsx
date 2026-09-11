@@ -4,6 +4,7 @@ import { ChonkyDrive } from './components/ChonkyDrive';
 import SessionConfig from './components/SessionConfig';
 import LoginScreen from './components/LoginScreen';
 import SettingsDialog from './components/SettingsDialog';
+import { startUploadStatisticsSync } from './lib/uploadStatisticsSync';
 import { Sidebar } from './components/Sidebar';
 import { SearchBox } from './components/SearchBox';
 import { useUrlState } from './hooks/useUrlState';
@@ -26,6 +27,10 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const url = useUrlState();
   const { theme, toggleTheme } = useTheme();
+
+  useEffect(() => {
+    if (authState === 'authenticated') return startUploadStatisticsSync();
+  }, [authState]);
 
   useEffect(() => {
     let cancelled = false;

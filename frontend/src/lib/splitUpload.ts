@@ -14,8 +14,12 @@
  * index instead, from planSegments() all the way to part_index in the DB.
  */
 import { planSegments, SMALL_FILE_LIMIT } from './segmentPlan';
-import type { SegmentResult, TelegramClientManager } from './gramjs';
+import { getAllClients, type SegmentResult, type TelegramClientManager } from './gramjs';
 import { withAccountSlot } from './accountPool';
+import { accountActivityRegistry } from './accountActivityRegistry';
+import { SegmentScheduler } from './segmentScheduler';
+import type { SegmentFileJobInput } from './segmentUploadTypes';
+import { uploadSpeedTracker } from './uploadSpeedTracker';
 
 export { planSegments, SMALL_FILE_LIMIT } from './segmentPlan';
 export type { Segment } from './segmentPlan';
@@ -28,6 +32,102 @@ export type SplitUploadResult = {
   hasThumbnail: boolean;
 };
 
+export type SplitUploadProgressDetail =
+  | { reason: 'migration'; message: '重新分派上傳帳號，該區段將從頭重傳' };
+
+export type SplitUploadProgress = (percent: number, detail?: SplitUploadProgressDetail) => void;
+
+export interface SplitUploadDependencies {
+  scheduler: Pick<SegmentScheduler, 'enqueueFile'>;
+  clients: () => TelegramClientManager[];
+  plan?: typeof planSegments;
+  withAccountSlot?: typeof withAccountSlot;
+  smallFileLimit?: number;
+}
+
+let nextFileJobId = 0;
+
+function fileJobIdFor(file: File): string {
+  nextFileJobId++;
+  return `split-upload:${Date.now()}:${nextFileJobId}:${file.name}`;
+}
+
+function percentage(logicalFileBytes: number, fileSize: number): number {
+  return fileSize === 0 ? 100 : Math.round(Math.max(0, Math.min(1, logicalFileBytes / fileSize)) * 100);
+}
+
+/**
+ * Creates the split-upload adapter around the shared segment scheduler.
+ * The scheduler owns account selection and migration for a large file as one
+ * job; this layer only translates its byte/migration events to UI progress.
+ */
+export function createUploadFileSpread(deps: SplitUploadDependencies): typeof uploadFileSpread {
+  const plan = deps.plan ?? planSegments;
+  const useAccountSlot = deps.withAccountSlot ?? withAccountSlot;
+  const smallFileLimit = deps.smallFileLimit ?? SMALL_FILE_LIMIT;
+
+  return async function uploadFileSpreadWithDependencies(
+    file: File,
+    onProgress?: SplitUploadProgress,
+    thumb?: Blob | null,
+    pinned?: TelegramClientManager,
+  ): Promise<SplitUploadResult> {
+    const run = <T,>(fn: (client: TelegramClientManager) => Promise<T>): Promise<T> =>
+      pinned ? fn(pinned) : useAccountSlot(fn);
+
+    if (file.size <= smallFileLimit) {
+      const result = await run((client) => client.uploadSmallFile(file, thumb));
+      onProgress?.(100);
+      const { hasThumbnail, ...part } = result;
+      return { parts: [part], originalName: file.name, totalParts: 1, hasThumbnail };
+    }
+
+    const segments = plan(file.size);
+    const runners = (pinned ? [pinned] : deps.clients()).map((client) => client.asSegmentRunner());
+    const input: SegmentFileJobInput = {
+      fileJobId: fileJobIdFor(file),
+      file,
+      segments,
+      runners,
+      thumb,
+      // A pinned caller may not move to another account; all other segment
+      // jobs deliberately defer account assignment to the shared scheduler.
+      migrationEnabled: !pinned,
+      onProgress: ({ logicalFileBytes }) => onProgress?.(percentage(logicalFileBytes, file.size)),
+      onMigration: ({ logicalFileBytes, message }) => onProgress?.(
+        percentage(logicalFileBytes, file.size),
+        { reason: 'migration', message },
+      ),
+    };
+    const result = await deps.scheduler.enqueueFile(input);
+    const parts = result.parts
+      .slice()
+      .sort((a, b) => a.index - b.index)
+      .map(({ hasThumbnail: _drop, ...part }) => part);
+
+    onProgress?.(100);
+    return {
+      parts,
+      originalName: file.name,
+      totalParts: parts.length,
+      hasThumbnail: result.hasThumbnail,
+    };
+  };
+}
+
+const productionScheduler = new SegmentScheduler({
+  activity: accountActivityRegistry,
+  speed: uploadSpeedTracker,
+});
+
+const productionUploadFileSpread = createUploadFileSpread({
+  scheduler: productionScheduler,
+  clients: getAllClients,
+  plan: planSegments,
+  withAccountSlot,
+  smallFileLimit: SMALL_FILE_LIMIT,
+});
+
 /**
  * Upload `file`, spreading its segments over the drive's linked accounts.
  * Small files take one account and one message; large ones fan out.
@@ -37,42 +137,9 @@ export type SplitUploadResult = {
  */
 export async function uploadFileSpread(
   file: File,
-  onProgress?: (pct: number) => void,
+  onProgress?: SplitUploadProgress,
   thumb?: Blob | null,
   pinned?: TelegramClientManager,
 ): Promise<SplitUploadResult> {
-  const run = <T,>(fn: (c: TelegramClientManager) => Promise<T>): Promise<T> =>
-    pinned ? fn(pinned) : withAccountSlot(fn);
-
-  if (file.size <= SMALL_FILE_LIMIT) {
-    const result = await run((client) => client.uploadSmallFile(file, thumb));
-    onProgress?.(100);
-    const { hasThumbnail, ...part } = result;
-    return { parts: [part], originalName: file.name, totalParts: 1, hasThumbnail };
-  }
-
-  const segments = planSegments(file.size);
-  const totalChunks = segments.reduce((n, s) => n + s.parts, 0);
-  let completedChunks = 0;
-  const reportChunk = () => {
-    completedChunks++;
-    onProgress?.(Math.min(99, Math.round((completedChunks / totalChunks) * 100)));
-  };
-
-  const results = await Promise.all(segments.map((segment) =>
-    // The thumb rides on segment 0 only — it represents the whole file, and the
-    // listing reads it from the first part.
-    run((client) => client.uploadSegment(file, segment, segment.index === 0 ? thumb : undefined, reportChunk))
-  ));
-
-  // Segment index, never message_id: see the file header.
-  results.sort((a, b) => a.index - b.index);
-  onProgress?.(100);
-
-  return {
-    parts: results.map(({ hasThumbnail: _drop, ...part }) => part),
-    originalName: file.name,
-    totalParts: results.length,
-    hasThumbnail: results.some((r) => r.index === 0 && r.hasThumbnail),
-  };
+  return productionUploadFileSpread(file, onProgress, thumb, pinned);
 }

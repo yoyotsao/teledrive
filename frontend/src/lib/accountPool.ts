@@ -1,58 +1,133 @@
 /**
- * Spreads uploads across the drive's linked Telegram accounts.
- *
- * Telegram's upload limits are per account, so N accounts means N independent
- * budgets: each gets its own file-concurrency semaphore here, on top of the
- * per-account chunk semaphore and pacer that live on TelegramClientManager.
- * One account hitting FLOOD_WAIT therefore only slows its own share down.
+ * Spreads byte uploads across the drive's linked Telegram accounts while
+ * keeping the account activity registry and per-account file slots in lockstep.
  */
-import { Semaphore } from './semaphore';
-import { getAllClients, TelegramClientManager } from './gramjs';
 import { MAX_CONCURRENT_FILES } from '../config';
+import { accountActivityRegistry, AccountActivityRegistry } from './accountActivityRegistry';
+import { getAllClients, TelegramClientManager } from './gramjs';
+import { Semaphore } from './semaphore';
 
-// ponytail: per-account file slots only. If browser upstream or the WebSocket
-// count turns out to be the real ceiling, add one global Semaphore here and
-// wrap withAccountSlot's body in it.
-const fileSemaphores = new WeakMap<TelegramClientManager, Semaphore>();
-let cursor = 0;
-
-function slotsFor(client: TelegramClientManager): Semaphore {
-  let sem = fileSemaphores.get(client);
-  if (!sem) {
-    sem = new Semaphore(MAX_CONCURRENT_FILES);
-    fileSemaphores.set(client, sem);
-  }
-  return sem;
+export interface AccountPoolClient {
+  accountId: number;
 }
 
-/**
- * Round-robin across online accounts, but hand the file to an account with a
- * free slot when the round-robin pick is saturated — otherwise a single
- * flooded account would collect a queue while another sits idle.
- */
+export interface AccountPoolOptions<TClient extends AccountPoolClient> {
+  clients: () => readonly TClient[];
+  activity: AccountActivityRegistry;
+  maxConcurrentFiles: number;
+}
+
+export interface AccountPool<TClient extends AccountPoolClient> {
+  nextAccount(): TClient;
+  withAccountSlot<T>(fn: (client: TClient) => Promise<T>): Promise<T>;
+  withSlotOn<T>(client: TClient, fn: () => Promise<T>): Promise<T>;
+}
+
+type SlotResult<T> = { acquired: true; value: T } | { acquired: false };
+
+export function createAccountPool<TClient extends AccountPoolClient>(options: AccountPoolOptions<TClient>): AccountPool<TClient> {
+  const fileSemaphores = new WeakMap<object, Semaphore>();
+  let cursor = 0;
+
+  const slotsFor = (client: TClient): Semaphore => {
+    let sem = fileSemaphores.get(client);
+    if (!sem) {
+      sem = new Semaphore(options.maxConcurrentFiles);
+      fileSemaphores.set(client, sem);
+    }
+    return sem;
+  };
+
+  const isEligible = (client: TClient): boolean => {
+    const runtime = options.activity.runtime(client.accountId);
+    return runtime.online
+      && runtime.ready
+      && runtime.reservedTaskId === null
+      && runtime.activeByteUploadJobs < options.maxConcurrentFiles;
+  };
+
+  const chooseAccount = (): TClient => {
+    const clients = options.clients();
+    if (clients.length === 0) throw new Error('沒有可用的 Telegram 帳號（全部離線）');
+
+    const start = cursor++ % clients.length;
+    for (let i = 0; i < clients.length; i++) {
+      const candidate = clients[(start + i) % clients.length];
+      if (isEligible(candidate) && slotsFor(candidate).freeSlots() > 0) return candidate;
+    }
+    for (let i = 0; i < clients.length; i++) {
+      const candidate = clients[(start + i) % clients.length];
+      if (isEligible(candidate)) return candidate;
+    }
+    return clients[start];
+  };
+
+  const waitForActivityChange = (): Promise<void> => new Promise((resolve) => {
+    const unsubscribe = options.activity.subscribe(() => {
+      unsubscribe();
+      resolve();
+    });
+  });
+
+  const acquireOn = async <T>(client: TClient, fn: () => Promise<T>): Promise<SlotResult<T>> => {
+    const semaphore = slotsFor(client);
+    await semaphore.acquire();
+    const lease = options.activity.tryBeginByteUploadJob(client.accountId, options.maxConcurrentFiles);
+    if (!lease) {
+      semaphore.release();
+      return { acquired: false };
+    }
+
+    try {
+      return { acquired: true, value: await fn() };
+    } finally {
+      lease.release();
+      semaphore.release();
+    }
+  };
+
+  return {
+    nextAccount: chooseAccount,
+
+    async withAccountSlot<T>(fn: (client: TClient) => Promise<T>): Promise<T> {
+      while (true) {
+        const client = chooseAccount();
+        const result = await acquireOn(client, () => fn(client));
+        if (result.acquired) return result.value;
+
+        const clients = options.clients();
+        if (clients.some(isEligible)) continue;
+        await waitForActivityChange();
+      }
+    },
+
+    async withSlotOn<T>(client: TClient, fn: () => Promise<T>): Promise<T> {
+      while (true) {
+        const result = await acquireOn(client, fn);
+        if (result.acquired) return result.value;
+        await waitForActivityChange();
+      }
+    },
+  };
+}
+
+const productionPool = createAccountPool<TelegramClientManager>({
+  clients: getAllClients,
+  activity: accountActivityRegistry,
+  maxConcurrentFiles: MAX_CONCURRENT_FILES,
+});
+
+/** Round-robin selection used by the album pipeline before its pinned slot is acquired. */
 export function nextAccount(): TelegramClientManager {
-  const clients = getAllClients();
-  if (clients.length === 0) {
-    throw new Error('沒有可用的 Telegram 帳號（全部離線）');
-  }
-  const start = cursor++ % clients.length;
-  for (let i = 0; i < clients.length; i++) {
-    const candidate = clients[(start + i) % clients.length];
-    if (slotsFor(candidate).freeSlots() > 0) return candidate;
-  }
-  return clients[start]; // all busy — queue on the round-robin pick
+  return productionPool.nextAccount();
 }
 
-/** Pick an account, hold one of ITS file slots for the duration of fn. */
-export async function withAccountSlot<T>(fn: (client: TelegramClientManager) => Promise<T>): Promise<T> {
-  const client = nextAccount();
-  return slotsFor(client).withSlot(() => fn(client));
+/** Pick an account and hold one activity-aware file slot for fn's byte lifetime. */
+export function withAccountSlot<T>(fn: (client: TelegramClientManager) => Promise<T>): Promise<T> {
+  return productionPool.withAccountSlot(fn);
 }
 
-/** Hold a file slot on a specific account (album batches are pinned to one). */
-export async function withSlotOn<T>(
-  client: TelegramClientManager,
-  fn: () => Promise<T>,
-): Promise<T> {
-  return slotsFor(client).withSlot(fn);
+/** Hold a file slot on one pinned account; it never switches accounts while waiting. */
+export function withSlotOn<T>(client: TelegramClientManager, fn: () => Promise<T>): Promise<T> {
+  return productionPool.withSlotOn(client, fn);
 }

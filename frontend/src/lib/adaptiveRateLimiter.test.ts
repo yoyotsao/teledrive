@@ -1,14 +1,7 @@
 /**
- * Why this matters: FLOOD_PREMIUM_WAIT is an account-tier upload cap, not a
- * "too fast" signal. Cutting the rate never reduces it (it fired thousands of
- * times at the 0.5 parts/s floor, and official Telegram Desktop hits the same
- * wall), but the cut IS persisted — so treating it like FLOOD_WAIT keeps the
- * upload throttled for hours after Telegram has stopped throttling. pause()
- * must wait without touching rate or ceiling; reportFlood() must still cut,
- * because for a genuine FLOOD_WAIT the cut is what helps.
- *
- * These tests move real wall-clock time (the limiter schedules with setTimeout
- * against Date.now()); the waits are kept to a few seconds.
+ * FLOOD_PREMIUM_WAIT is an account-tier upload cap, not a "too fast" signal.
+ * A premium wait must hold the learned rate and ceiling, then permanently use
+ * a session-only cautious recovery cadence after a clean send window.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CHUNK_RATE_MAX, MAX_CONCURRENT_CHUNKS } from '../config.ts';
@@ -90,37 +83,94 @@ describe('production exploration ceiling', () => {
     vi.advanceTimersByTime(10_000);
     limiter.reportSuccess();
 
-    expect(CHUNK_RATE_MAX).toBe(64);
+    expect(CHUNK_RATE_MAX).toBe(32);
     expect(MAX_CONCURRENT_CHUNKS).toBe(12);
     expect(limiter.stats().rate).toBe(12.5);
   });
 });
 
-describe('pause() — the FLOOD_PREMIUM_WAIT path', () => {
-  it('does not self-throttle, however often it fires', () => {
-    const premium = new AdaptiveRateLimiter({ ...opts, label: 'premium-path' });
-    const before = premium.stats();
+describe('premium flood recovery', () => {
+  it('freezes through a post-wait clean window, then increases cautiously', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const limiter = new AdaptiveRateLimiter({ ...opts, label: 'premium-path' });
 
-    for (let i = 0; i < 50; i++) premium.pause(6);
+    limiter.reportPremiumFlood(15);
+    expect(limiter.stats()).toMatchObject({ rate: 4, ceiling: null, mode: 'frozen' });
 
-    const after = premium.stats();
-    expect(after.rate).toBe(before.rate);
-    expect(after.ceiling).toBeNull();
-    expect(after.floods).toBe(0);
+    vi.advanceTimersByTime(16_000);
+    limiter.reportSuccess();
+    expect(limiter.stats().rate).toBe(4);
+    expect(limiter.stats().cleanWindowStart).toBeNull();
+
+    limiter.noteSendStarted();
+    expect(limiter.stats().cleanWindowStart).toBe(Date.now());
+    vi.advanceTimersByTime(59_999);
+    limiter.reportSuccess();
+    expect(limiter.stats()).toMatchObject({ rate: 4, mode: 'frozen' });
+    vi.advanceTimersByTime(1);
+    limiter.reportSuccess();
+    expect(limiter.stats()).toMatchObject({ rate: 4, mode: 'cautious' });
+
+    vi.advanceTimersByTime(29_999);
+    limiter.reportSuccess();
+    expect(limiter.stats().rate).toBe(4);
+    vi.advanceTimersByTime(1);
+    limiter.reportSuccess();
+    expect(limiter.stats().rate).toBeCloseTo(4.1);
+    vi.advanceTimersByTime(30_000);
+    limiter.reportSuccess();
+    expect(limiter.stats().rate).toBeCloseTo(4.2);
   });
 
-  it('still actually holds the feed back', async () => {
-    // A 1s pause rather than the 6s Telegram usually sends: the property is
-    // that the next slot moves at all, and this run costs a second instead of
-    // seven. The full-length window is exercised by the penalty-window test.
-    const premium = new AdaptiveRateLimiter({ ...opts, label: 'premium-delay' });
-    premium.pause(1);
+  it('resets the clean send window when another flood arrives', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const limiter = new AdaptiveRateLimiter({ ...opts, label: 'premium-reset' });
 
-    const t0 = Date.now();
-    await premium.wait();
+    limiter.reportPremiumFlood(1);
+    vi.advanceTimersByTime(2_000);
+    limiter.noteSendStarted();
+    expect(limiter.stats().cleanWindowStart).toBe(2_000);
 
-    expect(Date.now() - t0).toBeGreaterThan(900);
-  }, 10_000);
+    limiter.reportFlood(1);
+    expect(limiter.stats()).toMatchObject({ mode: 'frozen', cleanWindowStart: null });
+  });
+
+  it('starts normal in a new session even when rate and ceiling are restored', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    vi.stubGlobal('window', {
+      localStorage: {
+        getItem: () => JSON.stringify({ rate: 10, ceiling: 8, updatedAt: 9_000 }),
+      },
+    });
+
+    const limiter = new AdaptiveRateLimiter({ ...opts, storageKey: 'premium-recovery' });
+
+    expect(limiter.stats()).toMatchObject({ rate: 6.4, ceiling: 8, mode: 'normal' });
+  });
+});
+
+describe('wait() — aborting a premium penalty', () => {
+  it('rejects with AbortError without changing premium recovery state', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const limiter = new AdaptiveRateLimiter({ ...opts, label: 'premium-abort' });
+    limiter.reportPremiumFlood(15);
+    const before = limiter.stats();
+    const controller = new AbortController();
+    const waiting = limiter.wait(controller.signal);
+
+    controller.abort();
+
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+    expect(limiter.stats()).toMatchObject({
+      rate: before.rate,
+      ceiling: before.ceiling,
+      mode: before.mode,
+    });
+  });
 });
 
 describe('reportFlood() — the genuine FLOOD_WAIT path', () => {
@@ -154,6 +204,8 @@ describe('reportFlood() — the genuine FLOOD_WAIT path', () => {
 
 describe('wait() — the penalty window', () => {
   it('binds parts that were already asleep when the flood landed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
     // reportFlood/pause can only push nextSlotAt forward; they cannot
     // reschedule a pending setTimeout, so without the re-check inside wait()
     // up to MAX_CONCURRENT_CHUNKS parts wake on stale deadlines and fire into
@@ -169,10 +221,11 @@ describe('wait() — the penalty window', () => {
 
     // Let the parts the burst allowance already released reach the server —
     // those are the ones that come back FLOOD_WAIT, and cannot be recalled.
-    await new Promise((r) => setTimeout(r, 50));
+    await vi.advanceTimersByTimeAsync(50);
     const alreadyGone = firedAt.length;
     gated.reportFlood(6);
     const windowEndsAt = Date.now() - t1 + 6_000 + 1_000;
+    await vi.runAllTimersAsync();
     await Promise.all(waiters);
 
     const stillAsleep = firedAt.slice(alreadyGone);

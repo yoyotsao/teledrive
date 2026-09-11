@@ -1,6 +1,31 @@
 import axios from 'axios';
 import { FileListResponse, FileInfo } from '../types';
 import { loadJwt, saveJwt } from '../lib/gramjs';
+import {
+  RETIRE_PENDING_UPLOAD_STATISTIC,
+  type UploadReport,
+  type UploadReportSendResult,
+} from '../lib/uploadStatistics';
+
+export interface UploadStatisticsResponse {
+  today: string;
+  timezone: string;
+  first_day: string | null;
+  days: { day: string; bytes: number }[];
+  accounts: { telegram_user_id: number; label: string | null; bytes: number }[];
+}
+
+/**
+ * The server makes this one response after a Telegram account has already
+ * been unlinked. All other failures remain retryable browser-side.
+ */
+export function classifyUploadStatisticsFailure(error: unknown): typeof RETIRE_PENDING_UPLOAD_STATISTIC | undefined {
+  if (!axios.isAxiosError(error)) return undefined;
+  return error.response?.status === 403
+    && error.response.data?.detail === 'Account is not linked to this drive'
+    ? RETIRE_PENDING_UPLOAD_STATISTIC
+    : undefined;
+}
 
 const client = axios.create({
   baseURL: '/api/v1',
@@ -109,6 +134,20 @@ export interface ChallengeResponse {
 }
 
 export const api = {
+  reportUploadStatistics: async (report: UploadReport): Promise<UploadReportSendResult> => {
+    try {
+      await client.post('/statistics/uploads', report);
+    } catch (error) {
+      const result = classifyUploadStatisticsFailure(error);
+      if (result) return result;
+      throw error;
+    }
+  },
+
+  getUploadStatistics: async (): Promise<UploadStatisticsResponse> => {
+    const response = await client.get<UploadStatisticsResponse>('/statistics/uploads');
+    return response.data;
+  },
   requestChallenge: async (): Promise<ChallengeResponse> => {
     const response = await client.post<ChallengeResponse>('/auth/challenge');
     return response.data;

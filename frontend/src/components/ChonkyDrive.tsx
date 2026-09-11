@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } fr
 import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
 import { getPrimaryClient, getClientFor, getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
-import { uploadFileSpread } from '../lib/splitUpload';
+import { uploadFileSpread, type SplitUploadProgress } from '../lib/splitUpload';
 import { withSlotOn, nextAccount } from '../lib/accountPool';
 import { captureThumb, isMediaFile, type ThumbCaptureResult } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
@@ -12,6 +12,11 @@ import { ThumbBatchQueue } from '../lib/thumbQueue';
 import { ALBUM_BATCH } from '../config';
 import { registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, checkFileHashesBounded, canonicalExistingParts, assertPartsCoverFile, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
+import { useUploadQueue } from '../hooks/useUploadQueue';
+import { safeErrorMessage, type UploadErrorStage } from '../lib/uploadQueue';
+import { selectCounts } from '../lib/uploadQueueSelectors';
+import type { UploadDestination } from '../lib/uploadIdentity';
+import { UploadCenter } from './UploadCenter';
 import { ContextMenu, MenuItem } from './ContextMenu';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
@@ -149,12 +154,18 @@ function isAlbumEligibleMedia(file: File): boolean {
  */
 function createAlbumPipeline() {
   type RoutedAlbumResult = AlbumFileResult & { account_id: number };
+  // 失敗時把「哪一個階段失敗」與原始錯誤一起交回呼叫端。spec 的錯誤處理要求
+  // 所有失敗都必須保存原始錯誤訊息；早期版本一律 resolve(null)，呼叫端只能
+  // 捏造一個 'Upload failed'，錯誤詳細資訊面板對最常見的相簿路徑因此毫無用處。
+  type AlbumOutcome =
+    | { ok: true; result: RoutedAlbumResult }
+    | { ok: false; stage: UploadErrorStage; error: unknown };
   type PendingEntry = {
     prepared: PreparedAlbumFile;
     hash: string | null;
     parentId: string | null;
     onProgress?: (pct: number) => void;
-    resolve: (result: RoutedAlbumResult | null) => void;
+    resolve: (outcome: AlbumOutcome) => void;
   };
 
   // One queue per account. A prepared file's bytes live on the account that
@@ -180,7 +191,7 @@ function createAlbumPipeline() {
         results = await client.sendAlbum(batch.map((e) => e.prepared));
       } catch (err) {
         console.error('[AlbumPipeline] sendAlbum failed:', err);
-        batch.forEach((e) => { e.onProgress?.(100); e.resolve(null); });
+        batch.forEach((e) => { e.onProgress?.(100); e.resolve({ ok: false, stage: 'telegram', error: err }); });
         return;
       }
       const tSend = performance.now();
@@ -190,7 +201,9 @@ function createAlbumPipeline() {
         const file = entry.prepared.file;
         if (!res.message_id) {
           entry.onProgress?.(100);
-          entry.resolve(null);
+          // sendAlbum 回了佔位結果（message_id 0）：這個檔案在 Telegram 端沒有
+          // 產生訊息，位元組並未落地，所以是 'telegram' 階段的失敗。
+          entry.resolve({ ok: false, stage: 'telegram', error: new Error(`Telegram returned no message for ${file.name}`) });
           return Promise.resolve();
         }
         return api.registerFile({
@@ -210,8 +223,9 @@ function createAlbumPipeline() {
           fileHash: entry.hash ?? undefined,
           telegramUserId: client.accountId,
         }).then(
-          () => { entry.onProgress?.(100); entry.resolve({ message_id: res.message_id, file_id: res.file_id, access_hash: res.access_hash, size: res.size, has_thumbnail: res.has_thumbnail, account_id: client.accountId }); },
-          (err) => { console.error('[AlbumPipeline] registerFile failed:', err); entry.onProgress?.(100); entry.resolve(null); },
+          () => { entry.onProgress?.(100); entry.resolve({ ok: true, result: { message_id: res.message_id, file_id: res.file_id, access_hash: res.access_hash, size: res.size, has_thumbnail: res.has_thumbnail, account_id: client.accountId } }); },
+          // 位元組已經在 Telegram 上，失敗的只有中繼資料註冊。
+          (err) => { console.error('[AlbumPipeline] registerFile failed:', err); entry.onProgress?.(100); entry.resolve({ ok: false, stage: 'register', error: err }); },
         );
       }));
       console.log(`[Perf] dispatchBatch x${batch.length} on account ${client.accountId}: sendAlbum=${Math.round(tSend - t0)}ms register=${Math.round(performance.now() - tSend)}ms`);
@@ -223,12 +237,15 @@ function createAlbumPipeline() {
      * bytes are on Telegram's servers. Resolves once the file's batch has
      * been sent and registered (which may happen well after this call returns
      * — the caller awaits the returned promise to know the final outcome). */
-    enqueue(file: File, hash: string | null, parentId: string | null, onProgress?: (pct: number) => void): Promise<RoutedAlbumResult | null> {
+    enqueue(file: File, hash: string | null, parentId: string | null, onProgress?: (pct: number) => void): Promise<AlbumOutcome> {
       return new Promise((resolve) => {
         const tQueued = performance.now();
         // The account is chosen here and stays with this file all the way
         // through sendAlbum — bytes and the album call must be on one account.
         const client = nextAccount();
+        // 一個 slot 裡有兩個階段，失敗的意義不同：縮圖擷取是 'thumbnail'，
+        // 之後的位元組上傳是 'telegram'。這個變數記著已經跑到哪一步。
+        let prepareStage: UploadErrorStage = 'thumbnail';
         const p = withSlotOn(client, async () => {
           const tSlot = performance.now();
           const { thumb, undecodable } = await captureThumb(file);
@@ -240,19 +257,21 @@ function createAlbumPipeline() {
           // permanently unstorable.
           if (!thumb && !undecodable) throw new Error(`Thumbnail capture failed for ${file.name}`);
           const tThumb = performance.now();
+          prepareStage = 'telegram';
           const prepared = await client.prepareAlbumFile(file, thumb);
           console.log(`[Perf] enqueue ${file.name} on account ${client.accountId}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
           return prepared;
         }).then((prepared) => {
           onProgress?.(50);
-          if (!prepared) { resolve(null); return; }
+          // prepareAlbumFile 回 null：位元組沒有成功送到 Telegram。
+          if (!prepared) { resolve({ ok: false, stage: prepareStage, error: new Error(`Album prepare returned no media for ${file.name}`) }); return; }
           const queue = queueFor(client);
           queue.push({ prepared, hash, parentId, onProgress, resolve });
           if (queue.length >= ALBUM_BATCH) dispatchBatch(client);
         }).catch((err) => {
           console.error('[AlbumPipeline] Prepare failed:', err);
           onProgress?.(50);
-          resolve(null);
+          resolve({ ok: false, stage: prepareStage, error: err });
         });
         preparePromises.push(p);
       });
@@ -341,10 +360,17 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   // disappear again until the next refresh.
   const contentsRequestRef = useRef(0);
   const uploadRefreshInFlightRef = useRef(false);
-  const [uploadingFiles, setUploadingFiles] = useState<
-    Array<{ name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string }>
-  >([]);
-  const [uploadTotals, setUploadTotals] = useState<{ total: number; done: number } | null>(null);
+  // Session-long upload centre. Replaces the per-batch `uploadingFiles` rows:
+  // every entry point dispatches into one queue that outlives a single batch.
+  const queue = useUploadQueue();
+
+  const currentDestination = useCallback((): UploadDestination => ({
+    rootFolderId: currentFolderId,
+    relativePath: '',
+    folderResolved: true,          // 拖放／挑選路徑不需要建立資料夾
+    resolvedFolderId: currentFolderId,
+  }), [currentFolderId]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
@@ -583,7 +609,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadContents]);
 
-  const uploadInProgress = uploadingFiles.some((file) => file.status === 'uploading');
+  const uploadInProgress = selectCounts(queue.state).active > 0;
   useEffect(() => {
     if (!canModify || !uploadInProgress) return;
     const timer = window.setInterval(() => {
@@ -815,7 +841,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   // register never holds up the next file's bytes from starting.
   const uploadFileToTelegram = async (
     file: File,
-    onProgress?: (pct: number) => void,
+    onProgress?: SplitUploadProgress,
     precomputedHash?: string | null,
   ): Promise<{
     parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean; account_id: number }>;
@@ -913,37 +939,16 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     console.log('[Upload] All parts registered with split_group_id:', splitGroupId);
   };
 
-  type UploadRow = { name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string };
-
   /**
    * Shared upload entry point for drag-drop and the file picker. Each file
    * passes its dedup check before it touches an upload slot, while already
    * checked files can upload in parallel with the remaining hash work.
    */
   const startUploadBatch = async (selectedFiles: File[]): Promise<void> => {
-    const initialFiles: UploadRow[] = selectedFiles.map((f) => ({
-      name: f.name,
-      progress: 0,
-      status: 'uploading',
-    }));
-    setUploadingFiles(initialFiles);
+    const destination = currentDestination();
+    // 每個 File 先拿到自己的 id；身分確認可能把它併到別的 id 上。
+    const enqueued = selectedFiles.map((file) => ({ file, id: queue.enqueueFile(file, destination) }));
 
-    const results: UploadRow[] = initialFiles.map((f) => ({ ...f }));
-    const indexByFile = new Map<File, number>();
-    selectedFiles.forEach((f, i) => indexByFile.set(f, i));
-
-    const setRowStatus = (file: File, patch: Partial<UploadRow>) => {
-      const i = indexByFile.get(file);
-      if (i === undefined) return;
-      results[i] = { ...results[i], ...patch };
-      setUploadingFiles([...results]);
-    };
-
-    // Route each file independently: hash -> dedup lookup -> upload/register.
-    // There is no whole-batch planning barrier, so the first fresh file starts
-    // sending while later files are still hashing. Browser File objects are
-    // lazy handles; hashing reads only the first 100MB and large uploads later
-    // read 512KB slices on demand.
     const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
     const albumPipeline = createAlbumPipeline();
     const uploadPromises: Promise<void>[] = [];
@@ -953,22 +958,50 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     // metadata only, preserving batch-local dedup without an upfront pre-pass.
     const claimedHashes = new Map<string, Promise<RegisterableExistingPart[] | null>>();
 
-    const routingPromises = selectedFiles.map(async (file) => {
+    const routingPromises = enqueued.map(async ({ file, id: enqueuedId }) => {
+      queue.dispatch({ type: 'setStatus', id: enqueuedId, attempt: 1, status: 'hashing', now: Date.now() });
       const fileHash = await hashFileBounded(file);
+
+      // 身分確認閘門：這一步之後才知道要用哪個 id、哪個 attempt 做事。
+      const settled = queue.dispatch({ type: 'setHash', id: enqueuedId, attempt: 1, contentHash: fileHash, now: Date.now() });
+      const resolution = settled.resolutions[enqueuedId];
+      if (!resolution || resolution.outcome === 'discarded') return;   // 相同工作已在進行中
+      const id = resolution.targetId;
+      const attempt = resolution.attempt;
+      queue.holdFile(id, file);
+
+      const done = () => { queue.dispatch({ type: 'complete', id, attempt, now: Date.now() }); queue.releaseFile(id); };
+      const failed = (stage: UploadErrorStage, err: unknown) => {
+        queue.dispatch({ type: 'fail', id, attempt, stage, message: safeErrorMessage(err), now: Date.now() });
+        queue.releaseFile(id);
+      };
+      const onProgress: SplitUploadProgress = (pct, detail) => queue.dispatch(
+        detail?.reason === 'migration'
+          ? { type: 'migrationProgressReset', id, attempt, progress: pct, message: detail.message, now: Date.now() }
+          : { type: 'setProgress', id, attempt, progress: pct, now: Date.now() },
+      );
+
+      // hashFileBounded 把讀取錯誤吞成 null（uploadPlanner 由其他呼叫端共用，
+      // 不在這裡改），因此「雜湊算不出來」與「檔案已經讀不到了」長得一樣。
+      // 再讀一個位元組就能分辨：真的讀不到就報 'hash'，否則照舊無雜湊上傳。
+      if (!fileHash) {
+        try {
+          await file.slice(0, 1).arrayBuffer();
+        } catch (err) {
+          failed('hash', err);
+          return;
+        }
+      }
 
       if (fileHash) {
         const checked = await checkFileHashesBounded([fileHash]);
         const existing = checked[fileHash] ?? [];
         const reusable = canonicalExistingParts(existing, file.size);
         if (reusable.length > 0) {
+          queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
           uploadPromises.push(
-            registerDuplicateParts(file, fileHash, reusable, currentFolderId)
-              .then(() => setRowStatus(file, { progress: 100, status: 'complete' }))
-              .catch((err: unknown) => setRowStatus(file, {
-                progress: 0,
-                status: 'error',
-                error: err instanceof Error ? err.message : 'Registration failed',
-              })),
+            registerDuplicateParts(file, fileHash, reusable, destination.resolvedFolderId)
+              .then(done).catch((err) => failed('register', err)),
           );
           return;
         }
@@ -981,48 +1014,36 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       if (fileHash) {
         const claimed = claimedHashes.get(fileHash);
         if (claimed) {
+          queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
           uploadPromises.push(
             claimed.then(async (parts) => {
               if (!parts || parts.length === 0) throw new Error('Matching upload failed');
-              await registerDuplicateParts(file, fileHash, parts, currentFolderId);
-              setRowStatus(file, { progress: 100, status: 'complete' });
-            }).catch((err: unknown) => setRowStatus(file, {
-              progress: 0,
-              status: 'error',
-              error: err instanceof Error ? err.message : 'Registration failed',
-            })),
+              await registerDuplicateParts(file, fileHash, parts, destination.resolvedFolderId);
+              done();
+            }).catch((err) => failed('register', err)),
           );
           return;
         }
-        claimedHashes.set(
-          fileHash,
-          new Promise<RegisterableExistingPart[] | null>((resolve) => { publishParts = resolve; }),
-        );
+        claimedHashes.set(fileHash, new Promise((resolve) => { publishParts = resolve; }));
       }
+
+      queue.dispatch({ type: 'setStatus', id, attempt, status: 'uploading', now: Date.now() });
 
       if (isAlbumEligibleMedia(file) && file.size <= SINGLE_PATH_SIZE_LIMIT) {
         uploadPromises.push(
-          albumPipeline.enqueue(file, fileHash, currentFolderId, (pct) => setRowStatus(file, { progress: pct }))
-            .then((res) => {
-              if (!res) throw new Error('Upload failed');
+          albumPipeline.enqueue(file, fileHash, destination.resolvedFolderId, onProgress)
+            .then((outcome) => {
+              // 用 pipeline 回報的真實階段與原始錯誤，不要捏造一個 'Upload failed'
+              // ——錯誤詳細資訊面板要的就是這個原因。
+              if (!outcome.ok) { publishParts(null); failed(outcome.stage, outcome.error); return; }
+              const res = outcome.result;
               publishParts([{
-                filesize: res.size,
-                mime_type: file.type || null,
-                telegram_message_id: res.message_id,
-                access_hash: res.access_hash,
-                part_index: 0,
-                has_thumbnail: res.has_thumbnail,
-                telegram_user_id: res.account_id,
+                filesize: res.size, mime_type: file.type || null,
+                telegram_message_id: res.message_id, access_hash: res.access_hash,
+                part_index: 0, has_thumbnail: res.has_thumbnail, telegram_user_id: res.account_id,
               }]);
-              setRowStatus(file, { progress: 100, status: 'complete' });
-            }).catch((err: unknown) => {
-              publishParts(null);
-              setRowStatus(file, {
-                progress: 0,
-                status: 'error',
-                error: err instanceof Error ? err.message : 'Upload failed',
-              });
-            }),
+              done();
+            }).catch((err) => { publishParts(null); failed('telegram', err); }),
         );
         return;
       }
@@ -1030,29 +1051,29 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       // uploadFileSpread claims an account slot only after the hash check.
       // Its large-file path reads and sends bounded chunks incrementally.
       uploadPromises.push(
-        uploadFileToTelegram(file, (pct) => setRowStatus(file, { progress: pct }), fileHash)
+        uploadFileToTelegram(file, onProgress, fileHash)
           .then(async (result) => {
             if (!result.alreadyRegistered) {
-              await registerUploadedParts(file, result.fileHash, result.parts, currentFolderId);
+              queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
+              try {
+                await registerUploadedParts(file, result.fileHash, result.parts, destination.resolvedFolderId);
+              } catch (err) {
+                // 位元組已經在 Telegram 上，失敗的只有註冊。報 'telegram' 會叫
+                // 使用者重新上傳，實際上只要重新註冊就好。publishParts 在這條
+                // 路徑上一樣被 settle，後面排隊的同內容檔案才不會永遠等下去。
+                publishParts(null);
+                failed('register', err);
+                return;
+              }
             }
             publishParts(result.parts.map((part, i) => ({
-              filesize: part.size,
-              mime_type: file.type || null,
-              telegram_message_id: part.message_id,
-              access_hash: part.access_hash,
-              part_index: i,
-              has_thumbnail: i === 0 && part.has_thumbnail,
+              filesize: part.size, mime_type: file.type || null,
+              telegram_message_id: part.message_id, access_hash: part.access_hash,
+              part_index: i, has_thumbnail: i === 0 && part.has_thumbnail,
               telegram_user_id: part.account_id,
             })));
-            setRowStatus(file, { progress: 100, status: 'complete' });
-          }).catch((err: unknown) => {
-            publishParts(null);
-            setRowStatus(file, {
-              progress: 0,
-              status: 'error',
-              error: err instanceof Error ? err.message : 'Upload failed',
-            });
-          }),
+            done();
+          }).catch((err) => { publishParts(null); failed('telegram', err); }),
       );
     });
 
@@ -1166,35 +1187,11 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       return p;
     };
 
-    let discovered = 0;
-    let completed = 0;
-    let failed = 0;
-
-    // Rolling window: show last 100 files so the list stays bounded.
-    const VISIBLE_MAX = 100;
-    type FileEntry = { name: string; progress: number; status: 'uploading' | 'complete' | 'error'; error?: string };
-    const visibleFiles: FileEntry[] = [];
-
-    const addVisible = (entry: FileEntry) => {
-      visibleFiles.push(entry);
-      if (visibleFiles.length > VISIBLE_MAX) visibleFiles.shift();
-    };
-    const updateVisible = (name: string, patch: Partial<FileEntry>) => {
-      for (let i = visibleFiles.length - 1; i >= 0; i--) {
-        if (visibleFiles[i].name === name) { Object.assign(visibleFiles[i], patch); break; }
-      }
-    };
-
-    const updateUI = () => {
-      setUploadTotals({ total: discovered, done: completed + failed });
-      setUploadingFiles([...visibleFiles]);
-    };
-
     // Upload one file's bytes to Telegram. Called only for files already proven
     // fresh (not a duplicate) — hash check happens before this is invoked.
     // Does NOT register metadata — that happens after the caller releases
     // fileSemaphore, so a slow backend never blocks the next file's bytes.
-    const uploadFileEntryFresh = async (file: File): Promise<{
+    const uploadFileEntryFresh = async (file: File, onProgress?: SplitUploadProgress): Promise<{
       parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>;
       hasThumbnail: boolean;
     }> => {
@@ -1205,7 +1202,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       if (isMediaFile(file) && !thumbBlob && !undecodable) {
         throw new Error(`Thumbnail capture failed for ${file.name}`);
       }
-      const uploadResult = await uploadFileSpread(file, undefined, thumbBlob);
+      const uploadResult = await uploadFileSpread(file, onProgress, thumbBlob);
       return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
     };
 
@@ -1281,135 +1278,144 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       if (entry.isFile) {
         await new Promise<void>((resolve) => {
           entry.file((file: File) => {
-            discovered++;
-            addVisible({ name: file.name, progress: 0, status: 'uploading' });
-            updateUI();
             const folderPath = basePath.replace(/\/$/, '');
+            const enqueuedId = queue.enqueueFile(file, {
+              rootFolderId: parentFolderId,
+              relativePath: folderPath,
+              folderResolved: false,        // ensureFolder() 尚未回報
+              resolvedFolderId: null,
+            });
             const discoveryPromise = (async (): Promise<void> => {
-              // Fast path: if a file with the same name+size already lives in the
-              // destination folder, it's already uploaded — skip entirely (no
-              // hash, no check-hash, no register). Makes re-uploading an existing
-              // folder nearly free instead of a per-file request storm.
+              const folderId = await ensureFolder(folderPath);
+              queue.dispatch({ type: 'setResolved', id: enqueuedId, attempt: 1, resolvedFolderId: folderId, now: Date.now() });
+
+              // 快速判定：目的資料夾已有同名同大小的檔案就整個跳過。這條路徑不做內容
+              // 雜湊，因此不會與既有失敗列合併——但先前失敗的檔案本來就不會在目的地，
+              // 所以實務上碰不到。
               const alreadyThere = await existingFolderFiles(folderPath);
               if (alreadyThere.get(file.name) === file.size) {
-                completed++;
-                updateVisible(file.name, { progress: 100, status: 'complete' });
-                updateUI();
+                queue.dispatch({ type: 'setHash', id: enqueuedId, attempt: 1, contentHash: null, now: Date.now() });
+                const settled = queue.dispatch({ type: 'complete', id: enqueuedId, attempt: 1, now: Date.now() });
+                void settled;
                 return;
               }
+
+              queue.dispatch({ type: 'setStatus', id: enqueuedId, attempt: 1, status: 'hashing', now: Date.now() });
               const fileHash = await hashFileBounded(file);
+              const settled = queue.dispatch({ type: 'setHash', id: enqueuedId, attempt: 1, contentHash: fileHash, now: Date.now() });
+              const resolution = settled.resolutions[enqueuedId];
+              if (!resolution || resolution.outcome === 'discarded') return;
+              const id = resolution.targetId;
+              const attempt = resolution.attempt;
+              queue.holdFile(id, file);
+
+              const done = () => { queue.dispatch({ type: 'complete', id, attempt, now: Date.now() }); queue.releaseFile(id); };
+              const failed = (stage: UploadErrorStage, err: unknown) => {
+                queue.dispatch({ type: 'fail', id, attempt, stage, message: safeErrorMessage(err), now: Date.now() });
+                queue.releaseFile(id);
+              };
+              const onProgress: SplitUploadProgress = (pct, detail) => queue.dispatch(
+                detail?.reason === 'migration'
+                  ? { type: 'migrationProgressReset', id, attempt, progress: pct, message: detail.message, now: Date.now() }
+                  : { type: 'setProgress', id, attempt, progress: pct, now: Date.now() },
+              );
+
+              // hashFileBounded 把讀取錯誤吞成 null，所以雜湊為 null 時再讀一個
+              // 位元組，分辨「算不出雜湊」與「檔案已經讀不到了」。此處還沒搶
+              // claim（fileHash 為 null 時根本不會建 claim），提早 return 安全。
+              if (!fileHash) {
+                try {
+                  await file.slice(0, 1).arrayBuffer();
+                } catch (err) {
+                  failed('hash', err);
+                  return;
+                }
+              }
+
+              // 後端去重命中：直接註冊中繼資料，不碰 Telegram。
               if (fileHash) {
                 const hashCheck = await checkFileHashBounded(fileHash);
-                // Collapse to canonical parts — see the drag/picker dedup path.
-                // Empty means no stored copy covers the whole file, so this
-                // falls through and uploads for real.
-                const asExisting = hashCheck.found
-                  ? canonicalExistingParts(hashCheck.files, file.size)
-                  : [];
+                const asExisting = hashCheck.found ? canonicalExistingParts(hashCheck.files, file.size) : [];
                 if (asExisting.length > 0) {
-                  const folderId = await ensureFolder(folderPath);
-                  await registerDuplicateParts(file, fileHash, asExisting, folderId);
-                  completed++;
-                  updateVisible(file.name, { progress: 100, status: 'complete' });
-                  updateUI();
+                  queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
+                  try {
+                    await registerDuplicateParts(file, fileHash, asExisting, folderId);
+                    done();
+                  } catch (err) {
+                    failed('register', err);
+                  }
                   return;
                 }
                 if (hashCheck.files.length > 0) {
                   console.warn('[Upload] Hash matched but stored copy is incomplete, re-uploading:', file.name);
                 }
               }
-              // Claim this hash for the batch, or fall in behind whoever claimed it
-              // first. The get/set pair stays synchronous so two concurrent
-              // discoveries of the same content can never both claim.
+
+              // 批次內去重：搶到 claim 的人負責真的上傳，其餘的人排在它後面只註冊。
+              // get/set 這一對必須保持同步，否則兩個同內容的 discovery 會同時搶到。
               const claim: { publish: (parts: RegisterableExistingPart[] | null) => void } = { publish: () => {} };
               if (fileHash) {
                 const claimed = claimedHashes.get(fileHash);
                 if (claimed) {
-                  const folderId = await ensureFolder(folderPath);
-                  // Queued as an upload promise instead of awaited here: waiting on
-                  // the claim inside a discovery promise would deadlock the album
-                  // pipeline, whose tail batch is only flushed once discovery settles.
+                  queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
+                  // 排進 uploadPromises 而不是在這裡 await：discovery promise 內等 claim
+                  // 會讓 album pipeline 的尾批永遠等不到 flush。
                   uploadPromises.push((async () => {
                     const parts = await claimed;
-                    if (!parts || parts.length === 0) {
-                      failed++;
-                      updateVisible(file.name, { progress: 0, status: 'error', error: '來源檔案上傳失敗' });
-                      updateUI();
-                      return;
-                    }
+                    if (!parts || parts.length === 0) throw new Error('來源檔案上傳失敗');
                     await registerDuplicateParts(file, fileHash, parts, folderId);
-                    completed++;
-                    updateVisible(file.name, { progress: 100, status: 'complete' });
-                    updateUI();
-                  })().catch(() => {
-                    failed++;
-                    updateVisible(file.name, { progress: 0, status: 'error', error: '註冊失敗' });
-                    updateUI();
-                  }));
+                    done();
+                  })().catch((err) => failed('register', err)));
                   return;
                 }
-                claimedHashes.set(
-                  fileHash,
-                  new Promise<RegisterableExistingPart[] | null>((resolve) => { claim.publish = resolve; }),
-                );
+                claimedHashes.set(fileHash, new Promise((resolve) => { claim.publish = resolve; }));
               }
 
-              // Past the claim, every path must settle it — files queued behind an
-              // unresolved claim would wait forever.
+              queue.dispatch({ type: 'setStatus', id, attempt, status: 'uploading', now: Date.now() });
+
+              // 過了 claim 之後每條路徑都必須把它 settle 掉，排在後面的檔案才不會永遠等下去。
               try {
                 if (isAlbumEligibleMedia(file) && file.size <= SMALL_FILE_LIMIT) {
-                  const folderId = await ensureFolder(folderPath);
-                  const uploadPromise = albumPipeline.enqueue(file, fileHash, folderId, (pct) => { updateVisible(file.name, { progress: pct }); updateUI(); })
-                    .then((res) => {
-                      if (res) {
+                  uploadPromises.push(
+                    albumPipeline.enqueue(file, fileHash, folderId, onProgress)
+                      .then((outcome) => {
+                        // 保留 pipeline 回報的階段與原始錯誤，不要捏造「上傳失敗」。
+                        if (!outcome.ok) { claim.publish(null); failed(outcome.stage, outcome.error); return; }
+                        const res = outcome.result;
                         claim.publish([{
-                          filesize: file.size,
-                          mime_type: file.type || null,
-                          telegram_message_id: res.message_id,
-                          access_hash: res.access_hash,
-                          part_index: 0,
-                          has_thumbnail: res.has_thumbnail,
-                          telegram_user_id: res.account_id,
+                          filesize: file.size, mime_type: file.type || null,
+                          telegram_message_id: res.message_id, access_hash: res.access_hash,
+                          part_index: 0, has_thumbnail: res.has_thumbnail, telegram_user_id: res.account_id,
                         }]);
-                        completed++;
-                        updateVisible(file.name, { progress: 100, status: 'complete' });
-                      } else {
-                        claim.publish(null);
-                        failed++;
-                        updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-                      }
-                      updateUI();
-                    }).catch(() => {
-                      claim.publish(null);
-                      failed++;
-                      updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-                      updateUI();
-                    });
-                  uploadPromises.push(uploadPromise);
+                        done();
+                      })
+                      .catch((err) => { claim.publish(null); failed('telegram', err); }),
+                  );
                   return;
                 }
-                const folderId = await ensureFolder(folderPath);
-                const uploadPromise = uploadFileEntryFresh(file)
-                  .then(async (result) => {
-                    await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
-                    claim.publish(result.parts.map((part, j) => ({
-                      filesize: part.size,
-                      mime_type: file.type || null,
-                      telegram_message_id: part.message_id,
-                      access_hash: part.access_hash,
-                      part_index: j,
-                      has_thumbnail: j === 0 && result.hasThumbnail,
-                    })));
-                    completed++;
-                    updateVisible(file.name, { progress: 100, status: 'complete' });
-                    updateUI();
-                  }).catch(() => {
-                    claim.publish(null);
-                    failed++;
-                    updateVisible(file.name, { progress: 0, status: 'error', error: '上傳失敗' });
-                    updateUI();
-                  });
-                uploadPromises.push(uploadPromise);
+
+                uploadPromises.push(
+                  uploadFileEntryFresh(file, onProgress)
+                    .then(async (result) => {
+                      queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
+                      try {
+                        await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
+                      } catch (err) {
+                        // 位元組已經上去了，失敗的只有註冊——報 'register'。
+                        // claim 一樣在這條路徑上被 settle。
+                        claim.publish(null);
+                        failed('register', err);
+                        return;
+                      }
+                      claim.publish(result.parts.map((part, j) => ({
+                        filesize: part.size, mime_type: file.type || null,
+                        telegram_message_id: part.message_id, access_hash: part.access_hash,
+                        part_index: j, has_thumbnail: j === 0 && result.hasThumbnail,
+                      })));
+                      done();
+                    })
+                    .catch((err) => { claim.publish(null); failed('telegram', err); }),
+                );
               } catch (err) {
                 claim.publish(null);
                 throw err;
@@ -1427,9 +1433,6 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       }
     };
 
-    setUploadTotals({ total: 0, done: 0 });
-    setUploadingFiles([{ name: '掃描資料夾中...', progress: 0, status: 'uploading' }]);
-
     const rootEntries = Array.from({ length: items.length }, (_, i) => items[i].webkitGetAsEntry?.()).filter(Boolean);
     await Promise.all(rootEntries.map((e) => processEntry(e, '')));
 
@@ -1442,7 +1445,6 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     logChunkRates('batch done');
 
-    updateUI();
     loadContents();
   };
 
@@ -1799,48 +1801,16 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       onDrop={handleDrop}
     >
 
-      {uploadingFiles.length > 0 && (() => {
-        const totalCount = uploadTotals ? uploadTotals.total : uploadingFiles.length;
-        const doneCount = uploadTotals ? uploadTotals.done : uploadingFiles.filter(f => f.status !== 'uploading').length;
-        return (
-          <div style={{
-            position: 'fixed', bottom: '16px', right: '16px',
-            background: 'white', border: '1px solid #e5e7eb', borderRadius: '8px',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.1)', minWidth: '280px', maxWidth: '360px',
-            zIndex: 9999, display: 'flex', flexDirection: 'column',
-          }}>
-            {/* Header */}
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #e5e7eb' }}>
-              <span style={{ fontSize: '13px', fontWeight: 600, color: '#374151' }}>
-                上傳中 {doneCount.toLocaleString()} / {totalCount.toLocaleString()} 個檔案
-              </span>
-              <button
-                onClick={() => { setUploadingFiles([]); setUploadTotals(null); }}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#6b7280', fontSize: '16px', lineHeight: 1, padding: '2px 4px' }}
-              >✕</button>
-            </div>
-            {/* File list */}
-            <div style={{ maxHeight: '280px', overflowY: 'auto', padding: '8px 14px' }}>
-              {uploadingFiles.map((f, i) => (
-                <div key={`${f.name}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: i < uploadingFiles.length - 1 ? '5px' : 0 }}>
-                  {f.status === 'complete' && <span style={{ color: '#16a34a', fontSize: '13px', flexShrink: 0 }}>✓</span>}
-                  {f.status === 'error'    && <span style={{ color: '#dc2626', fontSize: '13px', flexShrink: 0 }}>✗</span>}
-                  {f.status === 'uploading'&& <span style={{ color: '#3b82f6', fontSize: '13px', flexShrink: 0 }}>↑</span>}
-                  <span style={{ fontSize: '12px', color: '#374151', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {f.name}
-                  </span>
-                  {(f.status === 'uploading' || f.status === 'complete') && (
-                    <span style={{ fontSize: '11px', color: f.status === 'complete' ? '#16a34a' : '#6b7280', flexShrink: 0 }}>
-                      {f.status === 'complete' ? '100%' : `${f.progress}%`}
-                    </span>
-                  )}
-                  {f.status === 'error' && <span style={{ fontSize: '11px', color: '#dc2626', flexShrink: 0 }}>{f.error}</span>}
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
+      <UploadCenter
+        state={queue.state}
+        isVideoPreviewOpen={previewFile !== null && fileKind(previewFile.mime_type, previewFile.filename) === 'video'}
+        onFilter={(filter) => queue.dispatch({ type: 'setFilter', filter })}
+        onQuery={(query) => queue.dispatch({ type: 'setQuery', query })}
+        onToggleCompleted={() => queue.dispatch({ type: 'toggleCompleted' })}
+        onErrorDetail={(id) => queue.dispatch({ type: 'setErrorDetail', id })}
+        onPanelMode={(mode, byUser) => queue.dispatch({ type: 'setPanelMode', mode, byUser })}
+        onClearTerminal={() => queue.dispatch({ type: 'clearTerminal' })}
+      />
       <div
         style={{
           display: 'flex',

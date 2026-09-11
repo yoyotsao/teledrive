@@ -33,5 +33,22 @@ services:
       - backend
     restart: unless-stopped
 
+  # The Cloudflare connector serving the public hostname. It shares the
+  # frontend container's network namespace instead of joining the compose
+  # network: a token tunnel keeps its ingress rules in the Cloudflare
+  # dashboard, not in this repo, so sharing the namespace lets the existing
+  # `http://localhost:3000` ingress reach nginx with no dashboard change.
+  # Consequences of network_mode: this service publishes no ports of its own
+  # and cannot resolve sibling services by name — it needs neither.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
+    network_mode: "service:frontend"
+    depends_on:
+      - frontend
+    restart: unless-stopped
+
 volumes:
   teledrive-data:

@@ -2,11 +2,26 @@ import { useState, useEffect, useCallback } from 'react';
 import { api, LinkedAccount } from '../api/client';
 import { SessionTabs } from './LoginScreen';
 import { adoptClient, getClientFor, saveAccount, removeAccount, TelegramClientManager } from '../lib/gramjs';
+import UploadStatisticsPanel from './UploadStatisticsPanel';
+import { flushUploadStatistics } from '../lib/uploadStatisticsSync';
 
 type Props = { onClose: () => void };
 
 /** Backend row + whatever this browser knows about the account's live client. */
 type Row = LinkedAccount & { online: boolean; rate: number | null };
+
+export async function flushThenUnlinkSecondaryAccount(
+  telegramUserId: number,
+  actions: {
+    flush: (telegramUserId: number) => Promise<void>;
+    unlink: (telegramUserId: number) => Promise<void>;
+    forget: (telegramUserId: number) => Promise<void>;
+  },
+): Promise<void> {
+  await actions.flush(telegramUserId);
+  await actions.unlink(telegramUserId);
+  await actions.forget(telegramUserId);
+}
 
 function decorate(accounts: LinkedAccount[]): Row[] {
   return accounts.map((a) => {
@@ -25,6 +40,7 @@ export default function SettingsDialog({ onClose }: Props) {
   const [error, setError] = useState('');
   const [adding, setAdding] = useState(false);
   const [linking, setLinking] = useState('');
+  const [tab, setTab] = useState<'accounts' | 'statistics'>('accounts');
 
   const reload = useCallback(async () => {
     try {
@@ -76,8 +92,11 @@ export default function SettingsDialog({ onClose }: Props) {
   const unlink = async (row: Row) => {
     setError('');
     try {
-      await api.unlinkAccount(row.telegram_user_id);
-      await removeAccount(row.telegram_user_id);
+      await flushThenUnlinkSecondaryAccount(row.telegram_user_id, {
+        flush: flushUploadStatistics,
+        unlink: api.unlinkAccount,
+        forget: removeAccount,
+      });
       await reload();
     } catch (err: any) {
       // 409 carries the reason (usually "still stores N files") — show it verbatim.
@@ -94,21 +113,44 @@ export default function SettingsDialog({ onClose }: Props) {
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
         onClick={(e) => e.stopPropagation()}
         style={{
           background: 'var(--td-surface)', color: 'var(--td-text)', borderRadius: 12,
-          padding: '24px 28px', minWidth: 420, maxWidth: 520, maxHeight: '80vh', overflowY: 'auto',
+          padding: '24px 28px', width: 520, maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box', maxHeight: '80vh', overflowY: 'auto',
           boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Telegram 帳號</h2>
-          <button onClick={onClose} style={{
+          <h2 id="settings-title" style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>設定</h2>
+          <button onClick={onClose} aria-label="關閉設定" style={{
             marginLeft: 'auto', border: 'none', background: 'none',
             fontSize: 20, cursor: 'pointer', color: 'var(--td-text-muted)',
           }}>×</button>
         </div>
 
+        <div role="tablist" aria-label="設定分頁" style={{ display: 'flex', gap: 8, marginBottom: 20, borderBottom: '1px solid var(--td-border)' }}>
+          {(['accounts', 'statistics'] as const).map(value => <button
+            key={value} id={`settings-tab-${value}`} role="tab"
+            aria-selected={tab === value} aria-controls={`settings-panel-${value}`}
+            tabIndex={tab === value ? 0 : -1}
+            onClick={() => setTab(value)}
+            onKeyDown={event => {
+              if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+                event.preventDefault();
+                const next = event.key === 'Home' ? 'accounts' : event.key === 'End' ? 'statistics' : tab === 'accounts' ? 'statistics' : 'accounts';
+                setTab(next);
+                document.getElementById(`settings-tab-${next}`)?.focus();
+              }
+            }}
+            style={{ padding: '10px 14px', border: 'none', borderBottom: `2px solid ${tab === value ? '#2563eb' : 'transparent'}`, background: 'none', color: tab === value ? 'var(--td-text-strong)' : 'var(--td-text-muted)', fontWeight: tab === value ? 600 : 400, cursor: 'pointer' }}
+          >{value === 'accounts' ? '管理帳號' : '統計'}</button>)}
+        </div>
+
+        {tab === 'statistics' && <div id="settings-panel-statistics" role="tabpanel" aria-labelledby="settings-tab-statistics"><UploadStatisticsPanel /></div>}
+        <div id="settings-panel-accounts" role="tabpanel" aria-labelledby="settings-tab-accounts" hidden={tab !== 'accounts'}>
         <p style={{ margin: '0 0 16px', fontSize: 12, color: 'var(--td-text-muted)' }}>
           多綁幾個帳號，上傳會分散到各帳號並行，總吞吐大致等比放大。
         </p>
@@ -159,6 +201,7 @@ export default function SettingsDialog({ onClose }: Props) {
             background: '#2563eb', color: '#fff', fontSize: 13, cursor: 'pointer',
           }}>＋ 新增 Telegram 帳號</button>
         )}
+        </div>
       </div>
     </div>
   );

@@ -18,6 +18,8 @@ from conftest import OWNER_B
 # a token. The template is what the coverage test at the bottom matches against
 # the router; the path is what the request actually goes to.
 PROTECTED = [
+    ("/api/v1/statistics/uploads", "GET", "/api/v1/statistics/uploads", None),
+    ("/api/v1/statistics/uploads", "POST", "/api/v1/statistics/uploads", {}),
     ("/api/v1/accounts", "GET", "/api/v1/accounts", None),
     ("/api/v1/accounts/challenge", "POST", "/api/v1/accounts/challenge", None),
     ("/api/v1/accounts/verify", "POST", "/api/v1/accounts/verify", {"nonce": "x"}),

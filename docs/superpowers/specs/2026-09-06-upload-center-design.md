@@ -89,7 +89,9 @@ TeleDrive 將以單一、工作階段內持續存在的「上傳中心」取代�
 - 失敗時顯示短錯誤類別，例如「上傳失敗」、「縮圖失敗」或「註冊失敗」。完整錯誤訊息由列上的可鍵盤操作「詳細資訊」控制顯示在面板內固定的錯誤詳情區，不得只依賴 hover tooltip，也不得改變虛擬列表的列高。
 - 曾重試的項目顯示「第 N 次嘗試」。第一次嘗試不顯示額外文字。
 
-進度百分比只能前進；項目進入 `complete` 時固定為 100%。項目進入 `error` 時保留失敗前最後已知的百分比，不得重設為 0%，以便診斷失敗階段。
+進度百分比在同一次 `attempt` 內只能前進；項目進入 `complete` 時固定為 100%。項目進入 `error` 時保留失敗前最後已知的百分比，不得重設為 0%，以便診斷失敗階段。
+
+單調遞增只在同一個 `attempt` 內成立。開啟新的 `attempt` 時，`progress` 重設為 0、`completedAt`、`errorStage` 與 `errorMessage` 一併清除，畫面從 0% 重新累積。第一次在 90% 失敗、第二次重跑時顯示 0% 起算是預期行為，不得為了避免倒退而沿用上一次的百分比。
 
 ### 收合狀態
 
@@ -112,7 +114,9 @@ TeleDrive 將以單一、工作階段內持續存在的「上傳中心」取代�
 3. 上傳與狀態更新持續進行，不因預覽而暫停。
 4. 關閉影片後維持收合，不自動重新展開。
 
-若上傳是在影片預覽期間首次開始，直接顯示收合按鈕，不先閃現展開面板。本規格不改變圖片、PDF、音訊或文字預覽的上傳中心行為。
+影片的判定必須與播放器本身一致：`previewFile !== null && fileKind(previewFile.mime_type, previewFile.filename) === 'video'`。只判斷 `previewFile` 是否存在會讓圖片、PDF、音訊與文字預覽也觸發收合，違反本節第一句的範圍。
+
+若上傳是在影片預覽期間首次開始，直接顯示收合按鈕，不先閃現展開面板。影片預覽開啟期間，收合按鈕持續更新進度與失敗徽章，但點擊不展開面板；按鈕的 accessible name 需說明「關閉預覽後可展開」。這是刻意取捨：面板最小寬度 360 px 與播放器安全區域無法同時滿足「不遮擋播放器」與「失敗清單仍可讀」。本規格不改變圖片、PDF、音訊或文字預覽的上傳中心行為。
 
 ### 行動裝置
 
@@ -135,14 +139,27 @@ type UploadStatus =
 
 type UploadErrorStage = 'hash' | 'thumbnail' | 'telegram' | 'register';
 
+interface UploadDestination {
+  /** 使用者發起這次上傳時的根目的資料夾（拖放目標或當前資料夾）。不可變。 */
+  rootFolderId: string | null;
+  /** 根目的資料夾內、不含檔名的相對目錄路徑；單檔／多檔上傳為空字串。不可變。 */
+  relativePath: string;
+  /** ensureFolder() 建立內層資料夾後的實際目的資料夾 ID；解析完成前為 null。
+   *  註冊中繼資料一律使用這個值，identity 也只在這個值到齊後才算得出來。 */
+  resolvedFolderId: string | null;
+}
+
 interface UploadItem {
   id: string;
   name: string;
-  relativePath: string;
-  targetFolderId: string | null;
+  destination: UploadDestination;
   size: number;
   lastModified: number;
   provisionalIdentity: string;
+  /** resolvedFolderId 與 contentHash 都到齊後才寫入；在那之前為 null。 */
+  canonicalIdentity: string | null;
+  /** 身分尚未確認前掛在哪個候選項目底下；非 null 時不進列表、不進計數。 */
+  mergePendingWith: string | null;
   contentHash: string | null;
   status: UploadStatus;
   progress: number;
@@ -157,7 +174,7 @@ interface UploadItem {
 
 `id` 是畫面列與所有非同步更新使用的穩定識別碼。任何更新不得再以檔名尋找列。
 
-`targetFolderId` 與 `relativePath` 是重試合併判定的一部分。同一內容上傳到不同目的資料夾代表不同工作，不得合併成一列。
+`destination` 刻意拆成不可變的工作目的地（`rootFolderId` + `relativePath`）與可變的 `resolvedFolderId`。前者在項目建立時就固定，後者由 `ensureFolder()` 非同步填入。`ChonkyDrive` 註冊中繼資料時一律使用 `resolvedFolderId`；identity 判定則見「相同檔案與重試規則」。同一內容上傳到不同目的資料夾代表不同工作，不得合併成一列。
 
 ### 佇列狀態
 
@@ -174,7 +191,11 @@ interface UploadQueueState {
 }
 ```
 
-所有批次只能送出針對項目 ID 的動作，例如 `enqueue`、`setHashing`、`setProgress`、`setRegistering`、`complete`、`fail` 與 `retry`。不得由某一批次以整個陣列呼叫 `setUploadingFiles([...batchResults])`。
+所有批次只能送出針對項目 ID 的動作，例如 `enqueue`、`setHashing`、`setResolved`、`setProgress`、`setRegistering`、`complete`、`fail` 與 `retry`。不得由某一批次以整個陣列呼叫 `setUploadingFiles([...batchResults])`。
+
+穩定 ID 不足以隔離不同嘗試：重試沿用同一個 `id`，第一次嘗試延遲抵達的進度、錯誤或已排入 animation frame 的更新仍會覆寫第二次嘗試。因此除了 `enqueue` 之外，**所有非同步動作都必須攜帶 `{ id, attempt }`**，reducer 收到 `action.attempt !== item.attempt` 時直接忽略。`retry` 是唯一遞增 `attempt` 的動作。
+
+reducer 另外拒絕兩類遲到更新：已進入 `complete` 或 `error` 的項目不接受 `setProgress`；`attempt` 較舊的 `fail` 不得把已重新排隊的項目打回錯誤狀態。合併進度更新的 animation frame buffer 以 `id + attempt` 為鍵，flush 前重新比對當前 `attempt`。
 
 計數、分組、搜尋結果及整體百分比均由 selector 從單一狀態計算，不另存容易失去同步的 `uploadTotals`。
 
@@ -188,45 +209,72 @@ queued → hashing → uploading → registering → complete
 error → queued    （重新選取相同失敗檔案）
 ```
 
-去重命中時可以從 `hashing` 直接進入 `registering`；資料夾快速判定已存在時可以從 `queued` 或 `hashing` 直接進入 `complete`。無論走哪條路徑，都必須透過同一組項目 ID 更新動作。
+去重命中時可以從 `hashing` 直接進入 `registering`；資料夾快速判定已存在時可以從 `queued` 或 `hashing` 直接進入 `complete`。無論走哪條路徑，都必須透過同一組帶 `{ id, attempt }` 的更新動作。
+
+`error → queued` 只由重試觸發，並同時遞增 `attempt`。這是狀態圖中唯一的反向邊，也是唯一允許 `progress` 下降的時機。
 
 ## 相同檔案與重試規則
 
 ### 身分判定
 
-檔案剛加入、內容雜湊尚未算出時，使用以下 provisional identity：
+身分判定分成兩層：**provisional identity 只負責找出候選項目，canonical identity 才決定合併。**
+
+檔案剛加入、內層資料夾尚未建立、內容雜湊尚未算出時，使用 provisional identity：
 
 ```text
-targetFolderId + relativePath + name + size + lastModified
+rootFolderId + relativePath + name + size + lastModified
 ```
 
-`relativePath` 是目的資料夾內、不含檔名的相對目錄路徑；直接上傳單一或多個檔案時為空字串。資料夾上傳尚未完成內層資料夾建立時，`targetFolderId` 使用該次上傳的根目的資料夾 ID，並由 `relativePath` 區分內層位置。
+`relativePath` 是根目的資料夾內、不含檔名的相對目錄路徑；直接上傳單一或多個檔案時為空字串。這些欄位在項目建立時就固定，不隨 `ensureFolder()` 的結果改變。
 
-取得現有 `hashFileBounded()` 結果後，使用以下 canonical identity：
+`resolvedFolderId`（由 `ensureFolder()` 填入）與 `contentHash`（由既有 `hashFileBounded()` 填入）**兩者都到齊**後，才算得出 canonical identity：
 
 ```text
-targetFolderId + relativePath + contentHash + size
+resolvedFolderId + name + contentHash
 ```
 
-內容雜湊優先於 provisional identity。相同檔名但雜湊不同的檔案必須保持為不同項目。相同內容但目的資料夾或資料夾內相對路徑不同，也必須保持為不同工作。
+`name` 必須包含在內。少了它，同一資料夾中內容相同但檔名不同的 `a.txt` 與 `b.txt` 會被判為同一個工作，第二個檔案會因第一個仍在 active 而被忽略，連自己的中繼資料都不會註冊。`size` 不另外列入，因為 `sha256File()` 回傳的格式本身就是 `<hex64>:<size>`。`relativePath` 也不再列入，因為 `resolvedFolderId` 已經編碼了實際位置——這正是跨入口重試能夠合併的原因（見下）。
 
-### 再次加入時的行為
+**內容雜湊的已知限制**：`frontend/src/lib/hashFile.ts` 只讀取前 100 MB 加上檔案大小。兩個大小相同、前 100 MB 也相同、只在之後的位元組不同的檔案，會被判定為相同內容。本規格接受這個限制（與既有的上傳去重行為一致），不因上傳中心而改用完整檔案雜湊——完整雜湊會讓每次重試都重讀整份檔案。
 
-當使用者再次選取或拖入檔案：
+### 身分確認閘門
 
-| 現有項目狀態 | 身分相同時的行為 |
+在 canonical identity 算出來之前，佇列**不得忽略新檔案，也不得改寫任何既有項目**：
+
+1. 新檔案加入時，一律建立新項目，狀態為 `queued`。
+2. 若它的 provisional identity 命中某個既有項目，把新項目的 `mergePendingWith` 設為該候選項目的 `id`。`mergePendingWith` 非 null 的項目不進虛擬列表、不進任何計數與整體百分比，因此畫面上仍然只有候選項目那一列。
+3. 沒有命中候選時 `mergePendingWith` 為 null，項目立即正常顯示（一般情況不會有任何閃爍或計數跳動）。
+4. `resolvedFolderId` 與 `contentHash` 都到齊後，reducer 依 canonical identity 重新比對，才做出合併、忽略或分列的決定。
+
+這個閘門同時解決兩件事：候選確認前原失敗紀錄完整保留（不需要還原機制），以及目的資料夾在建立完成後才參與身分判定（`destination` 的不可變部分不會被改寫）。
+
+`ChonkyDrive.tsx:1126` 的 `ensureFolder()` 在每個檔案真正開工前就已 await 完成，因此這個閘門不會延後上傳；它與雜湊前置作業落在同一個時間點。
+
+### 身分確認後的行為
+
+canonical identity 相同時：
+
+| 既有項目狀態 | 行為 |
 |---|---|
-| `queued` / `hashing` / `uploading` / `registering` | 不新增、不重啟；聚焦既有項目並保持原進度。 |
-| `error` | 沿用既有 `id`；`attempt += 1`，清除錯誤，狀態回到 `queued`，以新的 `File` 物件重跑完整流程。畫面全程維持一列。 |
-| `complete` | 建立新項目；這代表使用者主動發起新的上傳工作，實際位元組是否省略仍交由既有內容去重流程決定。 |
+| `queued` / `hashing` / `uploading` / `registering` | 丟棄新項目、釋放其 `File` 參照；聚焦既有項目並保持原進度。 |
+| `error` | 新項目併入既有 `id`：`attempt += 1`、`progress` 歸零、清除 `errorStage`/`errorMessage`/`completedAt`，狀態回到 `queued`，以新的 `File` 物件重跑完整流程。畫面全程維持一列。 |
+| `complete` | **不合併**，新項目脫離 `mergePendingWith` 成為獨立的一列。這代表使用者主動發起新的上傳工作；實際位元組是否省略仍交由既有內容去重流程決定。 |
 
-如果 provisional identity 相同，但後續內容雜湊證明檔案不同，佇列必須保留原失敗項目，並為新內容建立新的項目。不得把原失敗紀錄改寫成另一個檔案的結果。
+canonical identity 不同時（provisional 命中但雜湊或解析後的目的地其實不同）：新項目清除 `mergePendingWith`，成為自己的一列。原項目**完全不受影響**——原本的 `error`、`attempt`、錯誤訊息與最後已知百分比全部保留。因為閘門前不曾改寫原列，這裡不需要任何還原邏輯。
 
 若使用者已清除舊失敗項目，之後再次加入相同檔案時會建立新列，`attempt` 從 1 開始。
 
+### 跨入口重試
+
+同一個實體目的地可以由兩種入口抵達：拖入資料夾 `A/`（`rootFolderId = 目前資料夾`、`relativePath = "A"`），或先進入 `A/` 再拖入檔案（`rootFolderId = A_id`、`relativePath = ""`）。兩者的 provisional identity 不同，但 `resolvedFolderId` 都會解析到 `A_id`，因此 canonical identity 相同。
+
+為了讓這個案例也能合併，reducer 的 canonical 比對**不限於 provisional 候選**：識別碼確認後，以 `canonicalIdentity` 對全佇列查表。provisional identity 的唯一用途是決定新項目在確認前是否隱藏，避免使用者看到重複列一閃而過。
+
+已知邊界：`ensureFolder()` 在 `api.createFolder()` 失敗時會退回父資料夾（`ChonkyDrive.tsx:1135`）。此時不同 `relativePath` 的檔案會真的落在同一個資料夾，canonical identity 相同即代表目的地相同，合併是正確行為。
+
 ### 同一批次中的重複內容
 
-既有 `claimedHashes` 仍負責避免同一批次重複上傳位元組。上傳中心的項目身分與 Telegram 位元組去重是兩個不同概念：不同路徑或不同目的資料夾的項目可以各有一列，但仍可共用已上傳的 Telegram parts 並分別註冊中繼資料。
+既有 `claimedHashes` 仍負責避免同一批次重複上傳位元組。上傳中心的項目身分與 Telegram 位元組去重是兩個不同概念：不同檔名、不同路徑或不同目的資料夾的項目可以各有一列，但仍可共用已上傳的 Telegram parts 並分別註冊中繼資料。
 
 ## 清除與保留
 
@@ -236,6 +284,8 @@ targetFolderId + relativePath + contentHash + size
 - 「清除已完成與失敗」只移除 `complete` 與 `error`；所有 active 狀態必須保留。
 - 若存在 active 項目，關閉控制等同收合，不得丟棄進度列。
 - 沒有 active 項目時，使用者可清除所有 terminal 項目並讓上傳中心消失。
+
+上傳中心的清除、重試與項目合併，**不得清除、也不得直接增加每日上傳統計**。統計仍以實際成功傳輸的位元組為準，由 `frontend/src/lib/gramjs.ts` 在傳輸層呼叫 `recordUploadedBytes()` 累計，與上傳中心的顯示狀態完全解耦。重試會因為真的重傳位元組而讓統計增加，這是正確的；合併成一列或清除列表則不得對統計產生任何影響。
 
 ## 虛擬捲動與效能
 
@@ -255,8 +305,9 @@ targetFolderId + relativePath + contentHash + size
 ### `frontend/src/lib/uploadQueue.ts`
 
 - 定義 `UploadItem`、狀態、reducer actions 與 selectors。
-- 產生 provisional/canonical identity。
+- 產生 provisional/canonical identity，並實作身分確認閘門（`mergePendingWith`）。
 - 決定加入、忽略、重試或拆成新項目。
+- 以 `{ id, attempt }` 過濾遲到的非同步動作。
 - 實作篩選、搜尋、排序、計數及整體進度計算。
 - 不依賴 React、GramJS、API client 或 DOM。
 
@@ -286,7 +337,8 @@ targetFolderId + relativePath + contentHash + size
 - 保留拖放、選擇檔案、資料夾走訪、雜湊、Telegram 上傳及註冊流程。
 - 將 `startUploadBatch()` 與 `uploadFolder()` 中的整體陣列替換改成 queue item ID 更新。
 - 移除 `VISIBLE_MAX`、`visibleFiles`、`uploadTotals` 及依檔名更新列的邏輯。
-- 將目前 `previewFile` 是否存在傳給上傳中心，用於自動收合。
+- 傳入 `isVideoPreviewOpen`，其值為 `previewFile !== null && fileKind(previewFile.mime_type, previewFile.filename) === 'video'`，不得只傳「`previewFile` 是否存在」。
+- 提供 `ensureFolder()` 解析結果給佇列（`setResolved` action），讓身分確認閘門得以完成。
 
 不需要修改後端 API、資料庫 schema、Service Worker 或 Telegram 上傳函式。
 
@@ -324,9 +376,14 @@ targetFolderId + relativePath + contentHash + size
 2. 不同批次的非同步 action 只更新指定 ID，不會覆蓋其他項目。
 3. 同名不同 ID 的進度互不影響。
 4. 相同失敗檔案重新加入時保持一個 ID、`attempt` 加一並清除錯誤。
-5. 相同 provisional identity 但不同內容雜湊時拆成兩個項目，原失敗資料不遺失。
-6. 相同 active 檔案再次加入時不新增項目。
+5. 相同 provisional identity 但不同內容雜湊時拆成兩個項目，原失敗項目的 `attempt`、錯誤階段、錯誤訊息與最後已知百分比皆未被改寫。
+6. 相同 active 檔案再次加入時不新增可見項目，且身分確認前既有項目的進度不受影響。
 7. 同一內容但不同目的資料夾或相對路徑不合併。
+7a. 同一資料夾內、內容相同但檔名不同的兩個檔案各自成列，且兩者都完成註冊（canonical identity 含 `name`）。
+7b. 拖入資料夾 `A/` 中的失敗檔案，改為進入 `A/` 後重新拖入時合併為同一列並 `attempt = 2`（兩者 `resolvedFolderId` 相同）。
+7c. `mergePendingWith` 非 null 的項目不計入總數、失敗數與整體百分比。
+7d. `attempt = 1` 遲到的 `setProgress`、`fail` 與 `complete` 不影響已進入 `attempt = 2` 的項目；已進入 `complete`/`error` 的項目拒絕 `setProgress`。
+7e. `retry` 把 `progress` 歸零並清除 `completedAt`／錯誤欄位；同一 `attempt` 內 `setProgress` 不得倒退。
 8. 清除動作只移除 terminal 項目。
 9. 失敗、進行中、完成的排序與四種篩選符合規格。
 10. 搜尋能找到虛擬 viewport 外及已收合完成組內的項目。
@@ -340,9 +397,11 @@ targetFolderId + relativePath + contentHash + size
 2. 第一批仍有延遲中的項目時加入第二批，畫面只有一個上傳中心，總數為兩批總和，且第一批狀態不被覆蓋。
 3. 製造註冊失敗後再次選取相同內容，失敗列直接轉為第 2 次嘗試，DOM 與狀態中都只有一列。
 4. 同名但內容不同的兩個檔案顯示兩列並各自更新。
+4a. 同一資料夾中內容相同、檔名不同的兩個檔案顯示兩列，兩者皆註冊成功。
 5. 失敗項目置頂；切換失敗篩選後只看見失敗項目及具體原因。
 6. 清除已完成與失敗後，進行中的列仍存在。
-7. 開啟影片預覽後，展開面板消失、收合按鈕出現，按鈕與影片及預覽控制的 bounding boxes 不重疊。
+7. 開啟影片預覽後，展開面板消失、收合按鈕出現，按鈕與影片及預覽控制的 bounding boxes 不重疊；預覽期間點擊收合按鈕不展開面板。
+7a. 開啟圖片、PDF、音訊與文字預覽時，上傳中心維持原本的展開狀態，不被誤判為影片而收合。
 8. 關閉影片後維持收合；上傳完成與失敗徽章仍持續更新。
 9. 在窄螢幕 viewport 驗證底部 sheet 不超出畫面，篩選及清除控制可用鍵盤操作。
 
@@ -357,7 +416,9 @@ targetFolderId + relativePath + contentHash + size
 - 失敗總數始終可見；失敗列預設優先於進行中及完成列。
 - 新批次不會清除舊失敗。
 - 相同失敗檔案再次上傳時畫面維持一列並顯示增加後的嘗試次數。
-- 相同 active 檔案不會重複排入；同名不同內容不會被錯誤合併。
+- 相同 active 檔案不會重複排入；同名不同內容不會被錯誤合併；同內容不同檔名也不會被錯誤合併。
+- 身分確認前不改寫任何既有項目；遲到的舊 `attempt` 更新不影響新一次嘗試。
+- 上傳中心的清除、重試與合併不改動每日上傳統計。
 - 影片預覽期間，上傳 UI 不遮住播放器或預覽控制。
 - 清除操作永遠不移除進行中的工作。
 - 不新增任何讓檔案位元組經過 Python backend 的路徑。

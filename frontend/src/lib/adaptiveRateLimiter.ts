@@ -1,4 +1,11 @@
 import { formatAccountLog } from './accountLog';
+import {
+  PREMIUM_FLOOD_CAUTIOUS_INTERVAL_MS,
+  PREMIUM_FLOOD_CAUTIOUS_STEP,
+  PREMIUM_FLOOD_CLEAN_WINDOW_MS,
+} from '../config';
+
+export type PacerMode = 'normal' | 'frozen' | 'cautious';
 
 export interface CeilingOptions {
   /** On flood, ceiling ≤ backoff × the rate that triggered it. */
@@ -94,6 +101,12 @@ export class AdaptiveRateLimiter {
   private lastIncreaseAt = 0;
   private floods = 0;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Premium flood recovery is deliberately session-only. Persisting either
+  // state would carry a temporary account-tier cap into a fresh page load.
+  private mode: PacerMode = 'normal';
+  private cleanWindowStart: number | null = null;
+  private lastCautiousIncreaseAt = 0;
 
   // Ceiling-memory state
   private floodEvents: number[] = [];
@@ -199,7 +212,8 @@ export class AdaptiveRateLimiter {
    * each pass also keeps those parts 1/rate apart afterwards, instead of
    * releasing them as one herd at the instant the window closes.
    */
-  async wait(): Promise<void> {
+  async wait(signal?: AbortSignal): Promise<void> {
+    this.throwIfAborted(signal);
     for (;;) {
       const interval = 1000 / this.rate;
       const now = Date.now();
@@ -208,10 +222,36 @@ export class AdaptiveRateLimiter {
       this.nextSlotAt = scheduled + interval;
       const delay = scheduled - now;
       if (delay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        await this.sleep(delay, signal);
       }
+      this.throwIfAborted(signal);
       if (Date.now() >= this.penaltyUntil) return;
     }
+  }
+
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return;
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
+
+  private sleep(delay: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('The operation was aborted', 'AbortError'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(done, delay);
+      const abort = () => {
+        clearTimeout(timer);
+        cleanup();
+        reject(new DOMException('The operation was aborted', 'AbortError'));
+      };
+      const cleanup = () => signal?.removeEventListener('abort', abort);
+      function done(): void {
+        cleanup();
+        resolve();
+      }
+      signal?.addEventListener('abort', abort, { once: true });
+    });
   }
 
   /**
@@ -226,8 +266,27 @@ export class AdaptiveRateLimiter {
    * the only response that helps.
    */
   pause(seconds?: number): void {
+    this.reportPremiumFlood(seconds);
+  }
+
+  /**
+   * Hold a premium-tier flood at the current rate and ceiling. The following
+   * post-wait clean send window controls the session-only cautious recovery.
+   */
+  reportPremiumFlood(seconds?: number): void {
+    const now = Date.now();
     const waitSeconds = typeof seconds === 'number' && seconds > 0 ? seconds : 10;
-    this.pauseUntil(Date.now() + waitSeconds * 1000 + 1000);
+    this.mode = 'frozen';
+    this.cleanWindowStart = null;
+    this.lastCautiousIncreaseAt = 0;
+    this.pauseUntil(now + waitSeconds * 1000 + 1000);
+  }
+
+  /** Start premium recovery only when a real part send begins after its wait. */
+  noteSendStarted(): void {
+    if (this.mode !== 'frozen' || this.cleanWindowStart !== null) return;
+    const now = Date.now();
+    if (now >= this.penaltyUntil) this.cleanWindowStart = now;
   }
 
   private pauseUntil(until: number): void {
@@ -238,6 +297,13 @@ export class AdaptiveRateLimiter {
   /** Multiplicative decrease + halt feed until the penalty window elapses. */
   reportFlood(seconds?: number): void {
     const now = Date.now();
+    // An ordinary flood remains a real rate signal, but if premium recovery is
+    // underway it also restarts its post-wait clean window.
+    if (this.mode !== 'normal') {
+      this.mode = 'frozen';
+      this.cleanWindowStart = null;
+      this.lastCautiousIncreaseAt = 0;
+    }
     this.floods += 1;
     this.lastFloodAt = now;
     const waitSeconds = typeof seconds === 'number' && seconds > 0 ? seconds : 10;
@@ -298,6 +364,28 @@ export class AdaptiveRateLimiter {
   /** Additive increase, gated by a clean window since the last flood. */
   reportSuccess(): void {
     const now = Date.now();
+
+    if (this.mode === 'frozen') {
+      if (
+        this.cleanWindowStart !== null &&
+        now - this.cleanWindowStart >= PREMIUM_FLOOD_CLEAN_WINDOW_MS
+      ) {
+        this.mode = 'cautious';
+        this.lastCautiousIncreaseAt = now;
+      }
+      return;
+    }
+
+    if (this.mode === 'cautious') {
+      if (now - this.lastCautiousIncreaseAt < PREMIUM_FLOOD_CAUTIOUS_INTERVAL_MS) return;
+      this.lastCautiousIncreaseAt = now;
+      if (this.rate >= this.opts.maxRate) return;
+      this.rate = Math.min(this.opts.maxRate, this.rate + PREMIUM_FLOOD_CAUTIOUS_STEP);
+      this.log(`cautious ramp → ${this.rate.toFixed(1)} parts/s`);
+      this.persist(false);
+      return;
+    }
+
     const ceilOpts = this.opts.ceiling;
     const escalated = now < this.escalatedUntil;
     const cleanWindow = escalated && ceilOpts ? ceilOpts.escalatedCleanWindowMs : this.opts.cleanWindowMs;
@@ -358,7 +446,21 @@ export class AdaptiveRateLimiter {
     }
   }
 
-  stats(): { rate: number; floods: number; ceiling: number | null } {
-    return { rate: this.rate, floods: this.floods, ceiling: this.ceiling };
+  stats(): {
+    rate: number;
+    floods: number;
+    ceiling: number | null;
+    mode: PacerMode;
+    penaltyUntil: number;
+    cleanWindowStart: number | null;
+  } {
+    return {
+      rate: this.rate,
+      floods: this.floods,
+      ceiling: this.ceiling,
+      mode: this.mode,
+      penaltyUntil: this.penaltyUntil,
+      cleanWindowStart: this.cleanWindowStart,
+    };
   }
 }

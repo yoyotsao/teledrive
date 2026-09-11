@@ -14,6 +14,7 @@ on:
       - frontend/src/maintenance/migrateSavedMessagesToChannel.test.ts
       - frontend/src/maintenance/migrateSavedMessagesToChannel.photo.test.ts
       - frontend/src/maintenance/migrateSavedMessagesToChannel.batch.test.ts
+      - frontend/src/maintenance/migrateSavedMessagesToChannel.verificationBatch.test.ts
 
 permissions:
   contents: read
@@ -47,3 +48,4 @@ jobs:
           src/maintenance/migrateSavedMessagesToChannel.test.ts
           src/maintenance/migrateSavedMessagesToChannel.photo.test.ts
           src/maintenance/migrateSavedMessagesToChannel.batch.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.verificationBatch.test.ts

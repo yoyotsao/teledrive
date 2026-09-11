@@ -90,6 +90,9 @@ const SORT_KEYS: Record<string, (row: Row) => string | number> = {
 
 export class FakeDrive {
   rows: Row[] = [];
+  accounts: Array<{ telegram_user_id: number; label: string; is_primary: number; file_count: number }> = [
+    { telegram_user_id: 42, label: 'test', is_primary: 1, file_count: 0 },
+  ];
   requests: Array<{ method: string; path: string; query: URLSearchParams; body: any }> = [];
 
   seed(...seeds: SeedRow[]): this {

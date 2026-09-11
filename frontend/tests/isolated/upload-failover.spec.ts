@@ -23,8 +23,8 @@ test('migrates a visible upload back to zero without letting the stale source fi
   });
 
   await page.evaluate(() => window.__TELEDRIVE_FAILOVER_TEST__!.finishTarget());
-  await expect(row).toContainText('已完成');
-  await expect(row).toHaveCount(1);
+  await expect(page.getByTestId('upload-center-title')).toContainText('1 / 1');
+  await expect(row).toHaveCount(0);
   expect(await page.evaluate(() => window.__TELEDRIVE_FAILOVER_TEST__!.snapshot())).toEqual({
     sourceFinalizeCalls: 0,
     targetFinalizeCalls: 1,

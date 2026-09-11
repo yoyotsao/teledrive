@@ -42,6 +42,7 @@ export type ChannelManagerLike = {
 type CacheEntry = {
   generation: number;
   byChannel: Map<string, AccountChannelVerification>;
+  byPeer: Map<string, ChannelEntity>;
 };
 
 const verificationCache = new WeakMap<object, CacheEntry>();
@@ -52,6 +53,19 @@ function managerGeneration(manager: ChannelManagerLike): number {
   return typeof manager.sessionGeneration === 'number'
     ? manager.sessionGeneration
     : (implicitGeneration.get(manager as object) ?? 0);
+}
+
+function cacheEntryFor(manager: ChannelManagerLike, generation: number): CacheEntry {
+  const key = manager as object;
+  const cached = verificationCache.get(key);
+  if (cached?.generation === generation) return cached;
+  const entry: CacheEntry = {
+    generation,
+    byChannel: new Map<string, AccountChannelVerification>(),
+    byPeer: new Map<string, ChannelEntity>(),
+  };
+  verificationCache.set(key, entry);
+  return entry;
 }
 
 function entityId(entity: ChannelEntity): string | null {
@@ -102,13 +116,21 @@ export async function resolveChannelPeerForAccount(
   canonicalChannelId: string,
 ): Promise<ChannelEntity | null> {
   const channelId = parseCanonicalChannelId(canonicalChannelId);
+  const generation = managerGeneration(manager);
+  const cache = cacheEntryFor(manager, generation);
+  const cachedPeer = cache.byPeer.get(channelId);
+  if (cachedPeer) return cachedPeer;
+
   const client = manager.client;
   if (!client) {
     throw new ChannelStorageError('CLIENT_UNAVAILABLE', 'Telegram client is not available');
   }
   for await (const dialog of client.iterDialogs({})) {
     const candidate = dialog?.entity;
-    if (candidate && entityId(candidate) === channelId) return candidate;
+    if (candidate && entityId(candidate) === channelId) {
+      cache.byPeer.set(channelId, candidate);
+      return candidate;
+    }
   }
   return null;
 }
@@ -123,11 +145,9 @@ export async function validateChannelForAccount(
 ): Promise<AccountChannelVerification> {
   const channelId = parseCanonicalChannelId(canonicalChannelId);
   const generation = managerGeneration(manager);
-  const cached = verificationCache.get(manager as object);
-  if (cached?.generation === generation) {
-    const existing = cached.byChannel.get(channelId);
-    if (existing) return existing;
-  }
+  const cache = cacheEntryFor(manager, generation);
+  const existing = cache.byChannel.get(channelId);
+  if (existing) return existing;
 
   const client = manager.client;
   if (!client) {
@@ -169,10 +189,6 @@ export async function validateChannelForAccount(
     accounts_version: manager.accountsVersion ?? 0,
   };
 
-  const entry = cached?.generation === generation
-    ? cached
-    : { generation, byChannel: new Map<string, AccountChannelVerification>() };
-  entry.byChannel.set(channelId, verification);
-  verificationCache.set(manager as object, entry);
+  cache.byChannel.set(channelId, verification);
   return verification;
 }

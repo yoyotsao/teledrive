@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import { getAllClients } from './lib/gramjs';
+import { getAllClients, getClientFor, getPrimaryClient } from './lib/gramjs';
 import { api } from './api/client';
 import { resolveFileLocation } from './lib/fileLocationResolver';
 import { fileInfoToLocation } from './lib/storageLocation';
@@ -33,6 +33,24 @@ const streamBridge = new MainWindowStreamBridge({
       resolved.media.id,
       resolved.media,
       async () => (await resolveFileLocation(frozenLocation, 'stream')).media,
+    );
+    return blob.arrayBuffer();
+  },
+  readLegacyChunk: async (file, offset, length) => {
+    if (file.telegram_message_id == null) {
+      throw Object.assign(new Error('Legacy file has no Telegram message id'), { code: 'READ_UNAVAILABLE' });
+    }
+    const manager = file.telegram_user_id
+      ? getClientFor(file.telegram_user_id)
+      : getPrimaryClient();
+    if (!manager?.downloadFileChunkedByOffset) {
+      throw Object.assign(new Error('Legacy Saved Messages reader is unavailable'), { code: 'CLIENT_UNAVAILABLE' });
+    }
+    const blob = await manager.downloadFileChunkedByOffset(
+      file.telegram_message_id,
+      offset,
+      length,
+      file.filesize,
     );
     return blob.arrayBuffer();
   },

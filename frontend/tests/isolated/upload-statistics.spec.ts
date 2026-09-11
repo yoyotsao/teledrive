@@ -34,6 +34,8 @@ test('settings switches between account management and daily upload statistics',
   await expect(settings.getByRole('row').filter({ hasText: '2026-09-04' })).toContainText('—');
   await expect(settings.getByRole('button', { name: '＋ 新增 Telegram 帳號' })).toBeHidden();
   await settings.getByRole('tab', { name: '統計', exact: true }).press('ArrowLeft');
+  await expect(settings.getByRole('tab', { name: '儲存位置' })).toBeFocused();
+  await settings.getByRole('tab', { name: '儲存位置' }).press('ArrowLeft');
   await expect(settings.getByRole('tab', { name: '管理帳號' })).toBeFocused();
   await expect(settings.getByRole('button', { name: '＋ 新增 Telegram 帳號' })).toBeVisible();
   await settings.getByRole('button', { name: '關閉設定' }).click();

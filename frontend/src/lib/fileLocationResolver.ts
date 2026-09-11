@@ -1,5 +1,5 @@
 import type { FileLocation } from './storageLocation.ts';
-import { validateChannelForAccount } from './channelStorage.ts';
+import { resolveChannelPeerForAccount, validateChannelForAccount } from './channelStorage.ts';
 import { getAllClients } from './gramjs.ts';
 import { readMedia, type MediaRef } from './telegramMedia.ts';
 
@@ -33,22 +33,6 @@ type ManagerLike = {
 
 function rawClient(manager: ManagerLike): any | null {
   return (manager as any).client ?? null;
-}
-
-function entityId(entity: any): string | null {
-  if (entity?.id == null) return null;
-  try {
-    return BigInt(String(entity.id)).toString();
-  } catch {
-    return null;
-  }
-}
-
-async function findChannelPeer(client: any, channelId: string): Promise<any | null> {
-  for await (const dialog of client.iterDialogs({})) {
-    if (entityId(dialog?.entity) === channelId) return dialog.entity;
-  }
-  return null;
 }
 
 function validateIdentity(location: FileLocation, media: MediaRef, attempts: number): void {
@@ -119,11 +103,10 @@ export function createFileLocationResolver(
     let attempts = 0;
     for (const manager of liveManagers) {
       attempts += 1;
-      const client = rawClient(manager)!;
       try {
         const verification = await validateChannelForAccount(manager as any, location.telegram_chat_id);
         if (!verification.can_read) continue;
-        const peer = await findChannelPeer(client, location.telegram_chat_id);
+        const peer = await resolveChannelPeerForAccount(manager as any, location.telegram_chat_id);
         if (!peer) continue;
         return await fetchAndValidate(manager, peer, location, attempts);
       } catch (error) {

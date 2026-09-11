@@ -11,6 +11,11 @@ export interface MainWindowStreamBridgeDeps {
     length: number,
     file: FileInfo,
   ): Promise<ArrayBuffer>;
+  readLegacyChunk?(
+    file: FileInfo,
+    offset: number,
+    length: number,
+  ): Promise<ArrayBuffer>;
 }
 
 export interface StreamBridgeResult {
@@ -54,12 +59,24 @@ export class MainWindowStreamBridge {
   private async resolveCurrent(fileId: string, expectedVersion: number): Promise<{
     file: FileInfo;
     resolved: ResolvedFileLocation;
+  } | {
+    file: FileInfo;
+    legacy: true;
   } | { error: 'STALE_LOCATION' | 'READ_UNAVAILABLE' }> {
     const file = await this.deps.getFile(fileId);
     if ((file.location_version ?? 0) !== expectedVersion) return { error: 'STALE_LOCATION' };
 
     const location = fileInfoToLocation(file);
-    if (!location) return { error: 'READ_UNAVAILABLE' };
+    if (!location) {
+      if (
+        file.telegram_chat_id === null
+        && file.telegram_user_id != null
+        && file.telegram_message_id != null
+      ) {
+        return { file, legacy: true };
+      }
+      return { error: 'READ_UNAVAILABLE' };
+    }
 
     const resolved = await this.deps.resolve(location, 'stream');
     if (resolved.locationVersion !== expectedVersion) return { error: 'STALE_LOCATION' };
@@ -73,7 +90,9 @@ export class MainWindowStreamBridge {
       return {
         request_id: request.request_id,
         metadata: {
-          size: current.resolved.media.size || current.file.filesize,
+          size: 'legacy' in current
+            ? current.file.filesize
+            : (current.resolved.media.size || current.file.filesize),
           mimeType: current.file.mime_type || 'video/mp4',
         },
       };
@@ -87,12 +106,14 @@ export class MainWindowStreamBridge {
       const current = await this.resolveCurrent(request.file_id, request.location_version);
       if ('error' in current) return { request_id: request.request_id, error: current.error };
 
-      const chunk = await this.deps.readChunk(
-        current.resolved,
-        request.offset,
-        request.length,
-        current.file,
-      );
+      const chunk = 'legacy' in current
+        ? await this.readLegacy(current.file, request.offset, request.length)
+        : await this.deps.readChunk(
+          current.resolved,
+          request.offset,
+          request.length,
+          current.file,
+        );
 
       const after = await this.deps.getFile(request.file_id);
       if ((after.location_version ?? 0) !== request.location_version) {
@@ -103,5 +124,12 @@ export class MainWindowStreamBridge {
     } catch (error) {
       return { request_id: request.request_id, error: errorCode(error) };
     }
+  }
+
+  private async readLegacy(file: FileInfo, offset: number, length: number): Promise<ArrayBuffer> {
+    if (!this.deps.readLegacyChunk) {
+      throw Object.assign(new Error('Legacy Saved Messages reader is unavailable'), { code: 'READ_UNAVAILABLE' });
+    }
+    return this.deps.readLegacyChunk(file, offset, length);
   }
 }

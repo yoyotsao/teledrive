@@ -653,7 +653,16 @@ async def rollback_migration_group(
                 SET state = 'rolled_back', applied_location_version = ?, version = version + 1, updated_at = ?
                 WHERE migration_id = ? AND item_id = ?
             """, (expected + 1, _iso(), migration_id, item["item_id"]))
-        await conn.execute("UPDATE storage_migrations SET state = 'rolled_back', version = version + 1, updated_at = ? WHERE migration_id = ?", (_iso(), migration_id))
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM storage_migration_items WHERE migration_id = ? AND state != 'rolled_back'",
+            (migration_id,),
+        )
+        remaining = (await cursor.fetchone())[0]
+        await conn.execute(
+            "UPDATE storage_migrations SET state = ?, version = version + 1, updated_at = ? WHERE migration_id = ?",
+            ("rolled_back" if remaining == 0 else "running", _iso(), migration_id),
+        )
         await conn.commit()
     except Exception:
         await conn.rollback()

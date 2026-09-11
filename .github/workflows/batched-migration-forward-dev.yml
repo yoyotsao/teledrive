@@ -1,0 +1,45 @@
+name: Batched Migration Forward Dev
+
+on:
+  push:
+    branches:
+      - feat/batched-storage-migration
+    paths:
+      - .github/workflows/batched-migration-forward-dev.yml
+      - frontend/src/lib/forwardResult.ts
+      - frontend/src/lib/forwardResult.test.ts
+      - frontend/src/lib/gramjs.ts
+      - frontend/src/lib/gramjs.forwardBatch.test.ts
+      - frontend/src/maintenance/migrateSavedMessagesToChannel.ts
+      - frontend/src/maintenance/migrateSavedMessagesToChannel.test.ts
+      - frontend/src/maintenance/migrateSavedMessagesToChannel.photo.test.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batched-migration-forward-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Focused migration forward tests
+        run: >-
+          npx vitest run
+          src/lib/forwardResult.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.photo.test.ts

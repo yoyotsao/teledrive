@@ -4,6 +4,12 @@
  * forwardResult.test.ts.
  */
 
+type RetryableForwardResultError = Error & { response: { status: number } };
+
+function retryableForwardResultError(message: string): RetryableForwardResultError {
+  return Object.assign(new Error(message), { response: { status: 503 } });
+}
+
 /**
  * Normalize what `client.forwardMessages` returns for one source chat.
  *
@@ -18,13 +24,13 @@ export function unwrapForwardedMessages(result: unknown, sourceMessageIds: reado
   const first = Array.isArray(result) ? result[0] : undefined;
   const forwarded = Array.isArray(first) ? first : (Array.isArray(result) ? result : []);
   if (forwarded.length !== sourceMessageIds.length) {
-    throw new Error(
+    throw retryableForwardResultError(
       `Forward result count mismatch: expected ${sourceMessageIds.length}, got ${forwarded.length}`,
     );
   }
   return forwarded.map((message, index) => {
     if (!message?.id) {
-      throw new Error(`Forward of message ${sourceMessageIds[index]} returned no message`);
+      throw retryableForwardResultError(`Forward of message ${sourceMessageIds[index]} returned no message`);
     }
     return message;
   });
@@ -36,7 +42,7 @@ export function unwrapForwardedMessage(result: unknown, messageId: number): any 
     return unwrapForwardedMessages(result, [messageId])[0];
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('Forward result count mismatch:')) {
-      throw new Error(`Forward of message ${messageId} returned no message`);
+      throw retryableForwardResultError(`Forward of message ${messageId} returned no message`);
     }
     throw error;
   }

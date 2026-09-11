@@ -29,6 +29,20 @@ describe('unwrapForwardedMessages', () => {
   it('rejects a result-count mismatch before assigning any result', () => {
     expect(() => unwrapForwardedMessages([[msg]], [10, 11])).toThrow(/2.*1|1.*2/);
   });
+
+  it.each([
+    { label: 'missing mapped slot', result: [[msg, undefined]], sourceIds: [10, 11] },
+    { label: 'result-count mismatch', result: [[msg]], sourceIds: [10, 11] },
+  ])('marks $label as a retryable transport-style result', ({ result, sourceIds }) => {
+    let caught: any;
+    try {
+      unwrapForwardedMessages(result, sourceIds);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught?.response?.status).toBe(503);
+  });
 });
 
 describe('unwrapForwardedMessage', () => {

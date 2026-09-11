@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal, Optional, List
+from typing import Dict, Literal, Optional, List
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -216,3 +216,96 @@ class FileLocationGroupSwitchRequest(BaseModel):
         if len({part.file_id for part in self.parts}) != len(self.parts):
             raise ValueError("each file may appear only once")
         return self
+
+
+
+# Storage migration endpoints carry metadata/CAS versions only. Telegram
+# sessions, peer access hashes and file bytes are intentionally absent.
+class CreateMigrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_target_version: int = Field(..., ge=0)
+    expected_accounts_version: int = Field(..., ge=0)
+    dry_run: bool = False
+
+
+class ItemPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(..., ge=1)
+    lease_owner: str = Field(..., min_length=1, max_length=128)
+    lease_seconds: int = Field(..., ge=1, le=300)
+    operation_id: Optional[str] = Field(None, min_length=1, max_length=128)
+    state: Optional[str] = Field(None, min_length=1, max_length=32)
+    error: Optional[str] = Field(None, max_length=1024)
+
+
+class ReconcileTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_item_version: int = Field(..., ge=1)
+    operation_result_version: int = Field(..., ge=1)
+
+
+class EvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_item_version: int = Field(..., ge=1)
+    result_version: int = Field(..., ge=1)
+    target_channel_id: str = Field(..., min_length=1, max_length=12)
+    destination_message_id: int = Field(..., gt=0)
+    media_kind: Literal["document", "photo"]
+    media_id: str = Field(..., min_length=1, max_length=64)
+    size_bytes: int = Field(..., ge=0)
+    photo_variant: Optional[str] = Field(None, max_length=255)
+    read_probe_ok: bool
+    checked_at: datetime
+    source_read_probe_ok: bool = False
+
+    @field_validator("target_channel_id")
+    @classmethod
+    def validate_target_channel(cls, value: str) -> str:
+        if not is_canonical_channel_id(value):
+            raise ValueError("target_channel_id must be canonical")
+        return value
+
+    @field_validator("checked_at")
+    @classmethod
+    def validate_checked_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("checked_at must include a timezone")
+        return value.astimezone(timezone.utc)
+
+
+class CommitGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_job_version: int = Field(..., ge=1)
+    expected_item_versions: Dict[str, int] = Field(..., min_length=1)
+
+
+class RollbackGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_location_versions: Dict[str, int] = Field(..., min_length=1)
+
+
+class MigrationItemResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    migration_id: str
+    item_id: str
+    file_id: str
+    group_id: str
+    state: str
+    version: int
+
+
+class MigrationResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    migration_id: str
+    state: str
+    version: int
+    dry_run: bool
+    target_channel_id: str
+    items: List[dict] = Field(default_factory=list)
+
+
+class EvidenceResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    telegram_user_id: int
+    result_version: int
+    target_channel_id: str

@@ -163,6 +163,49 @@ export interface StorageTargetPutRequest {
   verifications: StorageTargetVerificationRequest[];
 }
 
+export interface StorageMigrationEvidence {
+  telegram_user_id: number;
+  result_version: number;
+  target_channel_id: string;
+  destination_message_id: number;
+  media_kind: 'document' | 'photo';
+  media_id: string;
+  size_bytes: number;
+  photo_variant?: string | null;
+  read_probe_ok: boolean;
+  checked_at: string;
+  source_read_probe_ok?: boolean;
+  source_checked_at?: string | null;
+}
+
+export interface StorageMigrationItem {
+  migration_id: string;
+  item_id: string;
+  file_id: string;
+  group_id: string;
+  part_index?: number | null;
+  state: string;
+  version: number;
+  source_location: Record<string, unknown>;
+  expected_location_version: number;
+  operation_id?: string | null;
+  operation_result_version?: number | null;
+  applied_location_version?: number | null;
+  evidence: StorageMigrationEvidence[];
+}
+
+export interface StorageMigrationJob {
+  migration_id: string;
+  state: string;
+  version: number;
+  dry_run: boolean;
+  target_channel_id: string;
+  target_version: number;
+  accounts_version: number;
+  target_snapshot: Record<string, unknown>;
+  items: StorageMigrationItem[];
+}
+
 /** Durable, metadata-only send intent. Telegram bytes and credentials stay in GramJS. */
 export interface TelegramOperationRequest {
   operation_id: string;
@@ -280,6 +323,110 @@ export const api = {
 
   putStorageTarget: async (request: StorageTargetPutRequest): Promise<StorageTargetResponse> => {
     const response = await client.put<StorageTargetResponse>('/storage-target', request);
+    return response.data;
+  },
+
+  createMigrationManifest: async (params: {
+    expectedTargetVersion: number;
+    expectedAccountsVersion: number;
+    dryRun?: boolean;
+  }): Promise<StorageMigrationJob> => {
+    const response = await client.post<StorageMigrationJob>('/storage-migrations', {
+      expected_target_version: params.expectedTargetVersion,
+      expected_accounts_version: params.expectedAccountsVersion,
+      dry_run: params.dryRun ?? false,
+    });
+    return response.data;
+  },
+
+  listMigrationJobs: async (): Promise<StorageMigrationJob[]> => {
+    const response = await client.get<{ migrations: StorageMigrationJob[] }>('/storage-migrations');
+    return response.data.migrations;
+  },
+
+  getMigrationJob: async (migrationId: string): Promise<StorageMigrationJob> => {
+    const response = await client.get<StorageMigrationJob>(`/storage-migrations/${migrationId}`);
+    return response.data;
+  },
+
+  claimMigrationItem: async (params: {
+    migrationId: string;
+    itemId: string;
+    expectedVersion: number;
+    leaseOwner: string;
+    leaseSeconds: number;
+    operationId?: string;
+    state?: string;
+    error?: string;
+  }): Promise<StorageMigrationItem> => {
+    const response = await client.patch<StorageMigrationItem>(
+      `/storage-migrations/${params.migrationId}/items/${params.itemId}`,
+      {
+        expected_version: params.expectedVersion,
+        lease_owner: params.leaseOwner,
+        lease_seconds: params.leaseSeconds,
+        operation_id: params.operationId,
+        state: params.state,
+        error: params.error,
+      },
+    );
+    return response.data;
+  },
+
+  reconcileMigrationItem: async (params: {
+    migrationId: string;
+    itemId: string;
+    expectedItemVersion: number;
+    operationResultVersion: number;
+  }): Promise<StorageMigrationItem> => {
+    const response = await client.post<StorageMigrationItem>(
+      `/storage-migrations/${params.migrationId}/items/${params.itemId}/reconcile`,
+      {
+        expected_item_version: params.expectedItemVersion,
+        operation_result_version: params.operationResultVersion,
+      },
+    );
+    return response.data;
+  },
+
+  putMigrationEvidence: async (params: {
+    migrationId: string;
+    itemId: string;
+    telegramUserId: number;
+    evidence: Omit<StorageMigrationEvidence, 'telegram_user_id' | 'source_checked_at'> & { expected_item_version: number };
+  }): Promise<StorageMigrationItem> => {
+    const response = await client.put<StorageMigrationItem>(
+      `/storage-migrations/${params.migrationId}/items/${params.itemId}/verifications/${params.telegramUserId}`,
+      params.evidence,
+    );
+    return response.data;
+  },
+
+  commitMigrationGroup: async (params: {
+    migrationId: string;
+    groupId: string;
+    expectedJobVersion: number;
+    expectedItemVersions: Record<string, number>;
+  }): Promise<StorageMigrationJob> => {
+    const response = await client.post<StorageMigrationJob>(
+      `/storage-migrations/${params.migrationId}/groups/${params.groupId}/commit`,
+      {
+        expected_job_version: params.expectedJobVersion,
+        expected_item_versions: params.expectedItemVersions,
+      },
+    );
+    return response.data;
+  },
+
+  rollbackMigrationGroup: async (params: {
+    migrationId: string;
+    groupId: string;
+    expectedLocationVersions: Record<string, number>;
+  }): Promise<StorageMigrationJob> => {
+    const response = await client.post<StorageMigrationJob>(
+      `/storage-migrations/${params.migrationId}/groups/${params.groupId}/rollback`,
+      { expected_location_versions: params.expectedLocationVersions },
+    );
     return response.data;
   },
 

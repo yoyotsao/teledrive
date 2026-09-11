@@ -1,0 +1,60 @@
+name: Apply Task 15 API Integration
+
+on:
+  push:
+    branches:
+      - plan/shared-channel-storage
+    paths:
+      - .github/workflows/apply-task15-api.yml
+      - .github/scripts/apply_task15_api.py
+      - .github/scripts/cleanup_task15_patch.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: task15-api-integration
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply Task 15 API contracts
+        run: |
+          python .github/scripts/apply_task15_api.py
+          python .github/scripts/cleanup_task15_patch.py
+          git diff --check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install backend test dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt pytest >/dev/null
+      - name: Task 15 backend gates
+        working-directory: backend
+        run: |
+          python -m pytest tests/test_storage_migration.py tests/test_linked_accounts.py -q
+          python -m pytest tests/test_api_authz.py -q
+          python -m pytest tests/test_schema_migration.py -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci
+      - name: Frontend TypeScript
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Commit Task 15 API integration
+        run: |
+          git config user.name 'ChatGPT'
+          git config user.email '79632318+yoyotsao@users.noreply.github.com'
+          git add backend/app/services/database.py backend/app/api/routes.py backend/app/models/schemas.py backend/tests/test_api_authz.py frontend/src/api/client.ts
+          git commit -m 'feat: journal quorum-verified storage migration'
+          git push origin HEAD:plan/shared-channel-storage

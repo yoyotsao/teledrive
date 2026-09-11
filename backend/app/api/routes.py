@@ -5,6 +5,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.models.schemas import (
     FileListResponse,
     FileInfo,
+    CommitGroupRequest,
+    CreateMigrationRequest,
+    EvidenceRequest,
+    ItemPatchRequest,
+    ReconcileTransitionRequest,
+    RollbackGroupRequest,
     FileLocationGroupSwitchRequest,
     FileLocationSwitchRequest,
     ReconcileTelegramOperationResultRequest,
@@ -133,6 +139,14 @@ def _operation_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="Internal server error")
 
 
+def _migration_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, (KeyError, PermissionError)):
+        return HTTPException(status_code=404, detail="Storage migration not found")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.post("/auth/challenge", response_model=ChallengeResponse)
 async def auth_challenge():
     """Hand out a one-time nonce for the caller to DM to our bot."""
@@ -238,6 +252,112 @@ async def put_storage_target(
     if target is None:
         raise HTTPException(status_code=409, detail="Storage target changed; refresh and try again")
     return target
+
+
+@router.post("/storage-migrations")
+async def create_storage_migration(
+    request: CreateMigrationRequest, current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return await db.create_migration_manifest(
+            current_user, request.expected_target_version,
+            request.expected_accounts_version, request.dry_run,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
+
+
+@router.get("/storage-migrations")
+async def list_storage_migrations(current_user: int = Depends(get_current_user)):
+    db = await get_database()
+    return {"migrations": await db.list_migration_jobs(current_user)}
+
+
+@router.get("/storage-migrations/{migration_id}")
+async def get_storage_migration(
+    migration_id: str, current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    migration = await db.get_migration_job(current_user, migration_id)
+    if migration is None:
+        raise HTTPException(status_code=404, detail="Storage migration not found")
+    return migration
+
+
+@router.patch("/storage-migrations/{migration_id}/items/{item_id}")
+async def patch_storage_migration_item(
+    migration_id: str, item_id: str, request: ItemPatchRequest,
+    current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return await db.claim_migration_item(
+            current_user, migration_id, item_id, request.expected_version,
+            request.lease_owner, request.lease_seconds,
+            operation_id=request.operation_id, state=request.state, error=request.error,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
+
+
+@router.post("/storage-migrations/{migration_id}/items/{item_id}/reconcile")
+async def reconcile_storage_migration_item(
+    migration_id: str, item_id: str, request: ReconcileTransitionRequest,
+    current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return await db.transition_reconciled_item(
+            current_user, migration_id, item_id,
+            request.expected_item_version, request.operation_result_version,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
+
+
+@router.put("/storage-migrations/{migration_id}/items/{item_id}/verifications/{telegram_user_id}")
+async def put_storage_migration_evidence(
+    migration_id: str, item_id: str, telegram_user_id: int,
+    request: EvidenceRequest, current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        payload = request.model_dump(mode="json")
+        return await db.upsert_migration_evidence(
+            current_user, migration_id, item_id, telegram_user_id, **payload,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
+
+
+@router.post("/storage-migrations/{migration_id}/groups/{group_id}/commit")
+async def commit_storage_migration_group(
+    migration_id: str, group_id: str, request: CommitGroupRequest,
+    current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return await db.commit_migration_group(
+            current_user, migration_id, group_id,
+            request.expected_job_version, request.expected_item_versions,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
+
+
+@router.post("/storage-migrations/{migration_id}/groups/{group_id}/rollback")
+async def rollback_storage_migration_group(
+    migration_id: str, group_id: str, request: RollbackGroupRequest,
+    current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return await db.rollback_migration_group(
+            current_user, migration_id, group_id, request.expected_location_versions,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
 
 
 @router.post("/telegram-operations")
@@ -694,10 +814,10 @@ async def get_download_info(file_id: str, current_user: int = Depends(get_curren
     try:
         file_service = get_file_service()
         file_info = await file_service.get_file_info(file_id, owner_id=current_user)
-        
+
         if not file_info:
             raise HTTPException(status_code=404, detail="File not found")
-        
+
         return {
             "file_id": file_info.file_id,
             "filename": file_info.filename,
@@ -783,11 +903,11 @@ async def get_files_by_split_group(split_group_id: str, current_user: int = Depe
 
         if not rows:
             raise HTTPException(status_code=404, detail="No files found for this split group")
-        
+
         file_service = get_file_service()
         files = [file_service._row_to_file_info(row) for row in rows]
         files.sort(key=lambda f: f.part_index or 0)
-        
+
         return FileListResponse(
             files=files,
             total=len(files),

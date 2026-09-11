@@ -56,8 +56,6 @@ async function installStorageApi(page: Page, state: BackendState, verification: 
 }
 
 async function openStorage(page: Page) {
-  await page.goto('/');
-  await expect(page.getByRole('button', { name: '登出' })).toBeVisible();
   await page.getByTitle('設定 / Telegram 帳號').click();
   await page.getByRole('tab', { name: '儲存位置' }).click();
   await expect(page.getByTestId('storage-target-settings')).toBeVisible();
@@ -80,9 +78,10 @@ async function chooseChannel(page: Page, value: string) {
   await page.getByLabel('Canonical raw channel ID').fill(value);
 }
 
-test('rejects marked/non-canonical channel ids before save', async ({ page }) => {
+test('rejects marked/non-canonical channel ids before save', async ({ page, openDrive }) => {
   const state = initialState();
   await installStorageApi(page, state, { 42: { can_read: true, can_write: true }, 77: { can_read: true, can_write: true } });
+  await openDrive();
   await openStorage(page);
   await chooseChannel(page, '-100123456789');
   await page.getByTestId('save-storage-target').click();
@@ -90,9 +89,10 @@ test('rejects marked/non-canonical channel ids before save', async ({ page }) =>
   expect(state.putBodies).toHaveLength(0);
 });
 
-test('requires a fresh verification from every linked account', async ({ page }) => {
+test('requires a fresh verification from every linked account', async ({ page, openDrive }) => {
   const state = initialState();
   await installStorageApi(page, state, { 42: { can_read: true, can_write: true }, 77: { error: 'secondary offline' } });
+  await openDrive();
   await openStorage(page);
   await chooseChannel(page, '123456789');
   await page.getByTestId('save-storage-target').click();
@@ -100,9 +100,10 @@ test('requires a fresh verification from every linked account', async ({ page })
   expect(state.putBodies).toHaveLength(0);
 });
 
-test('fails closed when any linked account lacks read or write access', async ({ page }) => {
+test('fails closed when any linked account lacks read or write access', async ({ page, openDrive }) => {
   const state = initialState();
   await installStorageApi(page, state, { 42: { can_read: true, can_write: true }, 77: { can_read: true, can_write: false } });
+  await openDrive();
   await openStorage(page);
   await chooseChannel(page, '123456789');
   await page.getByRole('button', { name: '驗證所有帳號' }).click();
@@ -112,10 +113,11 @@ test('fails closed when any linked account lacks read or write access', async ({
   await expect(page.getByTestId('storage-live-status')).toContainText('不會 fallback 到 Saved Messages');
 });
 
-test('refetches on CAS conflict and requires a new verification attempt', async ({ page }) => {
+test('refetches on CAS conflict and requires a new verification attempt', async ({ page, openDrive }) => {
   const state = initialState();
   state.conflictOnce = true;
   await installStorageApi(page, state, { 42: { can_read: true, can_write: true }, 77: { can_read: true, can_write: true } });
+  await openDrive();
   await openStorage(page);
   await chooseChannel(page, '123456789');
   await page.getByTestId('save-storage-target').click();
@@ -127,9 +129,10 @@ test('refetches on CAS conflict and requires a new verification attempt', async 
   expect(state.putBodies[1].expected_version).toBe(3);
 });
 
-test('enables a verified channel then saves back to Saved Messages without channel evidence', async ({ page }) => {
+test('enables a verified channel then saves back to Saved Messages without channel evidence', async ({ page, openDrive }) => {
   const state = initialState();
   await installStorageApi(page, state, { 42: { can_read: true, can_write: true, channel_title: 'Storage' }, 77: { can_read: true, can_write: true, channel_title: 'Storage' } });
+  await openDrive();
   await openStorage(page);
   await chooseChannel(page, '123456789');
   await page.getByTestId('save-storage-target').click();

@@ -26,7 +26,7 @@ describe('target-aware Telegram sends', () => {
   });
 
   it('sendAlbum freezes one peer and the exact persisted random id for every child', async () => {
-    const invoke = vi.fn(async (request: any) => ({
+    const invoke = vi.fn(async (_request: any) => ({
       updates: [
         { message: { id: 71, media: { className: 'MessageMediaDocument', document: { id: 1001n, accessHash: 2001n, size: 12, mimeType: 'application/octet-stream', attributes: [], fileReference: new Uint8Array() } } } },
         { message: { id: 72, media: { className: 'MessageMediaDocument', document: { id: 1002n, accessHash: 2002n, size: 13, mimeType: 'application/octet-stream', attributes: [], fileReference: new Uint8Array() } } } },

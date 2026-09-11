@@ -1,7 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
 import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
-import { getPrimaryClient, getClientFor, getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
+import { getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
 import { uploadFileSpread, type SplitUploadProgress } from '../lib/splitUpload';
 import { withSlotOn, nextAccount } from '../lib/accountPool';
 import { captureThumb, isMediaFile, type ThumbCaptureResult } from '../lib/thumbCapture';
@@ -23,7 +23,8 @@ import { RenameDialog } from './RenameDialog';
 import { ImportChatDialog } from './ImportChatDialog';
 import { DetailsPanel } from './DetailsPanel';
 import { fileKind } from '../lib/fileKind';
-import { downloadFileToDisk, fetchFileBlob } from '../lib/download';
+import { downloadFileToDisk, fetchFileBlob, fetchFileThumbnail, thumbnailCacheKey } from '../lib/download';
+import { streamPreviewUrl } from '../lib/mainWindowStreamBridge';
 import { useLongPress } from '../hooks/useLongPress';
 
 const isTouch = typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches;
@@ -384,13 +385,14 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   // One page's worth of thumbnail work. Only ever called from the queue below —
   // running two of these at once is what used to kill the MTProto connection.
   const downloadThumbBatch = useCallback(async (thumbFiles: FileInfo[], signal?: AbortSignal) => {
-    // 1. Check IndexedDB cache for all files in parallel (bounded) — instant hits show immediately
+    // Cache keys include canonical location_version so a migration/relocation
+    // cannot keep showing bytes fetched from an older Telegram message.
     const cacheCheckSemaphore = new Semaphore(6);
     const misses: FileInfo[] = [];
     await Promise.all(thumbFiles.map((file) => cacheCheckSemaphore.withSlot(async () => {
       if (signal?.aborted) return;
       try {
-        const cached = await getCachedThumbnail(file.file_id);
+        const cached = await getCachedThumbnail(thumbnailCacheKey(file));
         if (cached) {
           setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(cached) }));
         } else {
@@ -403,33 +405,25 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     if (signal?.aborted || misses.length === 0) return;
 
-    // 2. Cache misses → one getMessages round trip PER ACCOUNT (a message id is
-    //    only meaningful to the account that holds it), then parallel thumb fetches.
-    const byAccount = new Map<number, FileInfo[]>();
-    for (const file of misses) {
-      const key = file.telegram_user_id ?? 0;
-      const group = byAccount.get(key);
-      if (group) group.push(file); else byAccount.set(key, [file]);
-    }
-    try {
-      await Promise.all([...byAccount].map(async ([accountId, group]) => {
-        const messageIdToFile = new Map(group.map((f) => [f.telegram_message_id!, f]));
-        const client = accountId ? getClientFor(accountId) : getPrimaryClient();
-        const blobs = await client.downloadThumbnails(Array.from(messageIdToFile.keys()));
-        for (const [messageId, blob] of blobs) {
-          const file = messageIdToFile.get(messageId);
-          if (!file || signal?.aborted) continue;
-          setCachedThumbnail(file.file_id, blob).catch(() => {});
-          setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
+    // Every canonical read goes through the shared location resolver. This is
+    // intentionally per logical file: telegram_user_id is only the historical
+    // uploader for channel-backed rows and must never select the runtime reader.
+    const downloadSemaphore = new Semaphore(6);
+    await Promise.all(misses.map((file) => downloadSemaphore.withSlot(async () => {
+      try {
+        if (signal?.aborted) return;
+        const blob = await fetchFileThumbnail(file);
+        if (!blob || signal?.aborted) return;
+        setCachedThumbnail(thumbnailCacheKey(file), blob).catch(() => {});
+        setThumbnails((prev) => ({ ...prev, [file.file_id]: URL.createObjectURL(blob) }));
+      } catch (err: any) {
+        if (err?.name !== 'AbortError') {
+          console.warn('[Thumb] Download error:', err?.message);
         }
-      }));
-    } catch (err: any) {
-      if (err?.name !== 'AbortError') {
-        console.warn('[Thumb] Batch download error:', err?.message);
+      } finally {
+        pendingThumbsRef.current.delete(file.file_id);
       }
-    } finally {
-      misses.forEach((f) => pendingThumbsRef.current.delete(f.file_id));
-    }
+    })));
   }, []);
 
   // Queue a page's thumbnails. The queue runs one page at a time, newest page
@@ -2297,7 +2291,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                 <video
                   src={previewFile.is_split_file && previewFile.split_group_id
                     ? `/preview-video/split/${previewFile.split_group_id}`
-                    : `/preview-video/${previewFile.file_id}/${previewFile.telegram_message_id}/${previewFile.telegram_user_id ?? 0}`}
+                    : streamPreviewUrl(previewFile)}
                   controls autoPlay style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)' }} />
               ) : kind === 'pdf' ? (
                 previewUrl ? <iframe src={previewUrl} title={previewFile.filename} style={{ width: '80vw', height: 'calc(90vh - 100px)', border: 'none' }} />
@@ -2322,53 +2316,31 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 }
 
 // Simple loading indicator for video preview via Service Worker streaming
-function VideoPreviewLoader({ fileId, messageId, accountId = 0 }: { fileId: string; messageId: number; accountId?: number; mimeType?: string }) {
+function VideoPreviewLoader({ fileId, locationVersion }: { fileId: string; locationVersion: number }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const src = `/preview-video/${encodeURIComponent(fileId)}/${locationVersion}`;
 
   useEffect(() => {
     const video = document.createElement('video');
-    video.src = `/preview-video/${fileId}/${messageId}/${accountId}`;
-    
-    const onCanPlay = () => {
-      setLoading(false);
-    };
-    
-    const onError = () => {
-      setLoading(false);
-      setError('Failed to load video');
-    };
-    
+    video.src = src;
+    const onCanPlay = () => setLoading(false);
+    const onError = () => { setLoading(false); setError('Failed to load video'); };
     video.addEventListener('canplay', onCanPlay);
     video.addEventListener('error', onError);
-    
-    // Timeout - assume it works if no error after 3s
     const timeout = setTimeout(() => setLoading(false), 3000);
-    
     return () => {
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('error', onError);
       clearTimeout(timeout);
     };
-  }, [fileId, messageId, accountId]);
+  }, [src]);
 
   return (
     <div style={{ padding: '8px', minHeight: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      {loading && (
-        <div style={{ textAlign: 'center', color: '#6b7280' }}>
-          <div style={{ fontSize: '24px', marginBottom: '8px' }}>⏳</div>
-          <div>Loading video...</div>
-        </div>
-      )}
-      {error && (
-        <div style={{ color: '#dc2626', textAlign: 'center' }}>{error}</div>
-      )}
-      <video
-        src={`/preview-video/${fileId}/${messageId}/${accountId}`}
-        controls
-        autoPlay
-        style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', display: loading ? 'none' : 'block' }}
-      />
+      {loading && <div style={{ textAlign: 'center', color: '#6b7280' }}><div style={{ fontSize: '24px', marginBottom: '8px' }}>⏳</div><div>Loading video...</div></div>}
+      {error && <div style={{ color: '#dc2626', textAlign: 'center' }}>{error}</div>}
+      <video src={src} controls autoPlay style={{ maxWidth: '100%', maxHeight: 'calc(90vh - 100px)', display: loading ? 'none' : 'block' }} />
     </div>
   );
 }

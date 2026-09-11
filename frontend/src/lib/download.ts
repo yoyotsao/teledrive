@@ -14,6 +14,13 @@ export function clientForFile(file: Pick<FileInfo, 'telegram_user_id'>): Telegra
   return file.telegram_user_id ? getClientFor(file.telegram_user_id) : getPrimaryClient();
 }
 
+/** Stable thumbnail cache identity; canonical relocations invalidate old bytes. */
+export function thumbnailCacheKey(file: FileInfo): string {
+  const location = fileInfoToLocation(file);
+  if (location) return `${file.file_id}:thumbnail:${locationKey(location)}`;
+  return `${file.file_id}:thumbnail:legacy-saved:${file.telegram_user_id || 0}:${file.telegram_message_id || 0}`;
+}
+
 /**
  * Fail rather than hand back a blob that is not the whole file.
  *
@@ -48,6 +55,34 @@ function asProgressNumber(value: unknown): number {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   return 0;
+}
+
+/**
+ * Download an embedded Telegram thumbnail through the same canonical resolver
+ * as full-file reads. Legacy rows retain original-account Saved Messages
+ * compatibility; incomplete channel rows fail closed.
+ */
+export async function fetchFileThumbnail(file: FileInfo): Promise<Blob | null> {
+  if (!file.telegram_message_id) return null;
+  const location = fileInfoToLocation(file);
+  if (location) {
+    const resolved = await resolveFileLocation(location, 'thumbnail');
+    if (resolved.locationVersion !== location.location_version) {
+      throw new Error(
+        `Stale resolved location: expected version ${location.location_version}, got ${resolved.locationVersion}`,
+      );
+    }
+    const thumb = resolved.media.previewThumbSize;
+    if (!thumb) return null;
+    const data = await resolved.client.downloadMedia(resolved.message, { thumb });
+    return toBlob(data, 'image/jpeg');
+  }
+
+  if (file.telegram_chat_id != null) {
+    throw new Error(`Incomplete canonical Telegram location for file: ${file.file_id}`);
+  }
+  const blobs = await clientForFile(file).downloadThumbnails([file.telegram_message_id]);
+  return blobs.get(file.telegram_message_id) ?? null;
 }
 
 /**

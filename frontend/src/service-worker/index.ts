@@ -22,13 +22,13 @@ const preloadBuffers = new Map<string, PreloadBuffer>();
 // around it are worth holding bytes for.
 const MAX_PRELOAD_BUFFERS = 4;
 
-function bufferFor(fileId: string, messageId: string, accountId: string, fileSize: number): PreloadBuffer {
-  const key = `${fileId}:${messageId}`;
+function bufferFor(fileId: string, locationVersion: number, fileSize: number): PreloadBuffer {
+  const key = `${fileId}:v${locationVersion}`;
   const existing = preloadBuffers.get(key);
   if (existing) return existing;
 
   const buffer = new PreloadBuffer(PRELOAD_AHEAD, (offset, limit) =>
-    requestChunkFromApp(fileId, messageId, accountId, offset, limit, fileSize));
+    requestChunkFromApp(fileId, locationVersion, offset, limit, fileSize));
   preloadBuffers.set(key, buffer);
   while (preloadBuffers.size > MAX_PRELOAD_BUFFERS) {
     const oldest = preloadBuffers.keys().next().value as string;
@@ -40,9 +40,8 @@ function bufferFor(fileId: string, messageId: string, accountId: string, fileSiz
 
 // Split file parts cache (keyed by splitGroupId)
 interface SplitPartInfo {
-  messageId: number;
-  /** Linked account holding this part's message — access_hash is account-scoped. */
-  accountId: number;
+  fileId: string;
+  locationVersion: number;
   size: number;
   startOffset: number;
 }
@@ -194,20 +193,14 @@ function getRangeHeader(request: Request): string | null {
 }
 
 /**
- * Parse URL to extract fileId, messageId and the account that stores it.
- * URL format: /preview-video/{fileId}/{messageId}/{accountId}
- * accountId is what lets the main app pick the right GramJS client; without it
- * a getMessages against the wrong account can silently return a DIFFERENT
- * message that happens to share the id.
+ * Parse a versioned preview URL. Telegram peer/message/account identity stays
+ * exclusively in the main window resolver.
+ * URL format: /preview-video/{fileId}/{locationVersion}
  */
-function parseVideoUrl(pathname: string): { fileId: string; messageId: string; accountId: string } | null {
+function parseVideoUrl(pathname: string): { fileId: string; locationVersion: number } | null {
   const parts = pathname.replace(VIDEO_PREVIEW_PATH, '').split('/');
-  if (parts.length >= 2 && parts[0] && parts[1]) {
-    return {
-      fileId: parts[0],
-      messageId: parts[1],
-      accountId: parts[2] || '0',
-    };
+  if (parts.length >= 2 && parts[0] && /^\d+$/.test(parts[1])) {
+    return { fileId: decodeURIComponent(parts[0]), locationVersion: Number(parts[1]) };
   }
   return null;
 }
@@ -218,56 +211,38 @@ function parseVideoUrl(pathname: string): { fileId: string; messageId: string; a
  */
 async function requestChunkFromApp(
   fileId: string,
-  messageId: string,
-  accountId: string,
+  locationVersion: number,
   offset: number,
   limit: number,
   fileSize?: number,
   retries = 3,
-  baseDelay = 1000
+  baseDelay = 1000,
 ): Promise<ArrayBuffer> {
   let lastError: Error | null = null;
-  
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      return await requestChunkOnce(fileId, messageId, accountId, offset, limit, fileSize);
+      return await requestChunkOnce(fileId, locationVersion, offset, limit, fileSize);
     } catch (err: any) {
       lastError = err;
-      
-      // Don't retry on client unavailable errors - they're not recoverable
-      if (err?.message?.includes('No clients available') || 
-          err?.message?.includes('main app may not be running')) {
-        throw err;
-      }
-      
-      // Exponential backoff before retry
+      if (err?.message === 'CLIENT_UNAVAILABLE' || err?.message === 'STALE_LOCATION') throw err;
       if (attempt < retries - 1) {
-        const delay = baseDelay * Math.pow(2, attempt);
-        console.log(`[ServiceWorker] Chunk request failed, retrying in ${delay}ms (attempt ${attempt + 1}/${retries})`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await new Promise((resolve) => setTimeout(resolve, baseDelay * Math.pow(2, attempt)));
       }
     }
   }
-  
   throw lastError || new Error('Chunk request failed after retries');
 }
 
-/**
- * Single attempt to request chunk from main app
- */
 function requestChunkOnce(
   fileId: string,
-  messageId: string,
-  accountId: string,
+  locationVersion: number,
   offset: number,
   limit: number,
-  fileSize?: number
+  _fileSize?: number,
 ): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
-    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
     const channel = new MessageChannel();
-    
     const timeout = setTimeout(() => {
       channel.port1.close();
       reject(new Error(`Chunk request timeout: offset=${offset}, limit=${limit}`));
@@ -276,35 +251,26 @@ function requestChunkOnce(
     channel.port1.onmessage = (event) => {
       clearTimeout(timeout);
       channel.port1.close();
-      
-      if (event.data?.error) {
-        reject(new Error(event.data.error));
-      } else if (event.data?.chunk) {
-        resolve(event.data.chunk);
-      } else {
-        reject(new Error('Invalid response from main app'));
-      }
+      if (event.data?.error) reject(new Error(event.data.error));
+      else if (event.data?.chunk) resolve(event.data.chunk);
+      else reject(new Error('Invalid response from main app'));
     };
 
     self.clients.matchAll().then((clients) => {
-      for (const client of clients) {
-        client.postMessage({
-          type: 'GET_FILE_CHUNK',
-          requestId,
-          fileId,
-          messageId: parseInt(messageId, 10),
-          accountId: parseInt(accountId, 10),
-          offset,
-          limit,
-          fileSize,
-        }, [channel.port2]);
-      }
-      
       if (clients.length === 0) {
         clearTimeout(timeout);
         channel.port1.close();
-        reject(new Error('No clients available - main app may not be running'));
+        reject(new Error('CLIENT_UNAVAILABLE'));
+        return;
       }
+      clients[0].postMessage({
+        type: 'GET_FILE_CHUNK',
+        request_id: requestId,
+        file_id: fileId,
+        location_version: locationVersion,
+        offset,
+        length: limit,
+      }, [channel.port2]);
     });
   });
 }
@@ -312,45 +278,34 @@ function requestChunkOnce(
 /**
  * Get file metadata (size and mimeType) from main app
  */
-async function requestFileMetadata(fileId: string, messageId: string, accountId: string): Promise<{ size: number; mimeType: string }> {
+async function requestFileMetadata(fileId: string, locationVersion: number): Promise<{ size: number; mimeType: string }> {
   return new Promise((resolve, reject) => {
     const requestId = `meta_${Date.now()}`;
     const channel = new MessageChannel();
-    
     const timeout = setTimeout(() => {
       channel.port1.close();
       reject(new Error('Metadata request timeout'));
     }, 10000);
-
     channel.port1.onmessage = (event) => {
       clearTimeout(timeout);
       channel.port1.close();
-      
-      if (event.data?.error) {
-        reject(new Error(event.data.error));
-      } else if (event.data?.metadata) {
-        resolve(event.data.metadata);
-      } else {
-        reject(new Error('Invalid metadata response'));
-      }
+      if (event.data?.error) reject(new Error(event.data.error));
+      else if (event.data?.metadata) resolve(event.data.metadata);
+      else reject(new Error('Invalid metadata response'));
     };
-
     self.clients.matchAll().then((clients) => {
-      for (const client of clients) {
-        client.postMessage({
-          type: 'GET_FILE_METADATA',
-          requestId,
-          fileId,
-          messageId: parseInt(messageId, 10),
-          accountId: parseInt(accountId, 10),
-        }, [channel.port2]);
-      }
-      
       if (clients.length === 0) {
         clearTimeout(timeout);
         channel.port1.close();
-        reject(new Error('No clients available'));
+        reject(new Error('CLIENT_UNAVAILABLE'));
+        return;
       }
+      clients[0].postMessage({
+        type: 'GET_FILE_METADATA',
+        request_id: requestId,
+        file_id: fileId,
+        location_version: locationVersion,
+      }, [channel.port2]);
     });
   });
 }
@@ -418,7 +373,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         // This path used to fetch the chunk directly and only THEN call the
         // preloader, which had no reader at all — so every chunk a split video
         // preloaded was downloaded a second time and thrown away.
-        const buffer = bufferFor(splitGroupId, String(part.messageId), String(part.accountId ?? 0), part.size);
+        const buffer = bufferFor(part.fileId, part.locationVersion, part.size);
         const chunkData = await buffer.take(partOffset, effectiveLimit);
 
         // Preload next PRELOAD_AHEAD chunks within the same part
@@ -455,13 +410,13 @@ self.addEventListener('fetch', (event: FetchEvent) => {
     event.respondWith(
       new Response(null, {
         status: 400,
-        statusText: 'Bad Request - URL should be /preview-video/{fileId}/{messageId}/{accountId}',
+        statusText: 'Bad Request - URL should be /preview-video/{fileId}/{locationVersion}',
       })
     );
     return;
   }
 
-  console.log('[ServiceWorker] Parsed URL - fileId:', urlParams.fileId, 'messageId:', urlParams.messageId);
+  console.log('[ServiceWorker] Parsed URL - fileId:', urlParams.fileId, 'locationVersion:', urlParams.locationVersion);
 
   // Handle request with Range header
   const rangeHeader = getRangeHeader(event.request);
@@ -488,7 +443,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
       try {
         // Get file metadata
         console.log('[ServiceWorker] Requesting file metadata...');
-        const metadata = await requestFileMetadata(urlParams.fileId, urlParams.messageId, urlParams.accountId);
+        const metadata = await requestFileMetadata(urlParams.fileId, urlParams.locationVersion);
         console.log('[ServiceWorker] Got metadata - size:', metadata.size, 'mimeType:', metadata.mimeType);
 
         // Parse Range header with actual file size
@@ -523,7 +478,7 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         // miss and fire a second GetFile for bytes already on their way, which
         // doubled the load precisely when the connection was too slow to keep
         // the lookahead ahead.
-        const buffer = bufferFor(urlParams.fileId, urlParams.messageId, urlParams.accountId, metadata.size);
+        const buffer = bufferFor(urlParams.fileId, urlParams.locationVersion, metadata.size);
         const chunkData = await buffer.take(rawRange.offset, limit);
         console.log('[ServiceWorker] Got chunk, size:', chunkData.byteLength);
 
@@ -556,8 +511,8 @@ self.addEventListener('fetch', (event: FetchEvent) => {
         
         if (errorMessage.includes('not connected') || errorMessage.includes('client not connected')) {
           message = 'Telegram client disconnected. Please refresh the page and reconnect to Telegram in the app.';
-        } else if (errorMessage.includes('No clients available') || errorMessage.includes('main app may not be running')) {
-          message = 'Main application not running. Please refresh the page.';
+        } else if (errorMessage.includes('CLIENT_UNAVAILABLE')) {
+          message = 'CLIENT_UNAVAILABLE';
         } else if (errorMessage.includes('timeout')) {
           message = 'Request timed out. Please check your connection and refresh.';
         }

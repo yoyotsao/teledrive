@@ -1,77 +1,47 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import { getPrimaryClient, getClientFor, getAllClients, loadJwt } from './lib/gramjs';
+import { getAllClients } from './lib/gramjs';
+import { api } from './api/client';
+import { resolveFileLocation } from './lib/fileLocationResolver';
+import { fileInfoToLocation } from './lib/storageLocation';
+import { MainWindowStreamBridge } from './lib/mainWindowStreamBridge';
 import { StreamGate } from './lib/streamGate';
 
 // Global state for keepalive mechanism
 let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 const KEEPALIVE_INTERVAL_MS = 15000; // 15 seconds
-// Skip the getMe() ping in ensureTelegramConnected() if the connection was verified
-// alive (by either the keepalive tick or a prior chunk request) within this window —
-// avoids a round trip before every single 512KB SW chunk request.
-const CONNECTION_CHECK_INTERVAL_MS = 20000;
-let lastVerifiedAliveAt = 0;
-let isStreamingActive = false;
 // Shut when the user closes the video, reopened when a preview opens, so
 // that preload chunk requests arriving after a close are rejected immediately.
 const streamGate = new StreamGate();
 
-/** Client for the account that stores a message. 0 (or unknown) = the primary. */
-function clientForAccount(accountId?: number) {
-  return accountId ? getClientFor(accountId) : getPrimaryClient();
-}
-
-/**
- * Ensure Telegram is connected, reconnect if needed.
- * Returns true if connected, false otherwise.
- */
-async function ensureTelegramConnected(): Promise<boolean> {
-  if (Date.now() - lastVerifiedAliveAt < CONNECTION_CHECK_INTERVAL_MS) {
-    return true;
-  }
-
-  console.log('[App] === ensureTelegramConnected START ===');
-  // Every account, not just the primary — a stream can be served by any of them.
-  const clients = getAllClients();
-
-  // Instead of just checking isConnected(), actually try a ping
-  // to verify the connection is truly alive
-  try {
-    const pings = await Promise.all(clients.map((c) => c.invokePing().catch(() => false)));
-    const pingSuccess = pings.length > 0 && pings.every(Boolean);
-    console.log('[App] ping result:', pingSuccess);
-    if (pingSuccess) {
-      lastVerifiedAliveAt = Date.now();
-      console.log('[App] === ensureTelegramConnected: ALREADY CONNECTED (ping success) ===');
-      return true;
+const streamBridge = new MainWindowStreamBridge({
+  getFile: api.getFile,
+  resolve: resolveFileLocation,
+  readChunk: async (resolved, offset, length, file) => {
+    const manager = resolved.manager as any;
+    if (!manager?.downloadFileChunkedByOffset) {
+      throw Object.assign(new Error('Main-window Telegram reader is unavailable'), { code: 'CLIENT_UNAVAILABLE' });
     }
-  } catch (err: any) {
-    console.log('[App] ping failed:', err?.message || err);
-  }
-
-  console.log('[App] Telegram not responding, attempting reconnection...');
-
-  try {
-    // Try to reconnect every client
-    await Promise.all(clients.map((c) => c.connect()));
-    lastVerifiedAliveAt = Date.now();
-    console.log('[App] Telegram reconnected successfully');
-    console.log('[App] === ensureTelegramConnected: RECONNECTED ===');
-    return true;
-  } catch (err: any) {
-    console.error('[App] Failed to reconnect:', err?.message || err);
-    console.log('[App] === ensureTelegramConnected: FAILED ===');
-  }
-
-  return false;
-}
+    const frozenLocation = fileInfoToLocation(file);
+    if (!frozenLocation) throw Object.assign(new Error('Missing canonical location'), { code: 'READ_UNAVAILABLE' });
+    const blob = await manager.downloadFileChunkedByOffset(
+      resolved.message.id,
+      offset,
+      length,
+      resolved.media.size || file.filesize,
+      resolved.media.id,
+      resolved.media,
+      async () => (await resolveFileLocation(frozenLocation, 'stream')).media,
+    );
+    return blob.arrayBuffer();
+  },
+});
 
 /**
  * Start periodic keepalive ping to prevent connection drops.
  */
 function stopKeepalive() {
-  isStreamingActive = false;
   streamGate.closed();
   if (keepaliveInterval) {
     clearInterval(keepaliveInterval);
@@ -99,7 +69,6 @@ function startKeepalive() {
   }
 
   console.log('[App] === STARTING KEEPALIVE INTERVAL ===');
-  isStreamingActive = true;
   
   keepaliveInterval = setInterval(async () => {
     console.log('[App] ===== KEEPALIVE TICK =====');
@@ -111,14 +80,12 @@ function startKeepalive() {
     try {
       // Try a simple API call to verify connection
       await Promise.all(clients.map((c) => c.invokePing()));
-      lastVerifiedAliveAt = Date.now();
       console.log('[App] Keepalive: connection truly ALIVE (ping success)');
     } catch (err: any) {
       console.log('[App] Keepalive: ping failed, connection likely dead:', err?.message || err);
       console.log('[App] Keepalive: attempting reconnect...');
       try {
         await Promise.all(clients.map((c) => c.connect()));
-        lastVerifiedAliveAt = Date.now();
         console.log('[App] Keepalive: RECONNECTED');
       } catch (reconnectErr: any) {
         console.error('[App] Keepalive: reconnect failed:', reconnectErr?.message || reconnectErr);
@@ -244,63 +211,31 @@ async function handleReconnectTelegram(event: MessageEvent) {
  * Uses GramJS to download a chunk from Telegram
  */
 async function handleGetFileChunk(event: MessageEvent) {
-  console.log('[App] ========== handleGetFileChunk START ==========');
   const msg = event.data;
-  const { requestId, messageId, accountId, fileId, offset, limit, fileSize } = msg;
+  const requestId = String(msg.request_id ?? msg.requestId ?? '');
   const port = event.ports[0];
-  
+
   try {
-    // Reject preload requests that arrive after the user closed the video
     if (!streamGate.accepts()) {
-      port?.postMessage({ requestId, error: 'Streaming stopped' });
+      port?.postMessage({ request_id: requestId, error: 'CLIENT_UNAVAILABLE' });
       return;
     }
-
-    // Start keepalive when streaming begins
-    console.log('[App] Calling startKeepalive()...');
     startKeepalive();
-
-    console.log('[App] startKeepalive called, isStreamingActive:', isStreamingActive);
-    
-    // Ensure Telegram is connected before downloading chunk
-    console.log('[App] Calling ensureTelegramConnected()...');
-    const isConnected = await ensureTelegramConnected();
-    console.log('[App] ensureTelegramConnected result:', isConnected);
-    
-    if (!isConnected) {
-      console.log('[App] ERROR: Telegram not connected, sending error to SW');
-      port?.postMessage({ requestId, error: 'Telegram client not connected' });
+    const result = await streamBridge.handle({
+      request_id: requestId,
+      file_id: String(msg.file_id ?? msg.fileId ?? ''),
+      part_id: msg.part_id,
+      location_version: Number(msg.location_version ?? 0),
+      offset: Number(msg.offset ?? 0),
+      length: Number(msg.length ?? msg.limit ?? 0),
+    });
+    if (result.error || !result.chunk) {
+      port?.postMessage({ request_id: requestId, error: result.error ?? 'READ_UNAVAILABLE' });
       return;
     }
-    
-    // access_hash is per (account, document): the wrong client either fails or,
-    // worse, hits a same-numbered message in ITS Saved Messages and streams the
-    // wrong file. Pick by the account the SW passed along with the message id.
-    const telegramClient = clientForAccount(accountId);
-
-    console.log('[App] Getting chunk - messageId:', messageId, 'account:', accountId, 'offset:', offset, 'limit:', limit, 'fileSize:', fileSize);
-    
-    let actualFileSize = fileSize;
-    if (actualFileSize === undefined) {
-      console.log('[App] fileSize not provided, fetching metadata...');
-      const metadata = await telegramClient.downloadFileMetadata(messageId);
-      actualFileSize = metadata.size;
-      console.log('[App] Retrieved fileSize from Telegram:', actualFileSize);
-    }
-    
-    // Only pass file_id when it really is the Telegram document id — dedup rows
-    // and split groups use synthetic ids that would false-alarm the guard.
-    const expectedFileId = /^\d+$/.test(String(fileId ?? '')) ? String(fileId) : undefined;
-    const blob = await telegramClient.downloadFileChunkedByOffset(messageId, offset, limit, actualFileSize, expectedFileId);
-    const arrayBuffer = await blob.arrayBuffer();
-    console.log('[App] Got chunk, size:', arrayBuffer.byteLength);
-    
-    port?.postMessage({ requestId, chunk: arrayBuffer }, [arrayBuffer]);
-    console.log('[App] ========== handleGetFileChunk END ==========');
-    
+    port?.postMessage({ request_id: requestId, chunk: result.chunk }, [result.chunk]);
   } catch (err: any) {
-    console.error('[App] Chunk download failed:', err?.message || err);
-    port?.postMessage({ requestId, error: err?.message || 'Failed to get chunk' });
+    port?.postMessage({ request_id: requestId, error: err?.code || err?.message || 'READ_UNAVAILABLE' });
   }
 }
 
@@ -310,31 +245,15 @@ async function handleGetFileChunk(event: MessageEvent) {
  */
 async function handleGetFileMetadata(event: MessageEvent) {
   const msg = event.data;
-  const { requestId, messageId, accountId } = msg;
+  const requestId = String(msg.request_id ?? msg.requestId ?? '');
   const port = event.ports[0];
-  
-  try {
-    const telegramClient = clientForAccount(accountId);
-    
-    if (!telegramClient.isConnected()) {
-      port?.postMessage({ requestId, error: 'Telegram client not connected' });
-      return;
-    }
-    
-    console.log('[App] Getting metadata for messageId:', messageId);
-    
-    // Get metadata from GramJS
-    const metadata = await telegramClient.downloadFileMetadata(messageId);
-    
-    console.log('[App] Got metadata:', metadata);
-    
-    // Send metadata back to Service Worker
-    port?.postMessage({ requestId, metadata });
-    
-  } catch (err: any) {
-    console.error('[App] Error getting metadata:', err?.message || err);
-    port?.postMessage({ requestId, error: err?.message || 'Failed to get metadata' });
-  }
+  const result = await streamBridge.metadata({
+    request_id: requestId,
+    file_id: String(msg.file_id ?? msg.fileId ?? ''),
+    location_version: Number(msg.location_version ?? 0),
+  });
+  if (result.error) port?.postMessage({ request_id: requestId, error: result.error });
+  else port?.postMessage({ request_id: requestId, metadata: result.metadata });
 }
 
 /**
@@ -345,35 +264,29 @@ async function handleGetSplitMetadata(event: MessageEvent) {
   const { splitGroupId } = event.data;
   const port = event.ports[0];
   try {
-    const token = loadJwt();
-    const response = await fetch(`/api/v1/files?split_group_id=${encodeURIComponent(splitGroupId)}&page_size=100`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!response.ok) throw new Error(`Failed to fetch split parts: ${response.status}`);
-    const data = await response.json();
-
-    const parts = (data.files as any[]).sort((a, b) => (a.part_index ?? 0) - (b.part_index ?? 0));
+    const data = await api.getSplitGroupFiles(String(splitGroupId));
+    const parts = [...data.files].sort((a, b) => (a.part_index ?? 0) - (b.part_index ?? 0));
     if (parts.length === 0) throw new Error('No parts found for split group');
 
     let totalSize = 0;
-    const partsWithOffset = parts.map((p: any) => {
+    const partsWithOffset = parts.map((part) => {
       const startOffset = totalSize;
-      totalSize += p.filesize;
-      // Parts of one split file may sit on different accounts — carry each
-      // part's own so the SW can ask the right client for its bytes.
+      totalSize += part.filesize;
       return {
-        messageId: p.telegram_message_id as number,
-        accountId: (p.telegram_user_id as number) || 0,
-        size: p.filesize as number,
+        fileId: part.file_id,
+        locationVersion: part.location_version ?? 0,
+        size: part.filesize,
         startOffset,
       };
     });
 
-    const mimeType: string = parts[0]?.mime_type || 'video/mp4';
-    port?.postMessage({ metadata: { totalSize, mimeType, parts: partsWithOffset } });
+    port?.postMessage({ metadata: {
+      totalSize,
+      mimeType: parts[0]?.mime_type || 'video/mp4',
+      parts: partsWithOffset,
+    } });
   } catch (err: any) {
-    console.error('[App] handleGetSplitMetadata error:', err?.message);
-    port?.postMessage({ error: err?.message || 'Failed to get split metadata' });
+    port?.postMessage({ error: err?.code || err?.message || 'READ_UNAVAILABLE' });
   }
 }
 

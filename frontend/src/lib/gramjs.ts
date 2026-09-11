@@ -1236,7 +1236,15 @@ export class TelegramClientManager {
    *   Checked against what Telegram returns so a wrong-account lookup fails
    *   loudly instead of streaming a same-numbered message's contents.
    */
-  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number, fileSize?: number, expectedFileId?: string): Promise<Blob> {
+  async downloadFileChunkedByOffset(
+    messageId: number,
+    offset: number,
+    limit: number,
+    fileSize?: number,
+    expectedFileId?: string,
+    resolvedRef?: MediaRef,
+    refreshResolvedRef?: () => Promise<MediaRef>,
+  ): Promise<Blob> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized");
@@ -1275,7 +1283,7 @@ export class TelegramClientManager {
 
     // Cached after the first chunk of a given message — subsequent chunks skip getMessages entirely.
     const invokeGetFile = async (off: number, lim: number): Promise<any> => {
-      const ref = await this.getFileLocation(messageId, false, expectedFileId);
+      const ref = resolvedRef ?? await this.getFileLocation(messageId, false, expectedFileId);
       try {
         return await this.getFileFrom(
           new Api.upload.GetFile({ location: toLocation(ref), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
@@ -1284,7 +1292,9 @@ export class TelegramClientManager {
       } catch (err: any) {
         if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {
           console.warn('[ChunkByOffset] File reference expired, refreshing for message', messageId);
-          const fresh = await this.getFileLocation(messageId, true, expectedFileId);
+          const fresh = refreshResolvedRef
+            ? await refreshResolvedRef()
+            : await this.getFileLocation(messageId, true, expectedFileId);
           return await this.getFileFrom(
             new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
             fresh,

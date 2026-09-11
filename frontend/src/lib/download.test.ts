@@ -3,9 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => {
   const resolveFileLocation = vi.fn();
   const legacyDownload = vi.fn();
-  const getClientFor = vi.fn(() => ({ downloadFile: legacyDownload }));
-  const getPrimaryClient = vi.fn(() => ({ downloadFile: legacyDownload }));
-  return { resolveFileLocation, legacyDownload, getClientFor, getPrimaryClient };
+  const legacyThumbnails = vi.fn();
+  const getClientFor = vi.fn(() => ({ downloadFile: legacyDownload, downloadThumbnails: legacyThumbnails }));
+  const getPrimaryClient = vi.fn(() => ({ downloadFile: legacyDownload, downloadThumbnails: legacyThumbnails }));
+  return { resolveFileLocation, legacyDownload, legacyThumbnails, getClientFor, getPrimaryClient };
 });
 
 vi.mock('./fileLocationResolver.ts', () => ({ resolveFileLocation: mocks.resolveFileLocation }));
@@ -15,7 +16,7 @@ vi.mock('./gramjs', () => ({
 }));
 vi.mock('../api/client', () => ({ api: { getSplitGroupFiles: vi.fn() } }));
 
-import { fetchFileBlob } from './download.ts';
+import { fetchFileBlob, fetchFileThumbnail, thumbnailCacheKey } from './download.ts';
 
 function channelFile(locationVersion = 1) {
   return {
@@ -93,5 +94,26 @@ describe('resolver-based downloads', () => {
 
     expect(mocks.getClientFor).toHaveBeenCalledWith(42);
     expect(mocks.resolveFileLocation).not.toHaveBeenCalled();
+  });
+
+  it('downloads channel thumbnails through the same resolved peer/message', async () => {
+    const downloadMedia = vi.fn(async () => new Uint8Array([9, 8]));
+    mocks.resolveFileLocation.mockResolvedValue({
+      client: { downloadMedia },
+      message: { id: 7 },
+      media: { previewThumbSize: 'm', size: 3 },
+      locationVersion: 1,
+    });
+
+    const blob = await fetchFileThumbnail(channelFile());
+
+    expect(blob?.size).toBe(2);
+    expect(mocks.resolveFileLocation).toHaveBeenCalledWith(expect.objectContaining({ telegram_chat_id: '123' }), 'thumbnail');
+    expect(downloadMedia).toHaveBeenCalledWith({ id: 7 }, expect.objectContaining({ thumb: 'm' }));
+    expect(mocks.getClientFor).not.toHaveBeenCalled();
+  });
+
+  it('invalidates thumbnail cache identity when location_version changes', () => {
+    expect(thumbnailCacheKey(channelFile(1))).not.toBe(thumbnailCacheKey(channelFile(2)));
   });
 });

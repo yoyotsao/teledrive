@@ -27,6 +27,7 @@ services:
       args:
         VITE_TELEGRAM_API_ID: ${VITE_TELEGRAM_API_ID}
         VITE_TELEGRAM_API_HASH: ${VITE_TELEGRAM_API_HASH}
+        VITE_ENABLE_STORAGE_MIGRATION: ${VITE_ENABLE_STORAGE_MIGRATION:-false}
     ports:
       - "3000:3000"
     depends_on:

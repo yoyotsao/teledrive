@@ -153,7 +153,8 @@ function invokeWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * Uses big-integer library for compatibility with GramJS API.
  */
 export type PreparedAlbumFile = { file: File; media: Api.InputMediaDocument; docId: unknown; hasThumbnail: boolean };
-export type AlbumFileResult = { message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean };
+export type AlbumFileResult = { message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean; mediaKind?: 'document' | 'photo'; mediaId?: string; photoVariant?: string };
+export type TargetAwareSendResult = { messageId: number; mediaKind: 'document' | 'photo'; mediaId: string; size: number; accessHash?: string; photoVariant?: string; message: Api.Message };
 
 function generateRandomBigInt(): ReturnType<typeof bigInt> {
   // Generate 8 random bytes and convert to BigInteger
@@ -531,12 +532,15 @@ export class TelegramClientManager {
    * calls race before the "me" entity is cached; serialising them (max 2) and
    * refreshing the cache on failure fixes this.
    */
-  private async sendFileLocked(params: any, maxRetries = 3): Promise<unknown> {
+  private async sendFileLocked(params: any, maxRetries = 3, targetPeer: any = "me"): Promise<unknown> {
     return this.sendFileSemaphore.withSlot(async () => {
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
           await this.messageRateLimiter.wait();
-          return await this.client!.sendFile("me", params);
+          const normalizedParams = typeof params?.randomId === 'string'
+            ? { ...params, randomId: bigInt(params.randomId) as any }
+            : params;
+          return await this.client!.sendFile(targetPeer, normalizedParams);
         } catch (err: any) {
           const isEntityZero = err?.message?.includes('ID 0') || err?.message?.includes('Entity');
           if (isEntityZero && attempt < maxRetries - 1) {
@@ -874,7 +878,10 @@ export class TelegramClientManager {
    * any per-file concurrency slot — safe to call after those have been
    * released, so it never blocks the next file's bytes from starting.
    */
-  async sendAlbum(prepared: PreparedAlbumFile[]): Promise<AlbumFileResult[]> {
+  async sendAlbum(
+    prepared: PreparedAlbumFile[],
+    options?: { targetPeer?: any; randomIds?: string[] },
+  ): Promise<AlbumFileResult[]> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
@@ -885,33 +892,49 @@ export class TelegramClientManager {
     const results: AlbumFileResult[] = prepared.map(emptyResult);
 
     if (prepared.length === 0) return results;
+    if (options?.randomIds && options.randomIds.length !== prepared.length) {
+      throw new Error('Album randomIds must match prepared file count');
+    }
+    const targetPeer = options?.targetPeer ?? new Api.InputPeerSelf();
 
     let sendSucceeded = false;
     try {
       const t0 = performance.now();
       await this.messageRateLimiter.wait();
       const tLimiter = performance.now();
-      const multiMedia = prepared.map((p) => new Api.InputSingleMedia({
+      const multiMedia = prepared.map((p, index) => new Api.InputSingleMedia({
         media: p.media,
-        randomId: generateRandomBigInt() as any,
+        randomId: (options?.randomIds?.[index] ? bigInt(options.randomIds[index]) : generateRandomBigInt()) as any,
         message: '',
       }));
       const updates = await invokeWithTimeout(
-        client.invoke(new Api.messages.SendMultiMedia({ peer: new Api.InputPeerSelf(), multiMedia })),
+        client.invoke(new Api.messages.SendMultiMedia({ peer: targetPeer as any, multiMedia })),
         ALBUM_SEND_TIMEOUT_MS,
       ) as { updates?: Array<{ message?: { id: number; media?: { document?: { id: unknown; accessHash?: unknown } } } }> };
       console.log(`[Perf] sendAlbum x${prepared.length}: limiterWait=${Math.round(tLimiter - t0)}ms sendMultiMedia=${Math.round(performance.now() - tLimiter)}ms`);
 
-      // Map back by document id (not array position) — Telegram doesn't guarantee order.
-      const docIdToMessage = new Map<string, { id: number; accessHash?: unknown }>();
+      // Map back by destination media identity, not array position. The persisted
+      // registration must use the destination object Telegram actually created,
+      // never the uploaded InputFile handle or source media identity.
+      const mediaIdToMessage = new Map<string, { id: number; ref: MediaRef }>();
       for (const u of updates.updates ?? []) {
-        const doc = u.message?.media?.document;
-        if (u.message?.id && doc?.id) docIdToMessage.set(String(doc.id), { id: u.message.id, accessHash: doc.accessHash });
+        const message = u.message as Api.Message | undefined;
+        const ref = message?.media ? readMedia(message.media) : null;
+        if (message?.id && ref) mediaIdToMessage.set(ref.id, { id: message.id, ref });
       }
       prepared.forEach((p, i) => {
-        const found = docIdToMessage.get(String(p.docId));
+        const found = mediaIdToMessage.get(String(p.docId));
         results[i] = found
-          ? { message_id: found.id, file_id: String(p.docId), access_hash: found.accessHash ? String(found.accessHash) : undefined, size: p.file.size, has_thumbnail: p.hasThumbnail }
+          ? {
+              message_id: found.id,
+              file_id: found.ref.id,
+              access_hash: found.ref.accessHash ? String(found.ref.accessHash) : undefined,
+              size: found.ref.size || p.file.size,
+              has_thumbnail: p.hasThumbnail,
+              mediaKind: found.ref.kind,
+              mediaId: found.ref.id,
+              photoVariant: found.ref.kind === 'photo' ? found.ref.fullThumbSize : undefined,
+            }
           : emptyResult();
       });
       sendSucceeded = true;
@@ -926,12 +949,25 @@ export class TelegramClientManager {
           const arrayBuffer = await p.file.arrayBuffer();
           const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
           const customFile = new CustomFile(p.file.name, p.file.size, "", buf);
-          const message = await this.sendFileLocked({ file: customFile, workers: 1, forceDocument: true }) as Api.Message;
+          const message = await this.sendFileLocked({
+            file: customFile,
+            workers: 1,
+            forceDocument: true,
+            ...(options?.randomIds?.[i] ? { randomId: options.randomIds[i] } : {}),
+          }, 3, options?.targetPeer ?? 'me') as Api.Message;
           recordUploadedBytes(this.accountId, p.file.size);
-          const media = message.media as any;
-          const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
-          results[i] = doc
-            ? { message_id: message.id, file_id: String(doc.id), access_hash: doc.accessHash ? String(doc.accessHash) : undefined, size: p.file.size, has_thumbnail: false }
+          const ref = message.media ? readMedia(message.media) : null;
+          results[i] = ref
+            ? {
+                message_id: message.id,
+                file_id: ref.id,
+                access_hash: ref.accessHash ? String(ref.accessHash) : undefined,
+                size: ref.size || p.file.size,
+                has_thumbnail: false,
+                mediaKind: ref.kind,
+                mediaId: ref.id,
+                photoVariant: ref.kind === 'photo' ? ref.fullThumbSize : undefined,
+              }
             : emptyResult();
         } catch (err) {
           console.error('[Album] Fallback sendFile failed:', p.file.name, err);
@@ -1365,25 +1401,35 @@ export class TelegramClientManager {
     }
   }
 
-  /**
-   * Forward one message into Saved Messages and return the new message.
-   *
-   * ponytail: one message per call, paced by messageRateLimiter (~3/s). Telegram
-   * accepts up to 100 ids per forwardMessages call, which would be ~100x faster;
-   * the upgrade path is batching and matching the returned messages back to
-   * their sources by media id, since the API gives no explicit mapping.
-   */
-  async forwardToSaved(entity: any, messageId: number): Promise<Api.Message> {
+  /** Forward one message to an explicit frozen target using the persisted random id. */
+  async forwardToTarget(
+    entity: any,
+    messageId: number,
+    targetPeer: any,
+    randomId: string,
+  ): Promise<TargetAwareSendResult> {
     await this.waitUntilReady();
     if (!this.client) throw new Error('Client not initialized');
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.messageRateLimiter.wait();
-        const result = await this.client.forwardMessages('me', {
+        const result = await this.client.forwardMessages(targetPeer, {
           messages: [messageId],
           fromPeer: entity,
-        });
-        return unwrapForwardedMessage(result, messageId) as Api.Message;
+          randomId: [bigInt(randomId) as any],
+        } as any);
+        const message = unwrapForwardedMessage(result, messageId) as Api.Message;
+        const ref = message.media ? readMedia(message.media) : null;
+        if (!ref) throw new Error(`Forwarded message ${message.id} has no readable media (source message ${messageId})`);
+        return {
+          messageId: message.id,
+          mediaKind: ref.kind,
+          mediaId: ref.id,
+          size: ref.size,
+          accessHash: ref.accessHash ? String(ref.accessHash) : undefined,
+          photoVariant: ref.kind === 'photo' ? ref.fullThumbSize : undefined,
+          message,
+        };
       } catch (err: any) {
         if (isFloodError(err) && attempt < 2) {
           this.penalizeForFlood('forwardMessages', err);
@@ -1393,6 +1439,17 @@ export class TelegramClientManager {
       }
     }
     throw new Error(`Forward of message ${messageId} failed after retries`);
+  }
+
+  /** Legacy Saved Messages wrapper retained for existing pre-channel call sites. */
+  async forwardToSaved(entity: any, messageId: number): Promise<Api.Message> {
+    const forwarded = await this.forwardToTarget(
+      entity,
+      messageId,
+      'me',
+      String(generateRandomBigInt()),
+    );
+    return forwarded.message;
   }
 
   /**

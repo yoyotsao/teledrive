@@ -1,0 +1,52 @@
+name: Apply Task 7
+
+on:
+  push:
+    branches:
+      - plan/shared-channel-storage
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: task7-fixer
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply Task 7 patch without normalizing existing line endings
+        run: |
+          python .github/scripts/apply_task7.py
+          git diff --ignore-space-at-eol -- frontend/src/lib/gramjs.ts > /tmp/task7.patch
+          git checkout -- frontend/src/lib/gramjs.ts
+          git apply --ignore-space-change --whitespace=nowarn /tmp/task7.patch
+      - name: Check patch cleanliness
+        run: git diff --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Run Task 7 focused tests
+        working-directory: frontend
+        run: npx vitest run src/lib/gramjsTargetAware.test.ts src/lib/forwardResult.test.ts src/lib/telegramMedia.test.ts
+      - name: Run full frontend unit suite
+        working-directory: frontend
+        run: npm run test:unit
+      - name: Commit Task 7 implementation
+        run: |
+          git config user.name 'ChatGPT'
+          git config user.email '79632318+yoyotsao@users.noreply.github.com'
+          git add frontend/src/lib/gramjs.ts
+          git commit -m 'feat: send telegram media to frozen targets'
+          git push origin HEAD:plan/shared-channel-storage

@@ -1,7 +1,8 @@
 from pathlib import Path
 
 path = Path('frontend/src/lib/gramjs.ts')
-text = path.read_text()
+text = path.read_bytes().decode('utf-8')
+newline = '\r\n' if '\r\n' in text else '\n'
 
 old_import = 'import { unwrapForwardedMessage } from "./forwardResult";'
 new_import = 'import { unwrapForwardedMessages } from "./forwardResult";'
@@ -9,8 +10,8 @@ if old_import not in text:
     raise SystemExit('forwardResult import marker not found')
 text = text.replace(old_import, new_import, 1)
 
-start_marker = '  /** Forward one message to an explicit frozen target using the persisted random id. */\n'
-end_marker = '  /** Legacy Saved Messages wrapper retained for existing pre-channel call sites. */\n'
+start_marker = '  /** Forward one message to an explicit frozen target using the persisted random id. */'
+end_marker = '  /** Legacy Saved Messages wrapper retained for existing pre-channel call sites. */'
 start = text.index(start_marker)
 end = text.index(end_marker, start)
 
@@ -78,7 +79,7 @@ replacement = '''  /** Forward up to 100 messages to one frozen target with one 
     ))[0];
   }
 
-'''
+'''.replace('\n', newline)
 
 text = text[:start] + replacement + text[end:]
-path.write_text(text)
+path.write_bytes(text.encode('utf-8'))

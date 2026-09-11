@@ -1,0 +1,65 @@
+# Task 12 dedup location + runtime type gate
+name: Apply Task 12 Dedup Metadata
+
+on:
+  push:
+    branches:
+      - plan/shared-channel-storage
+    paths:
+      - .github/workflows/apply-task12-dedup-metadata.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply location metadata patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import runpy
+          original_read = Path.read_text
+          original_write = Path.write_text
+          newlines = {}
+          def preserving_read(self, *args, **kwargs):
+              raw = self.read_bytes().decode(kwargs.get('encoding') or 'utf-8')
+              newlines[str(self)] = '\r\n' if '\r\n' in raw else '\n'
+              return raw.replace('\r\n', '\n')
+          def preserving_write(self, data, *args, **kwargs):
+              newline = newlines.get(str(self), '\n')
+              payload = data if newline == '\n' else data.replace('\n', '\r\n')
+              self.write_bytes(payload.encode(kwargs.get('encoding') or 'utf-8'))
+              return len(payload)
+          Path.read_text = preserving_read
+          Path.write_text = preserving_write
+          try:
+              runpy.run_path('.github/scripts/apply_task12_dedup_metadata.py', run_name='__main__')
+          finally:
+              Path.read_text = original_read
+              Path.write_text = original_write
+          PY
+          git -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol diff --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci
+      - working-directory: frontend
+        run: npx tsc --noEmit
+      - working-directory: frontend
+        run: npm run test:unit
+      - name: Commit location metadata plumbing
+        run: |
+          git config user.name 'ChatGPT'
+          git config user.email '79632318+yoyotsao@users.noreply.github.com'
+          git add frontend/src/api/client.ts frontend/src/lib/uploadPlanner.ts frontend/src/lib/uploadOperations.ts
+          git commit -m 'feat: preserve storage location through dedup registration'
+          git push origin HEAD:plan/shared-channel-storage

@@ -37,6 +37,11 @@ export type SplitUploadProgressDetail =
 
 export type SplitUploadProgress = (percent: number, detail?: SplitUploadProgressDetail) => void;
 
+export interface FrozenSplitSendTarget {
+  targetPeer: any;
+  randomIds: readonly string[];
+}
+
 export interface SplitUploadDependencies {
   scheduler: Pick<SegmentScheduler, 'enqueueFile'>;
   clients: () => TelegramClientManager[];
@@ -71,19 +76,24 @@ export function createUploadFileSpread(deps: SplitUploadDependencies): typeof up
     onProgress?: SplitUploadProgress,
     thumb?: Blob | null,
     pinned?: TelegramClientManager,
+    sendTarget?: FrozenSplitSendTarget,
   ): Promise<SplitUploadResult> {
     const run = <T,>(fn: (client: TelegramClientManager) => Promise<T>): Promise<T> =>
       pinned ? fn(pinned) : useAccountSlot(fn);
 
     if (file.size <= smallFileLimit) {
-      const result = await run((client) => client.uploadSmallFile(file, thumb));
+      const result = await run((client) => client.uploadSmallFile(
+        file, thumb, sendTarget?.targetPeer ?? "me", sendTarget?.randomIds?.[0],
+      ));
       onProgress?.(100);
       const { hasThumbnail, ...part } = result;
       return { parts: [part], originalName: file.name, totalParts: 1, hasThumbnail };
     }
 
     const segments = plan(file.size);
-    const runners = (pinned ? [pinned] : deps.clients()).map((client) => client.asSegmentRunner());
+    const runners = (pinned ? [pinned] : deps.clients()).map((client) =>
+      client.asSegmentRunner(pinned ? sendTarget : undefined),
+    );
     const input: SegmentFileJobInput = {
       fileJobId: fileJobIdFor(file),
       file,
@@ -140,6 +150,7 @@ export async function uploadFileSpread(
   onProgress?: SplitUploadProgress,
   thumb?: Blob | null,
   pinned?: TelegramClientManager,
+  sendTarget?: FrozenSplitSendTarget,
 ): Promise<SplitUploadResult> {
-  return productionUploadFileSpread(file, onProgress, thumb, pinned);
+  return productionUploadFileSpread(file, onProgress, thumb, pinned, sendTarget);
 }

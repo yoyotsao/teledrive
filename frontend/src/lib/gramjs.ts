@@ -572,15 +572,16 @@ export class TelegramClientManager {
   private async sendFileWithOptionalThumb(
     params: Record<string, unknown>,
     thumb?: Blob | null,
+    targetPeer: any = "me",
   ): Promise<{ message: unknown; hasThumbnail: boolean }> {
     if (!thumb) {
-      return { message: await this.sendFileLocked(params), hasThumbnail: false };
+      return { message: await this.sendFileLocked(params, 3, targetPeer), hasThumbnail: false };
     }
     const thumbFile = new File([thumb], 'thumb.jpg', { type: thumb.type || 'image/jpeg' });
     // No silent retry-without-thumb: a media file must not land in the drive
     // without its thumbnail. When a thumb was provided, sending with it MUST
     // succeed or the whole upload fails (the caller marks the file as errored).
-    const message = await this.sendFileLocked({ ...params, thumb: thumbFile });
+    const message = await this.sendFileLocked({ ...params, thumb: thumbFile }, 3, targetPeer);
     recordUploadedBytes(this.accountId, thumb.size);
     return { message, hasThumbnail: true };
   }
@@ -589,7 +590,12 @@ export class TelegramClientManager {
    * Upload a whole file that fits in one Telegram message via GramJS's own
    * sendFile (≤10MB path — CustomFile, not SaveBigFilePart).
    */
-  async uploadSmallFile(file: File, thumb?: Blob | null): Promise<SegmentResult & { hasThumbnail: boolean }> {
+  async uploadSmallFile(
+    file: File,
+    thumb?: Blob | null,
+    targetPeer: any = "me",
+    randomId?: string,
+  ): Promise<SegmentResult & { hasThumbnail: boolean }> {
     await this.waitUntilReady();
     if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
     const workId = `small-send:${String(generateRandomBigInt())}`;
@@ -603,7 +609,8 @@ export class TelegramClientManager {
         file: customFile,
         workers: 4,
         forceDocument: true,
-      }, thumb);
+        ...(randomId ? { randomId } : {}),
+      }, thumb, targetPeer);
       recordUploadedBytes(this.accountId, file.size);
       uploadSpeedTracker.recordAccountEffectiveUnit(this.accountId, workId, 'sendFile', file.size);
 
@@ -631,15 +638,18 @@ export class TelegramClientManager {
     }
   }
 
-  asSegmentRunner(): SegmentAttemptRunner {
+  asSegmentRunner(sendTarget?: { targetPeer?: any; randomIds?: readonly string[] }): SegmentAttemptRunner {
     return {
       accountId: this.accountId,
       accountName: resolveAccountLogName(this.accountName, this.accountId),
-      run: (input) => this.uploadSegmentAttempt(input),
+      run: (input) => this.uploadSegmentAttempt(input, sendTarget),
     };
   }
 
-  private async uploadSegmentAttempt(input: SegmentAttemptInput): Promise<SegmentResult & { hasThumbnail: boolean }> {
+  private async uploadSegmentAttempt(
+    input: SegmentAttemptInput,
+    sendTarget?: { targetPeer?: any; randomIds?: readonly string[] },
+  ): Promise<SegmentResult & { hasThumbnail: boolean }> {
     const { file, segment, thumb, lease, hooks } = input;
     await this.waitUntilReady();
     if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
@@ -678,10 +688,12 @@ export class TelegramClientManager {
     // must never create the message that makes that stale attempt logical.
     throwIfAborted(hooks.signal);
     if (!hooks.grantFinalize()) throw new LeaseRevokedError();
+    const randomId = sendTarget?.randomIds?.[segment.index];
     const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
       file: new Api.InputFileBig({ id: fileId, parts: segment.parts, name: file.name }),
       forceDocument: true,
-    }, segment.index === 0 ? thumb : undefined);
+      ...(randomId ? { randomId } : {}),
+    }, segment.index === 0 ? thumb : undefined, sendTarget?.targetPeer ?? "me");
 
     const msg = message as Api.Message;
     const media = msg.media as { className?: string } | undefined;

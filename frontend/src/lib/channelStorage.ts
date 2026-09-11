@@ -29,7 +29,7 @@ type ChannelEntity = {
   adminRights?: { postMessages?: boolean } | null;
 };
 
-type ChannelManagerLike = {
+export type ChannelManagerLike = {
   accountId: number;
   accountsVersion?: number;
   sessionGeneration?: number;
@@ -96,6 +96,23 @@ export function invalidateChannelSessionGeneration(manager: ChannelManagerLike):
   verificationCache.delete(manager as object);
 }
 
+/** Resolve the live entity/peer from this browser-owned manager only. */
+export async function resolveChannelPeerForAccount(
+  manager: ChannelManagerLike,
+  canonicalChannelId: string,
+): Promise<ChannelEntity | null> {
+  const channelId = parseCanonicalChannelId(canonicalChannelId);
+  const client = manager.client;
+  if (!client) {
+    throw new ChannelStorageError('CLIENT_UNAVAILABLE', 'Telegram client is not available');
+  }
+  for await (const dialog of client.iterDialogs({})) {
+    const candidate = dialog?.entity;
+    if (candidate && entityId(candidate) === channelId) return candidate;
+  }
+  return null;
+}
+
 /**
  * Resolve one private broadcast channel using only this account's Telegram
  * client and derive read/write capability without sending a probe message.
@@ -117,15 +134,7 @@ export async function validateChannelForAccount(
     throw new ChannelStorageError('CLIENT_UNAVAILABLE', 'Telegram client is not available');
   }
 
-  let entity: ChannelEntity | undefined;
-  for await (const dialog of client.iterDialogs({})) {
-    const candidate = dialog?.entity;
-    if (candidate && entityId(candidate) === channelId) {
-      entity = candidate;
-      break;
-    }
-  }
-
+  const entity = await resolveChannelPeerForAccount(manager, channelId);
   if (!entity) {
     throw new ChannelStorageError('CHANNEL_NOT_FOUND', `Channel ${channelId} was not found for this account`);
   }

@@ -120,6 +120,7 @@ export async function planUploads(files: File[]): Promise<UploadPlan> {
 }
 
 export interface RegisterableExistingPart {
+  file_id?: string;
   filesize: number;
   mime_type?: string | null;
   telegram_message_id: number;
@@ -129,7 +130,15 @@ export interface RegisterableExistingPart {
   /** Account storing the message. A dedup row MUST inherit it — access_hash is
    *  only valid against that account, so defaulting to the primary breaks the
    *  download of anything uploaded via a secondary one. */
-  telegram_user_id?: number;
+  telegram_user_id?: number | null;
+  telegram_chat_id?: string | null;
+  telegram_media_kind?: 'document' | 'photo' | null;
+  telegram_media_id?: string | null;
+  telegram_media_size?: number | null;
+  telegram_photo_variant?: string | null;
+  location_version?: number;
+  split_group_id?: string | null;
+  is_split_file?: boolean;
 }
 
 /**
@@ -161,13 +170,22 @@ export function canonicalExistingParts(
   if (files.length === 0) return [];
 
   const toPart = (f: FileInfo, index: number): RegisterableExistingPart => ({
+    file_id: f.file_id,
     filesize: f.filesize,
     mime_type: f.mime_type,
     telegram_message_id: f.telegram_message_id!,
     access_hash: f.access_hash,
     part_index: index,
     has_thumbnail: f.has_thumbnail,
-    telegram_user_id: f.telegram_user_id,
+    telegram_user_id: f.telegram_user_id ?? undefined,
+    telegram_chat_id: f.telegram_chat_id,
+    telegram_media_kind: f.telegram_media_kind,
+    telegram_media_id: f.telegram_media_id,
+    telegram_media_size: f.telegram_media_size,
+    telegram_photo_variant: f.telegram_photo_variant,
+    location_version: f.location_version ?? 0,
+    split_group_id: f.split_group_id,
+    is_split_file: f.is_split_file,
   });
   const covers = (parts: RegisterableExistingPart[]): boolean =>
     parts.reduce((n, p) => n + p.filesize, 0) === originalSize;
@@ -261,7 +279,13 @@ export async function registerDuplicateParts(
       totalParts: parts.length,
       originalName: file.name,
       fileHash: hash ?? undefined,
-      telegramUserId: part.telegram_user_id,
+      telegramUserId: part.telegram_user_id ?? undefined,
+      telegramChatId: part.telegram_chat_id,
+      telegramMediaKind: part.telegram_media_kind,
+      telegramMediaId: part.telegram_media_id,
+      telegramMediaSize: part.telegram_media_size,
+      telegramPhotoVariant: part.telegram_photo_variant,
+      locationVersion: part.location_version ?? 0,
     })
   ));
 }

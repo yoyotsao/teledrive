@@ -3,6 +3,8 @@ import { api } from '../api/client';
 import { sha256File } from '../lib/hashFile';
 import { getAllClients, PreparedAlbumFile, AlbumFileResult, TelegramClientManager } from '../lib/gramjs';
 import { uploadFileSpread, type SplitUploadProgress } from '../lib/splitUpload';
+import { durableUploadFile } from '../lib/durableUploadRuntime';
+import { ensureDedupPartsInCurrentTarget } from '../lib/dedupRelocationRuntime';
 import { withSlotOn, nextAccount } from '../lib/accountPool';
 import { captureThumb, isMediaFile, type ThumbCaptureResult } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
@@ -863,11 +865,12 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           : [];
         if (asExisting.length > 0) {
           onProgress?.(100);
-          await registerDuplicateParts(file, fileHash, asExisting, currentFolderId);
+          const targetParts = await ensureDedupPartsInCurrentTarget(asExisting);
+          await registerDuplicateParts(file, fileHash, targetParts, currentFolderId);
           return {
             // file_id is unused here — alreadyRegistered=true tells the caller to
             // skip registerUploadedParts, which is the only consumer that needs it.
-            parts: asExisting.map((p) => ({ message_id: p.telegram_message_id, file_id: '', access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false, account_id: p.telegram_user_id ?? 0 })),
+            parts: targetParts.map((p) => ({ message_id: p.telegram_message_id, file_id: p.telegram_media_id ?? '', access_hash: p.access_hash ?? undefined, size: p.filesize, has_thumbnail: p.has_thumbnail ?? false, account_id: p.telegram_user_id ?? 0 })),
             fileHash,
             alreadyRegistered: true,
           };
@@ -885,15 +888,21 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       throw new Error(`Thumbnail capture failed for ${file.name}`);
     }
     console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
-    // Unpinned: segments of a >512MB file are dispatched to different accounts
-    // and upload concurrently. Each takes a slot on the account it lands on.
-    const uploadResult = await uploadFileSpread(file, onProgress, thumbBlob);
-    console.log('[Upload] Upload completed, parts:', uploadResult.parts.length);
+    // Durable shared-storage uploads freeze the target/writer, persist every
+    // operation + random id before Telegram can create a message, persist the
+    // authoritative result, and only then commit metadata registration.
+    const uploadResult = await durableUploadFile(file, {
+      parentId: currentFolderId,
+      fileHash,
+      thumb: thumbBlob,
+      onProgress,
+    });
+    console.log('[Upload] Durable upload completed, parts:', uploadResult.parts.length);
 
     return {
       parts: uploadResult.parts.map((p, i) => ({ ...p, has_thumbnail: i === 0 && uploadResult.hasThumbnail })),
       fileHash,
-      alreadyRegistered: false,
+      alreadyRegistered: true,
     };
   };
 
@@ -944,6 +953,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     const enqueued = selectedFiles.map((file) => ({ file, id: queue.enqueueFile(file, destination) }));
 
     const SINGLE_PATH_SIZE_LIMIT = 10 * 1024 * 1024;
+    const batchStorageTarget = await api.getStorageTarget();
     const albumPipeline = createAlbumPipeline();
     const uploadPromises: Promise<void>[] = [];
 
@@ -994,7 +1004,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
         if (reusable.length > 0) {
           queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
           uploadPromises.push(
-            registerDuplicateParts(file, fileHash, reusable, destination.resolvedFolderId)
+            ensureDedupPartsInCurrentTarget(reusable)
+              .then((targetParts) => registerDuplicateParts(file, fileHash, targetParts, destination.resolvedFolderId))
               .then(done).catch((err) => failed('register', err)),
           );
           return;
@@ -1023,7 +1034,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
       queue.dispatch({ type: 'setStatus', id, attempt, status: 'uploading', now: Date.now() });
 
-      if (isAlbumEligibleMedia(file) && file.size <= SINGLE_PATH_SIZE_LIMIT) {
+      if (batchStorageTarget.storage_mode === 'saved_messages' && isAlbumEligibleMedia(file) && file.size <= SINGLE_PATH_SIZE_LIMIT) {
         uploadPromises.push(
           albumPipeline.enqueue(file, fileHash, destination.resolvedFolderId, onProgress)
             .then((outcome) => {

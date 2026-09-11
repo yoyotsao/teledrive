@@ -446,6 +446,12 @@ export const api = {
     fileHash?: string;
     /** Which linked account stores this message; omit for the primary. */
     telegramUserId?: number;
+    telegramChatId?: string | null;
+    telegramMediaKind?: 'document' | 'photo' | null;
+    telegramMediaId?: string | null;
+    telegramMediaSize?: number | null;
+    telegramPhotoVariant?: string | null;
+    locationVersion?: number;
   }): Promise<FileInfo> => {
     const response = await client.post<FileInfo>('/files/register', {
       filename: params.filename,
@@ -463,6 +469,12 @@ export const api = {
       original_name: params.originalName,
       file_hash: params.fileHash,
       telegram_user_id: params.telegramUserId,
+      telegram_chat_id: params.telegramChatId,
+      telegram_media_kind: params.telegramMediaKind,
+      telegram_media_id: params.telegramMediaId,
+      telegram_media_size: params.telegramMediaSize,
+      telegram_photo_variant: params.telegramPhotoVariant,
+      location_version: params.locationVersion ?? 0,
     });
     return response.data;
   },

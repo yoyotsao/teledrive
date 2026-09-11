@@ -1,4 +1,139 @@
-/** Production wiring for durable, target-aware chat import. */
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text(encoding='utf-8')
+    if old not in text:
+        raise SystemExit(f'pattern not found in {path}: {old[:180]!r}')
+    p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+
+replace_once(
+    'frontend/src/lib/chatImport.ts',
+    '''export type ImportDeps = {
+  resolveChat(input: string): Promise<{ entity: any; title: string; noForwards: boolean }>;
+  iterChatMedia(entity: any): AsyncIterable<any> | Iterable<any>;
+  forwardToSaved(entity: any, messageId: number): Promise<any>;
+  ensureFolder(name: string): Promise<string>;
+  /** Every row already filed under the import folder — the resume log and the taken-name list. */
+  existingFiles(folderId: string): Promise<FolderEntry[]>;
+  register(params: RegisterParams): Promise<void>;
+  accountId: number;
+};''',
+    '''export type DurableImportParams = {
+  entity: any;
+  sourceMessageId: number;
+  sourceMediaId: string;
+  filename: string;
+  filesize: number;
+  mimeType: string;
+  parentId: string;
+  hasThumbnail: boolean;
+};
+
+export type DurableImportResult = {
+  messageId: number;
+  mediaKind: 'document' | 'photo';
+  mediaId: string;
+  size: number;
+  mimeType: string;
+  accessHash?: string;
+  photoVariant?: string;
+  hasThumbnail: boolean;
+};
+
+export type ImportDeps = {
+  resolveChat(input: string): Promise<{ entity: any; title: string; noForwards: boolean }>;
+  iterChatMedia(entity: any): AsyncIterable<any> | Iterable<any>;
+  forwardToSaved(entity: any, messageId: number): Promise<any>;
+  /** Production supplies the durable target-aware path; tests/legacy callers may omit it. */
+  forwardAndRegister?: (params: DurableImportParams) => Promise<DurableImportResult>;
+  ensureFolder(name: string): Promise<string>;
+  /** Every row already filed under the import folder — the resume log and the taken-name list. */
+  existingFiles(folderId: string): Promise<FolderEntry[]>;
+  register(params: RegisterParams): Promise<void>;
+  accountId: number;
+};''',
+)
+
+replace_once(
+    'frontend/src/lib/chatImport.ts',
+    '''    try {
+      const forwarded = await deps.forwardToSaved(entity, message.id);
+      const stored = readMedia(forwarded.media);
+      if (!stored) {
+        // iterChatMedia already proved the SOURCE readable, so an unreadable
+        // forward is anomalous, not expected — treat it as a failure rather
+        // than silently registering the source's access_hash against a
+        // message id it doesn't belong to (a record that may not download).
+        throw new Error(`Forwarded message ${forwarded.id} has no readable media (source message ${message.id})`);
+      }
+      await deps.register({
+        filename,
+        filesize: stored.size,
+        mimeType: stored.mimeType,
+        messageId: forwarded.id,
+        fileId: stored.id,
+        accessHash: String(stored.accessHash),
+        parentId: folderId,
+        hasThumbnail: stored.previewThumbSize !== null,
+        telegramUserId: deps.accountId,
+      });
+      // Record what was actually written to the drive — the stored media id
+      // and the final, possibly renamed filename — so this run's view of the
+      // folder matches what a re-run will read back from it.
+      rememberImported(index, {
+        fileId: stored.id,
+        filename,
+        filesize: stored.size,
+        mimeType: stored.mimeType,
+      });''',
+    '''    try {
+      let storedIdentity: { id: string; size: number; mimeType: string };
+      if (deps.forwardAndRegister) {
+        const stored = await deps.forwardAndRegister({
+          entity,
+          sourceMessageId: message.id,
+          sourceMediaId: source.id,
+          filename,
+          filesize: source.size,
+          mimeType: source.mimeType,
+          parentId: folderId,
+          hasThumbnail: source.previewThumbSize !== null,
+        });
+        storedIdentity = { id: stored.mediaId, size: stored.size, mimeType: stored.mimeType };
+      } else {
+        const forwarded = await deps.forwardToSaved(entity, message.id);
+        const stored = readMedia(forwarded.media);
+        if (!stored) {
+          throw new Error(`Forwarded message ${forwarded.id} has no readable media (source message ${message.id})`);
+        }
+        await deps.register({
+          filename,
+          filesize: stored.size,
+          mimeType: stored.mimeType,
+          messageId: forwarded.id,
+          fileId: stored.id,
+          accessHash: String(stored.accessHash),
+          parentId: folderId,
+          hasThumbnail: stored.previewThumbSize !== null,
+          telegramUserId: deps.accountId,
+        });
+        storedIdentity = { id: stored.id, size: stored.size, mimeType: stored.mimeType };
+      }
+      // Record what was actually written to the drive — the stored media id
+      // and the final, possibly renamed filename — so this run's view of the
+      // folder matches what a re-run will read back from it.
+      rememberImported(index, {
+        fileId: storedIdentity.id,
+        filename,
+        filesize: storedIdentity.size,
+        mimeType: storedIdentity.mimeType,
+      });''',
+)
+
+Path('frontend/src/lib/chatImportDeps.ts').write_text('''/** Production wiring for durable, target-aware chat import. */
 import { api, type TelegramOperationRequest } from '../api/client';
 import { resolveChannelPeerForAccount, validateChannelForAccount } from './channelStorage';
 import type { DurableImportParams, ImportDeps } from './chatImport';
@@ -175,3 +310,44 @@ export function liveDeps(actingAccountId?: number): ImportDeps {
     },
   };
 }
+''', encoding='utf-8')
+
+replace_once(
+    'frontend/src/components/ImportChatDialog.tsx',
+    "import { liveDeps } from '../lib/chatImportDeps';",
+    "import { liveDeps } from '../lib/chatImportDeps';\nimport { loadAccounts } from '../lib/gramjs';",
+)
+replace_once(
+    'frontend/src/components/ImportChatDialog.tsx',
+    '''  const [finished, setFinished] = useState(false);
+  const stopRef = useRef(false);''',
+    '''  const [finished, setFinished] = useState(false);
+  const accounts = loadAccounts();
+  const [actingAccountId, setActingAccountId] = useState<number>(() => accounts[0]?.id ?? 0);
+  const stopRef = useRef(false);''',
+)
+replace_once(
+    'frontend/src/components/ImportChatDialog.tsx',
+    '''      const result = await runImport(value, liveDeps(), setProgress, () => stopRef.current);''',
+    '''      if (!actingAccountId) throw new Error('請先選擇可用的 Telegram 帳號');
+      const result = await runImport(value, liveDeps(actingAccountId), setProgress, () => stopRef.current);''',
+)
+replace_once(
+    'frontend/src/components/ImportChatDialog.tsx',
+    '''        <input
+          ref={inputRef}''',
+    '''        <label style={{ display: 'block', fontSize: 12, color: 'var(--td-text-muted)', marginBottom: 6 }}>
+          執行匯入的 Telegram 帳號
+        </label>
+        <select
+          value={actingAccountId}
+          disabled={running}
+          onChange={(e) => setActingAccountId(Number(e.target.value))}
+          style={{ width: '100%', padding: '8px 10px', fontSize: 14, borderRadius: 6, border: '1px solid var(--td-border)', background: 'var(--td-bg)', color: 'var(--td-text)', boxSizing: 'border-box', marginBottom: 12 }}
+        >
+          {accounts.map((account) => <option key={account.id} value={account.id}>{account.label || account.id}</option>)}
+        </select>
+
+        <input
+          ref={inputRef}''',
+)

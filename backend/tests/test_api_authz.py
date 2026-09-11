@@ -6,6 +6,7 @@ runtime, so an endpoint added without an auth dependency fails this file even
 though nobody wrote a test for it.
 """
 import inspect
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import params
@@ -18,10 +19,34 @@ from conftest import OWNER_B
 # a token. The template is what the coverage test at the bottom matches against
 # the router; the path is what the request actually goes to.
 PROTECTED = [
+    ("/api/v1/statistics/uploads", "GET", "/api/v1/statistics/uploads", None),
+    ("/api/v1/statistics/uploads", "POST", "/api/v1/statistics/uploads", {}),
     ("/api/v1/accounts", "GET", "/api/v1/accounts", None),
     ("/api/v1/accounts/challenge", "POST", "/api/v1/accounts/challenge", None),
     ("/api/v1/accounts/verify", "POST", "/api/v1/accounts/verify", {"nonce": "x"}),
     ("/api/v1/accounts/{tg_user_id}", "DELETE", "/api/v1/accounts/123", None),
+    ("/api/v1/storage-target", "GET", "/api/v1/storage-target", None),
+    ("/api/v1/storage-target", "PUT", "/api/v1/storage-target", {
+        "storage_mode": "channel", "channel_id": "1234567890",
+        "expected_version": 0, "expected_accounts_version": 0, "verifications": [],
+    }),
+    ("/api/v1/storage-migrations", "GET", "/api/v1/storage-migrations", None),
+    ("/api/v1/storage-migrations", "POST", "/api/v1/storage-migrations", {}),
+    ("/api/v1/storage-migrations/{migration_id}", "GET", "/api/v1/storage-migrations/migration", None),
+    ("/api/v1/storage-migrations/{migration_id}/items/{item_id}", "PATCH", "/api/v1/storage-migrations/migration/items/item", {}),
+    ("/api/v1/storage-migrations/{migration_id}/items/{item_id}/reconcile", "POST", "/api/v1/storage-migrations/migration/items/item/reconcile", {}),
+    ("/api/v1/storage-migrations/{migration_id}/items/{item_id}/verifications/{telegram_user_id}", "PUT", "/api/v1/storage-migrations/migration/items/item/verifications/123", {}),
+    ("/api/v1/storage-migrations/{migration_id}/groups/{group_id}/commit", "POST", "/api/v1/storage-migrations/migration/groups/group/commit", {}),
+    ("/api/v1/storage-migrations/{migration_id}/groups/{group_id}/rollback", "POST", "/api/v1/storage-migrations/migration/groups/group/rollback", {}),
+    ("/api/v1/telegram-operations", "GET", "/api/v1/telegram-operations", None),
+    ("/api/v1/telegram-operations", "POST", "/api/v1/telegram-operations", {}),
+    ("/api/v1/telegram-operations/{operation_id}", "GET", "/api/v1/telegram-operations/op", None),
+    ("/api/v1/telegram-operations/{operation_id}", "PATCH", "/api/v1/telegram-operations/op", {}),
+    ("/api/v1/telegram-operations/{operation_id}/reconcile-result", "POST", "/api/v1/telegram-operations/op/reconcile-result", {}),
+    ("/api/v1/telegram-operations/{operation_id}/register", "POST", "/api/v1/telegram-operations/op/register", None),
+    ("/api/v1/telegram-operation-groups/{group_id}/register", "POST", "/api/v1/telegram-operation-groups/group/register", None),
+    ("/api/v1/file-locations/{file_id}/switch", "POST", "/api/v1/file-locations/file/switch", {}),
+    ("/api/v1/file-location-groups/switch", "POST", "/api/v1/file-location-groups/switch", {}),
     ("/api/v1/files/check-hash", "GET", "/api/v1/files/check-hash?hash=" + "a" * 64, None),
     ("/api/v1/files/check-hashes", "POST", "/api/v1/files/check-hashes", {"hashes": []}),
     ("/api/v1/files/register", "POST", "/api/v1/files/register", {
@@ -89,6 +114,96 @@ def test_a_valid_token_still_stops_at_the_drive_boundary(client, make_file, meth
 
     assert resp.status_code == 404, "%s %s answered %d" % (method, path, resp.status_code)
     assert "theirs.txt" not in resp.text
+
+
+def test_storage_target_is_scoped_to_the_authenticated_owner(client, other_client, db, run):
+    """A signed-in drive can only read and replace its own target row."""
+    run(db.link_account(OWNER_B, OWNER_B, is_primary=True))
+    saved = run(db.put_storage_target(
+        OWNER_B,
+        {"storage_mode": "channel", "channel_id": "1234567890", "channel_title": "B only"},
+        expected_version=0,
+        expected_accounts_version=1,
+        verifications=[{
+            "telegram_user_id": OWNER_B,
+            "channel_id": "1234567890",
+            "channel_title": "B only",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "accounts_version": 1,
+        }],
+    ))
+    assert saved is not None
+
+    run(db.link_account(1001, 1001, is_primary=True))
+    own = client.put("/api/v1/storage-target", json={
+        "storage_mode": "channel", "channel_id": "9876543210",
+        "expected_version": 0, "expected_accounts_version": 1,
+        "verifications": [{
+            "telegram_user_id": 1001, "can_read": True, "can_write": True,
+            "status": "verified", "checked_at": datetime.now(timezone.utc).isoformat(),
+        }],
+    })
+    foreign = other_client.get("/api/v1/storage-target")
+
+    assert own.status_code == 200
+    assert own.json()["channel_id"] == "9876543210"
+    assert foreign.status_code == 200
+    assert foreign.json()["channel_id"] == "1234567890"
+
+
+def test_storage_migration_routes_are_owner_scoped(client, db, run, make_file):
+    run(db.link_account(OWNER_B, OWNER_B, is_primary=True))
+    target = run(db.put_storage_target(
+        OWNER_B,
+        {"storage_mode": "channel", "channel_id": "1234567890", "channel_title": "B migration"},
+        expected_version=0,
+        expected_accounts_version=1,
+        verifications=[{
+            "telegram_user_id": OWNER_B,
+            "channel_id": "1234567890",
+            "channel_title": "B migration",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "accounts_version": 1,
+        }],
+    ))
+    make_file("b-migration-file", owner_id=OWNER_B, telegram_message_id=44, filesize=1)
+    job = run(db.create_migration_manifest(
+        OWNER_B, target["version"], target["accounts_version"],
+    ))
+    item = job["items"][0]
+
+    assert client.get("/api/v1/storage-migrations").json() == {"migrations": []}
+    requests = [
+        ("GET", f"/api/v1/storage-migrations/{job['migration_id']}", None),
+        ("PATCH", f"/api/v1/storage-migrations/{job['migration_id']}/items/{item['item_id']}", {
+            "expected_version": item["version"], "lease_owner": "other", "lease_seconds": 30,
+        }),
+        ("POST", f"/api/v1/storage-migrations/{job['migration_id']}/items/{item['item_id']}/reconcile", {
+            "expected_item_version": item["version"], "operation_result_version": 1,
+        }),
+        ("PUT", f"/api/v1/storage-migrations/{job['migration_id']}/items/{item['item_id']}/verifications/{OWNER_B}", {
+            "expected_item_version": item["version"], "result_version": 1,
+            "target_channel_id": "1234567890", "destination_message_id": 1,
+            "media_kind": "document", "media_id": "1", "size_bytes": 1,
+            "read_probe_ok": True, "checked_at": datetime.now(timezone.utc).isoformat(),
+        }),
+        ("POST", f"/api/v1/storage-migrations/{job['migration_id']}/groups/{item['group_id']}/commit", {
+            "expected_job_version": job["version"],
+            "expected_item_versions": {item["item_id"]: item["version"]},
+        }),
+        ("POST", f"/api/v1/storage-migrations/{job['migration_id']}/groups/{item['group_id']}/rollback", {
+            "expected_location_versions": {item["item_id"]: 1},
+        }),
+    ]
+    for method, path, body in requests:
+        response = client.request(method, path, json=body)
+        assert response.status_code == 404, f"{method} {path} answered {response.status_code}: {response.text}"
 
 
 def _requires_authentication(endpoint) -> bool:

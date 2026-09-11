@@ -46,10 +46,13 @@ export default defineConfig({
     : {
         command: 'npm run dev -- --port 5173 --strictPort',
         url: LOCAL_URL,
-        reuseExistingServer: !process.env.CI,
+        // This server supplies VITE_E2E_TEST_HOOKS. Reuse would make the
+        // browser bridge depend on whatever happened to already hold 5173.
+        reuseExistingServer: false,
         timeout: 180_000,
         stdout: 'pipe',
         stderr: 'pipe',
+        env: { ...process.env, VITE_E2E_TEST_HOOKS: '1' },
       },
 
   projects: [

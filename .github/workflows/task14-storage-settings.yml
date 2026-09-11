@@ -1,0 +1,44 @@
+name: Task 14 Storage Settings Gate
+
+on:
+  push:
+    branches:
+      - plan/shared-channel-storage
+    paths:
+      - .github/workflows/task14-storage-settings.yml
+      - frontend/src/components/StorageTargetDialog.tsx
+      - frontend/src/components/SettingsDialog.tsx
+      - frontend/tests/isolated/storage-target-settings.spec.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: task14-storage-settings
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci
+      - name: TypeScript
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Full unit suite
+        working-directory: frontend
+        run: npm run test:unit
+      - name: Install Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Isolated storage settings
+        working-directory: frontend
+        run: npx playwright test --project=isolated tests/isolated/storage-target-settings.spec.ts

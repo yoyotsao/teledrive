@@ -37,6 +37,12 @@ export type Row = {
   total_parts: number | null;
   file_hash: string | null;
   telegram_user_id: number;
+  telegram_chat_id: string | null;
+  telegram_media_kind: 'document' | 'photo' | null;
+  telegram_media_id: string | null;
+  telegram_media_size: number | null;
+  telegram_photo_variant: string | null;
+  location_version: number | null;
   trashed_at: string | null;
 };
 
@@ -65,6 +71,12 @@ function makeRow(seed: SeedRow): Row {
     total_parts: null,
     file_hash: null,
     telegram_user_id: 42,
+    telegram_chat_id: null,
+    telegram_media_kind: null,
+    telegram_media_id: null,
+    telegram_media_size: null,
+    telegram_photo_variant: null,
+    location_version: null,
     trashed_at: null,
     ...seed,
   };
@@ -78,6 +90,9 @@ const SORT_KEYS: Record<string, (row: Row) => string | number> = {
 
 export class FakeDrive {
   rows: Row[] = [];
+  accounts: Array<{ telegram_user_id: number; label: string; is_primary: number; file_count: number }> = [
+    { telegram_user_id: 42, label: 'test', is_primary: 1, file_count: 0 },
+  ];
   requests: Array<{ method: string; path: string; query: URLSearchParams; body: any }> = [];
 
   seed(...seeds: SeedRow[]): this {

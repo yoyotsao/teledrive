@@ -30,10 +30,34 @@ export type RegisterParams = {
   telegramUserId: number;
 };
 
+export type DurableImportParams = {
+  entity: any;
+  sourceMessageId: number;
+  sourceMediaId: string;
+  filename: string;
+  filesize: number;
+  mimeType: string;
+  parentId: string;
+  hasThumbnail: boolean;
+};
+
+export type DurableImportResult = {
+  messageId: number;
+  mediaKind: 'document' | 'photo';
+  mediaId: string;
+  size: number;
+  mimeType: string;
+  accessHash?: string;
+  photoVariant?: string;
+  hasThumbnail: boolean;
+};
+
 export type ImportDeps = {
   resolveChat(input: string): Promise<{ entity: any; title: string; noForwards: boolean }>;
   iterChatMedia(entity: any): AsyncIterable<any> | Iterable<any>;
   forwardToSaved(entity: any, messageId: number): Promise<any>;
+  /** Production supplies the durable target-aware path; tests/legacy callers may omit it. */
+  forwardAndRegister?: (params: DurableImportParams) => Promise<DurableImportResult>;
   ensureFolder(name: string): Promise<string>;
   /** Every row already filed under the import folder — the resume log and the taken-name list. */
   existingFiles(folderId: string): Promise<FolderEntry[]>;
@@ -105,34 +129,46 @@ export async function runImport(
     progress.current = filename;
 
     try {
-      const forwarded = await deps.forwardToSaved(entity, message.id);
-      const stored = readMedia(forwarded.media);
-      if (!stored) {
-        // iterChatMedia already proved the SOURCE readable, so an unreadable
-        // forward is anomalous, not expected — treat it as a failure rather
-        // than silently registering the source's access_hash against a
-        // message id it doesn't belong to (a record that may not download).
-        throw new Error(`Forwarded message ${forwarded.id} has no readable media (source message ${message.id})`);
+      let storedIdentity: { id: string; size: number; mimeType: string };
+      if (deps.forwardAndRegister) {
+        const stored = await deps.forwardAndRegister({
+          entity,
+          sourceMessageId: message.id,
+          sourceMediaId: source.id,
+          filename,
+          filesize: source.size,
+          mimeType: source.mimeType,
+          parentId: folderId,
+          hasThumbnail: source.previewThumbSize !== null,
+        });
+        storedIdentity = { id: stored.mediaId, size: stored.size, mimeType: stored.mimeType };
+      } else {
+        const forwarded = await deps.forwardToSaved(entity, message.id);
+        const stored = readMedia(forwarded.media);
+        if (!stored) {
+          throw new Error(`Forwarded message ${forwarded.id} has no readable media (source message ${message.id})`);
+        }
+        await deps.register({
+          filename,
+          filesize: stored.size,
+          mimeType: stored.mimeType,
+          messageId: forwarded.id,
+          fileId: stored.id,
+          accessHash: String(stored.accessHash),
+          parentId: folderId,
+          hasThumbnail: stored.previewThumbSize !== null,
+          telegramUserId: deps.accountId,
+        });
+        storedIdentity = { id: stored.id, size: stored.size, mimeType: stored.mimeType };
       }
-      await deps.register({
-        filename,
-        filesize: stored.size,
-        mimeType: stored.mimeType,
-        messageId: forwarded.id,
-        fileId: stored.id,
-        accessHash: String(stored.accessHash),
-        parentId: folderId,
-        hasThumbnail: stored.previewThumbSize !== null,
-        telegramUserId: deps.accountId,
-      });
       // Record what was actually written to the drive — the stored media id
       // and the final, possibly renamed filename — so this run's view of the
       // folder matches what a re-run will read back from it.
       rememberImported(index, {
-        fileId: stored.id,
+        fileId: storedIdentity.id,
         filename,
-        filesize: stored.size,
-        mimeType: stored.mimeType,
+        filesize: storedIdentity.size,
+        mimeType: storedIdentity.mimeType,
       });
       // Guard the case where forwarding rewrites the media id: without this the
       // source id stays unseen and a re-run would import the message again.

@@ -4,6 +4,8 @@ import { ChonkyDrive } from './components/ChonkyDrive';
 import SessionConfig from './components/SessionConfig';
 import LoginScreen from './components/LoginScreen';
 import SettingsDialog from './components/SettingsDialog';
+import StorageMigrationPage from './maintenance/StorageMigrationPage';
+import { startUploadStatisticsSync } from './lib/uploadStatisticsSync';
 import { Sidebar } from './components/Sidebar';
 import { SearchBox } from './components/SearchBox';
 import { useUrlState } from './hooks/useUrlState';
@@ -19,6 +21,8 @@ type AuthState = 'loading' | 'unauthenticated' | 'authenticated';
 
 const API_ID = parseInt(import.meta.env.VITE_TELEGRAM_API_ID || '0');
 const API_HASH = import.meta.env.VITE_TELEGRAM_API_HASH || '';
+const STORAGE_MIGRATION_ENABLED = import.meta.env.VITE_ENABLE_STORAGE_MIGRATION === 'true';
+const STORAGE_MIGRATION_PATH = '/maintenance/storage-migration';
 
 function App() {
   const [authState, setAuthState] = useState<AuthState>('loading');
@@ -26,6 +30,10 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const url = useUrlState();
   const { theme, toggleTheme } = useTheme();
+
+  useEffect(() => {
+    if (authState === 'authenticated') return startUploadStatisticsSync();
+  }, [authState]);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,8 +45,6 @@ function App() {
           setAuthState('unauthenticated');
           return;
         }
-        // Show the file browser immediately — the file list only needs the backend JWT.
-        // GramJS-dependent actions await their own client handshake.
         setAuthState('authenticated');
         for (const account of accounts) {
           const client = getClientFor(account.id);
@@ -62,17 +68,12 @@ function App() {
     return () => { cancelled = true; };
   }, []);
 
-  // A token older than the backend's bounded refresh window needs a fresh
-  // Telegram proof. Keep the saved MTProto sessions intact so this does not
-  // disconnect accounts merely because backend authorization expired.
   useEffect(() => {
     const handleExpiredAuth = () => setAuthState('unauthenticated');
     window.addEventListener('teledrive:auth-expired', handleExpiredAuth);
     return () => window.removeEventListener('teledrive:auth-expired', handleExpiredAuth);
   }, []);
 
-  // Prove our identity to the backend by DMing a one-time nonce to its bot —
-  // Telegram reports who sent it, so the session string stays in this browser.
   const handleLogin = async (sessionString: string, client: TelegramClientManager) => {
     const { nonce, bot_username } = await api.requestChallenge();
     await client.sendAuthChallenge(bot_username, nonce);
@@ -111,6 +112,10 @@ function App() {
     return <LoginScreen onLogin={handleLogin} />;
   }
 
+  if (STORAGE_MIGRATION_ENABLED && window.location.pathname === STORAGE_MIGRATION_PATH) {
+    return <StorageMigrationPage />;
+  }
+
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--td-bg)', color: 'var(--td-text)' }}>
       <header style={{ padding: '12px 16px', borderBottom: '1px solid var(--td-border)', background: 'var(--td-surface)', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 16 }}>
@@ -122,6 +127,9 @@ function App() {
         </div>
         <SearchBox value={url.view.mode === 'search' ? url.view.query : ''} onChange={url.setSearch} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginLeft: 'auto' }}>
+          {STORAGE_MIGRATION_ENABLED && (
+            <a href={STORAGE_MIGRATION_PATH} style={{ fontSize: 12, color: 'var(--td-accent)' }}>儲存遷移</a>
+          )}
           <button onClick={toggleTheme} title="切換深色/淺色" style={{
             padding: '6px 10px', border: '1px solid var(--td-border)', borderRadius: 6,
             background: 'var(--td-surface)', fontSize: 16, cursor: 'pointer', color: 'var(--td-text)',

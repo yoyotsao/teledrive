@@ -1,0 +1,36 @@
+name: Task 15 Storage Migration Gate
+
+on:
+  push:
+    branches:
+      - plan/shared-channel-storage
+    paths:
+      - .github/workflows/task15-storage-migration.yml
+      - backend/app/services/storage_migration.py
+      - backend/app/services/database.py
+      - backend/app/api/routes.py
+      - backend/app/models/schemas.py
+      - backend/tests/test_storage_migration.py
+      - backend/tests/test_linked_accounts.py
+      - backend/tests/test_api_authz.py
+      - frontend/src/api/client.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install backend test dependencies
+        working-directory: backend
+        run: |
+          python -m pip install -r requirements.txt pytest >/dev/null
+      - name: Focused migration tests
+        working-directory: backend
+        run: python -m pytest tests/test_storage_migration.py tests/test_linked_accounts.py tests/test_api_authz.py -q

@@ -1,18 +1,24 @@
-import { getClientFor, getPrimaryClient, TelegramClientManager, DownloadProgress } from './gramjs';
+import { getClientFor, getPrimaryClient, type TelegramClientManager, type DownloadProgress } from './gramjs';
 import { api } from '../api/client';
 import { Semaphore } from './semaphore';
-import { FileInfo } from '../types';
+import { type FileInfo } from '../types';
+import { fileInfoToLocation, locationKey } from './storageLocation';
+import { resolveFileLocation } from './fileLocationResolver';
 
 /**
- * The client that can actually read this file.
- *
- * access_hash is issued per (account, document): another account's client
- * either fails outright or — worse — resolves a same-numbered message in ITS
- * own Saved Messages and silently returns the wrong bytes. Files registered
- * before multi-account have telegram_user_id 0, which means "the primary".
+ * Legacy Saved Messages reader. Canonical channel-backed locations must never
+ * use this selector because telegram_user_id identifies the historical uploader,
+ * not the account that should read a shared channel location at runtime.
  */
 export function clientForFile(file: Pick<FileInfo, 'telegram_user_id'>): TelegramClientManager {
   return file.telegram_user_id ? getClientFor(file.telegram_user_id) : getPrimaryClient();
+}
+
+/** Stable thumbnail cache identity; canonical relocations invalidate old bytes. */
+export function thumbnailCacheKey(file: FileInfo): string {
+  const location = fileInfoToLocation(file);
+  if (location) return `${file.file_id}:thumbnail:${locationKey(location)}`;
+  return `${file.file_id}:thumbnail:legacy-saved:${file.telegram_user_id || 0}:${file.telegram_message_id || 0}`;
 }
 
 /**
@@ -31,15 +37,103 @@ function assertWholeFile(blob: Blob, expected: number, what: string): Blob {
   return blob;
 }
 
+function toBlob(value: unknown, mimeType: string): Blob {
+  if (value instanceof Blob) return value.type === mimeType ? value : new Blob([value], { type: mimeType });
+  if (value instanceof ArrayBuffer) return new Blob([value], { type: mimeType });
+  if (ArrayBuffer.isView(value)) {
+    const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return new Blob([bytes.slice().buffer], { type: mimeType });
+  }
+  throw new Error('Telegram download returned no readable bytes');
+}
+
+function asProgressNumber(value: unknown): number {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (value && typeof (value as { toString?: () => string }).toString === 'function') {
+    const parsed = Number((value as { toString: () => string }).toString());
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+/**
+ * Download an embedded Telegram thumbnail through the same canonical resolver
+ * as full-file reads. Legacy rows retain original-account Saved Messages
+ * compatibility; incomplete channel rows fail closed.
+ */
+export async function fetchFileThumbnail(file: FileInfo): Promise<Blob | null> {
+  if (!file.telegram_message_id) return null;
+  const location = fileInfoToLocation(file);
+  if (location) {
+    const resolved = await resolveFileLocation(location, 'thumbnail');
+    if (resolved.locationVersion !== location.location_version) {
+      throw new Error(
+        `Stale resolved location: expected version ${location.location_version}, got ${resolved.locationVersion}`,
+      );
+    }
+    const thumb = resolved.media.previewThumbSize;
+    if (!thumb) return null;
+    const data = await resolved.client.downloadMedia(resolved.message, { thumb });
+    return toBlob(data, 'image/jpeg');
+  }
+
+  if (file.telegram_chat_id != null) {
+    throw new Error(`Incomplete canonical Telegram location for file: ${file.file_id}`);
+  }
+  const blobs = await clientForFile(file).downloadThumbnails([file.telegram_message_id]);
+  return blobs.get(file.telegram_message_id) ?? null;
+}
+
+/**
+ * Read canonical locations through the shared resolver. Rows that predate the
+ * additive location schema remain readable through their original Saved
+ * Messages account, but an incomplete channel row fails closed rather than
+ * silently falling back to @me.
+ */
+async function downloadFileRow(
+  file: FileInfo,
+  mimeType: string,
+  onProgress?: DownloadProgress,
+): Promise<Blob> {
+  const location = fileInfoToLocation(file);
+  if (location) {
+    const resolved = await resolveFileLocation(location, 'download');
+    if (resolved.locationVersion !== location.location_version) {
+      throw new Error(
+        `Stale resolved location: expected version ${location.location_version}, got ${resolved.locationVersion}`,
+      );
+    }
+    const data = await resolved.client.downloadMedia(resolved.message, {
+      progressCallback: (received: unknown, total: unknown) => {
+        onProgress?.(asProgressNumber(received), asProgressNumber(total) || file.filesize);
+      },
+    });
+    return toBlob(data, mimeType);
+  }
+
+  if (file.telegram_chat_id != null) {
+    throw new Error(`Incomplete canonical Telegram location for file: ${file.file_id}`);
+  }
+  if (!file.telegram_message_id) throw new Error('No telegram_message_id for file');
+  return clientForFile(file).downloadFile(file.telegram_message_id, mimeType, onProgress);
+}
+
 // Fetch a file's full bytes from Telegram (handles split files).
 export async function fetchFileBlob(file: FileInfo, onProgress?: DownloadProgress): Promise<Blob> {
   const mimeType = file.mime_type || 'application/octet-stream';
   if (file.is_split_file && file.split_group_id) {
     return downloadSplitMerged(file.split_group_id, mimeType, onProgress);
   }
-  if (!file.telegram_message_id) throw new Error('No telegram_message_id for file');
-  const blob = await clientForFile(file).downloadFile(file.telegram_message_id, mimeType, onProgress);
+  const blob = await downloadFileRow(file, mimeType, onProgress);
   return assertWholeFile(blob, file.filesize, file.filename);
+}
+
+function partLocationIdentity(part: FileInfo): string | null {
+  const location = fileInfoToLocation(part);
+  if (location) return locationKey(location);
+  if (!part.telegram_message_id) return null;
+  return `legacy-saved:${part.telegram_user_id || 0}:${part.telegram_message_id}`;
 }
 
 /**
@@ -62,19 +156,18 @@ export async function downloadSplitMerged(
 
   const sorted = [...files].sort((a, b) => (a.part_index ?? 0) - (b.part_index ?? 0));
 
-  // Safety net: a genuine split never reuses a Telegram message across parts,
-  // so collapse any duplicate telegram_message_id down to a single part. This
-  // stops a corrupt split group (e.g. one accidentally registered with the
-  // same message thousands of times) from downloading forever.
-  const seen = new Set<number>();
-  const uniqueParts = sorted.filter((p) => {
-    const id = p.telegram_message_id;
-    if (id == null || seen.has(id)) return false;
-    seen.add(id);
+  // A message number is only unique inside its chat. Deduplicate by the full
+  // canonical location key (including location_version); legacy Saved Messages
+  // rows include their original account so same-numbered messages stay distinct.
+  const seen = new Set<string>();
+  const uniqueParts = sorted.filter((part) => {
+    const key = partLocationIdentity(part);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
   if (uniqueParts.length !== sorted.length) {
-    console.warn('[DownloadMerge] Dropped', sorted.length - uniqueParts.length, 'duplicate-message parts');
+    console.warn('[DownloadMerge] Dropped', sorted.length - uniqueParts.length, 'duplicate-location parts');
   }
 
   // Parts download concurrently, so progress has to be summed across them
@@ -89,10 +182,7 @@ export async function downloadSplitMerged(
   const partSemaphore = new Semaphore(3);
   const blobs = await Promise.all(
     uniqueParts.map((part, i) => partSemaphore.withSlot(async () => {
-      const messageId = part.telegram_message_id;
-      if (!messageId) throw new Error(`Missing telegram_message_id for part: ${part.file_id}`);
-      // Each part carries its own storage account.
-      const blob = await clientForFile(part).downloadFile(messageId, mimeType, reportPart(i));
+      const blob = await downloadFileRow(part, mimeType, reportPart(i));
       console.log('[DownloadMerge] Part', i, 'downloaded, size:', blob.size);
       // A short part would merge into a corrupt file that still opens.
       return assertWholeFile(blob, part.filesize, `part ${i} of ${splitGroupId}`);

@@ -1,0 +1,120 @@
+name: Apply Task 12 Final Integration
+
+on:
+  push:
+    branches:
+      - plan/shared-channel-storage
+    paths:
+      - .github/workflows/apply-task12-final.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: task12-final-integration
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply complete Task 12 patches
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import runpy
+
+          original_read = Path.read_text
+          original_write = Path.write_text
+          newlines = {}
+
+          def preserving_read(self, *args, **kwargs):
+              raw = self.read_bytes().decode(kwargs.get('encoding') or 'utf-8')
+              newlines[str(self)] = '\r\n' if '\r\n' in raw else '\n'
+              return raw.replace('\r\n', '\n')
+
+          def preserving_write(self, data, *args, **kwargs):
+              newline = newlines.get(str(self), '\n')
+              payload = data if newline == '\n' else data.replace('\n', '\r\n')
+              self.write_bytes(payload.encode(kwargs.get('encoding') or 'utf-8'))
+              return len(payload)
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if old not in text:
+                  raise SystemExit(f'pattern not found in {path}: {old[:120]!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          Path.read_text = preserving_read
+          Path.write_text = preserving_write
+          try:
+              runpy.run_path('.github/scripts/apply_task12_dedup_metadata.py', run_name='__main__')
+              runpy.run_path('.github/scripts/apply_task12_fresh_runtime.py', run_name='__main__')
+              runpy.run_path('.github/scripts/apply_task12_dedup_relocation.py', run_name='__main__')
+
+              replace_once(
+                  'frontend/src/lib/uploadOperations.ts',
+                  "export interface UploadManagerLike {\n  accountId: number;\n  offline?: boolean;\n  [key: string]: unknown;\n}",
+                  "export interface UploadManagerLike {\n  accountId: number;\n  offline?: boolean;\n}",
+              )
+              replace_once(
+                  'frontend/src/lib/uploadOperations.ts',
+                  '`channel:${target.channel_id}`',
+                  'String(target.channel_id)',
+              )
+              for test_path in (
+                  'frontend/src/lib/uploadOperations.test.ts',
+                  'frontend/src/lib/uploadOperationsPrepared.test.ts',
+                  'frontend/src/lib/dedupRelocation.test.ts',
+                  'frontend/src/lib/chatImportOperation.test.ts',
+              ):
+                  p = Path(test_path)
+                  if p.exists():
+                      text = p.read_text(encoding='utf-8')
+                      text = text.replace('channel:123456789', '123456789')
+                      text = text.replace('register:channel:111:222', 'register:111:222')
+                      text = text.replace("  const base = { ...request(), state, version: 1, result_version: null };", "  const base: any = { ...request(), state, version: 1, result_version: null };")
+                      text = text.replace("    d.resolveSourceWriter.mockResolvedValue(null);", "    (d.resolveSourceWriter as any).mockResolvedValue(null);")
+                      p.write_text(text, encoding='utf-8')
+
+              for runtime_path in (
+                  'frontend/src/lib/durableUploadRuntime.ts',
+                  'frontend/src/lib/dedupRelocationRuntime.ts',
+              ):
+                  p = Path(runtime_path)
+                  text = p.read_text(encoding='utf-8')
+                  text = text.replace("      ...(result.accessHash ? { destination_access_hash: result.accessHash } : {}),\n", '')
+                  p.write_text(text, encoding='utf-8')
+          finally:
+              Path.read_text = original_read
+              Path.write_text = original_write
+          PY
+          git -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol diff --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci
+      - name: Focused Task 12 tests
+        working-directory: frontend
+        run: npm run test:unit -- src/lib/uploadOperations.test.ts src/lib/uploadOperationsPrepared.test.ts src/lib/dedupRelocation.test.ts src/lib/splitUploadTarget.test.ts src/lib/gramjsTargetAware.test.ts
+      - name: TypeScript
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Full frontend unit suite
+        working-directory: frontend
+        run: npm run test:unit
+      - name: Commit Task 12 integration
+        run: |
+          git config user.name 'ChatGPT'
+          git config user.email '79632318+yoyotsao@users.noreply.github.com'
+          git add frontend/src/components/ChonkyDrive.tsx frontend/src/lib/uploadOperations.ts frontend/src/lib/durableUploadRuntime.ts frontend/src/lib/dedupRelocation.ts frontend/src/lib/dedupRelocationRuntime.ts frontend/src/lib/dedupRelocation.test.ts frontend/src/api/client.ts frontend/src/lib/uploadPlanner.ts frontend/src/lib/uploadOperations.test.ts frontend/src/lib/uploadOperationsPrepared.test.ts frontend/src/lib/chatImportOperation.test.ts
+          git commit -m 'feat: upload through durable frozen channel operations'
+          git push origin HEAD:plan/shared-channel-storage

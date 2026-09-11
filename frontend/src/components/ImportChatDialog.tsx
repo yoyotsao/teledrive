@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { runImport, type ImportProgress } from '../lib/chatImport';
 import { liveDeps } from '../lib/chatImportDeps';
+import { loadAccounts } from '../lib/gramjs';
 
 // Import every media message of a chat into root/{chat name}. The whole thing
 // runs in this tab — closing it stops the import; re-running resumes, because
@@ -11,6 +12,8 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [finished, setFinished] = useState(false);
+  const accounts = loadAccounts();
+  const [actingAccountId, setActingAccountId] = useState<number>(() => accounts[0]?.id ?? 0);
   const stopRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -27,7 +30,8 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
     setProgress(null);
     stopRef.current = false;
     try {
-      const result = await runImport(value, liveDeps(), setProgress, () => stopRef.current);
+      if (!actingAccountId) throw new Error('請先選擇可用的 Telegram 帳號');
+      const result = await runImport(value, liveDeps(actingAccountId), setProgress, () => stopRef.current);
       setProgress(result);
       setFinished(true);
     } catch (e: any) {
@@ -52,6 +56,18 @@ export function ImportChatDialog({ onClose, onDone }: { onClose: () => void; onD
         <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--td-text-strong)', marginBottom: 14 }}>
           匯入 chat 媒體
         </div>
+
+        <label style={{ display: 'block', fontSize: 12, color: 'var(--td-text-muted)', marginBottom: 6 }}>
+          執行匯入的 Telegram 帳號
+        </label>
+        <select
+          value={actingAccountId}
+          disabled={running}
+          onChange={(e) => setActingAccountId(Number(e.target.value))}
+          style={{ width: '100%', padding: '8px 10px', fontSize: 14, borderRadius: 6, border: '1px solid var(--td-border)', background: 'var(--td-bg)', color: 'var(--td-text)', boxSizing: 'border-box', marginBottom: 12 }}
+        >
+          {accounts.map((account) => <option key={account.id} value={account.id}>{account.label || account.id}</option>)}
+        </select>
 
         <input
           ref={inputRef}

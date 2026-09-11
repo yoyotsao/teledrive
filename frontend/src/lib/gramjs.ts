@@ -46,6 +46,11 @@ import { sendWithDeadline, isTransientServerError } from './chunkSendGuard';
 import { unwrapForwardedMessage } from "./forwardResult";
 import { installPremiumFloodTag, isPremiumFlood } from "./gramjsFloodPatch";
 import { formatAccountLog, resolveAccountLogName } from "./accountLog";
+import { recordUploadedBytes } from './uploadStatisticsSync';
+import { accountActivityRegistry } from './accountActivityRegistry';
+import { uploadSpeedTracker } from './uploadSpeedTracker';
+import type { AttemptLease, SegmentAttemptHooks, SegmentAttemptInput, SegmentAttemptRunner, SegmentResult } from './segmentUploadTypes';
+export type { SegmentResult } from './segmentUploadTypes';
 
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
@@ -147,19 +152,9 @@ function invokeWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * Generate a random BigInteger for fileId in SaveBigFilePart operations.
  * Uses big-integer library for compatibility with GramJS API.
  */
-/** One Telegram message's worth of a (possibly split) file. `index` is the segment order. */
-export type SegmentResult = {
-  index: number;
-  message_id: number;
-  file_id: string;
-  access_hash?: string;
-  size: number;
-  /** Account holding this message — access_hash is only valid against it. */
-  account_id: number;
-};
-
 export type PreparedAlbumFile = { file: File; media: Api.InputMediaDocument; docId: unknown; hasThumbnail: boolean };
-export type AlbumFileResult = { message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean };
+export type AlbumFileResult = { message_id: number; file_id: string; access_hash?: string; size: number; has_thumbnail: boolean; mediaKind?: 'document' | 'photo'; mediaId?: string; photoVariant?: string };
+export type TargetAwareSendResult = { messageId: number; mediaKind: 'document' | 'photo'; mediaId: string; size: number; accessHash?: string; photoVariant?: string; message: Api.Message };
 
 function generateRandomBigInt(): ReturnType<typeof bigInt> {
   // Generate 8 random bytes and convert to BigInteger
@@ -173,6 +168,42 @@ function generateRandomBigInt(): ReturnType<typeof bigInt> {
   }
   
   return result;
+}
+
+/** The scheduler revoked this attempt before it could create the segment message. */
+export class LeaseRevokedError extends Error {
+  constructor() {
+    super('Segment attempt lease was revoked before finalization');
+    this.name = 'LeaseRevokedError';
+  }
+}
+
+type SegmentPartContext = {
+  lease: AttemptLease;
+  partIndex: number;
+  hooks: SegmentAttemptHooks;
+};
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new DOMException('The operation was aborted', 'AbortError'));
+    };
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    function done(): void {
+      cleanup();
+      resolve();
+    }
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 }
 
 /**
@@ -305,21 +336,51 @@ export class TelegramClientManager {
   private async sendFilePartGated(
     request: InstanceType<typeof Api.upload.SaveFilePart> | InstanceType<typeof Api.upload.SaveBigFilePart>,
     label: string,
+    context?: SegmentPartContext,
   ): Promise<void> {
     const client = this.client!;
     let floodRetries = 0;
     let transientRetries = 0;
     for (;;) {
-      await this.chunkPacer.wait();
+      await this.chunkPacer.wait(context?.hooks.signal);
       let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
       try {
         await sendWithDeadline(async () => {
           sender = await (client as any).getSender((client.session as any).dcId);
-          return await sender!.send(request);
         }, CHUNK_SEND_TIMEOUT_MS, label);
+        throwIfAborted(context?.hooks.signal);
+        if (context && !context.hooks.onRpcStart()) throw new LeaseRevokedError();
+        // Scheduler hooks own the registry lease for segment attempts. Direct
+        // small/album part uploads have no scheduler, so this layer owns their
+        // activity lease itself. Keeping those paths disjoint is what makes
+        // one sender request equal exactly one registry lifecycle.
+        const activityLease = context ? undefined : accountActivityRegistry.beginUploadRpc(this.accountId);
+        try {
+          throwIfAborted(context?.hooks.signal);
+          this.chunkPacer.noteSendStarted();
+          throwIfAborted(context?.hooks.signal);
+          await sendWithDeadline(() => sender!.send(request), CHUNK_SEND_TIMEOUT_MS, label);
+        } finally {
+          activityLease?.release();
+          if (context) context.hooks.onRpcSettled();
+        }
+        const bytes = ((request as unknown as { bytes?: { length?: number } }).bytes?.length ?? 0);
+        recordUploadedBytes(this.accountId, bytes);
         this.chunkPacer.reportSuccess();
+        if (context) {
+          context.hooks.onPartAccepted(context.partIndex, bytes);
+        } else {
+          const part = request as unknown as { fileId?: unknown; filePart?: unknown };
+          uploadSpeedTracker.recordAccountEffectiveUnit(
+            this.accountId,
+            `upload-part:${String(part.fileId)}`,
+            String(part.filePart),
+            bytes,
+          );
+        }
         return;
       } catch (err) {
+        if (err instanceof LeaseRevokedError || context?.hooks.signal.aborted) throw err;
         if (isFloodError(err)) {
           if (++floodRetries > 10) throw err;
           const seconds = (err as { seconds?: number } | null)?.seconds;
@@ -329,7 +390,14 @@ export class TelegramClientManager {
           );
           if (premium) {
             // Account-tier cap — wait it out at full rate, don't self-throttle.
-            this.chunkPacer.pause(seconds);
+            this.chunkPacer.reportPremiumFlood(seconds);
+            const stats = this.chunkPacer.stats();
+            context?.hooks.onPremiumFlood({
+              waitSeconds: typeof seconds === 'number' && seconds > 0 ? seconds : 10,
+              penaltyUntil: stats.penaltyUntil,
+              pacerMode: 'frozen',
+              scheduledRate: stats.rate,
+            });
           } else {
             this.chunkPacer.reportFlood(seconds);
           }
@@ -348,7 +416,7 @@ export class TelegramClientManager {
           console.warn(
             `[GramJS:${this.accountId}] ${label} transient failure (${(err as Error)?.message ?? err}) — resend ${transientRetries}/${CHUNK_TRANSIENT_RETRY_LIMIT}`,
           );
-          await new Promise((r) => setTimeout(r, Math.min(8000, 1000 * 2 ** (transientRetries - 1))));
+          await abortableDelay(Math.min(8000, 1000 * 2 ** (transientRetries - 1)), context?.hooks.signal);
           continue;
         }
         throw err;
@@ -429,7 +497,13 @@ export class TelegramClientManager {
     });
 
     // Connect to Telegram
-    await this.client.connect();
+    try {
+      await this.client.connect();
+    } catch (err) {
+      this.offline = true;
+      accountActivityRegistry.setAvailability(this.accountId, { online: false, ready: false });
+      throw err;
+    }
 
     // Check if session is valid by trying to get the current user
     try {
@@ -442,8 +516,12 @@ export class TelegramClientManager {
           myself.username || myself.firstName || String(myself.id),
         );
       }
+      this.offline = false;
+      accountActivityRegistry.setAvailability(this.accountId, { online: true, ready: true });
       console.log(`[GramJS:${this.accountId}] Connected as:`, myself.username || myself.firstName);
     } catch (err) {
+      this.offline = true;
+      accountActivityRegistry.setAvailability(this.accountId, { online: false, ready: false });
       console.warn('[GramJS] Session might need re-authentication:', err);
     }
   }
@@ -454,12 +532,15 @@ export class TelegramClientManager {
    * calls race before the "me" entity is cached; serialising them (max 2) and
    * refreshing the cache on failure fixes this.
    */
-  private async sendFileLocked(params: any, maxRetries = 3): Promise<unknown> {
+  private async sendFileLocked(params: any, maxRetries = 3, targetPeer: any = "me"): Promise<unknown> {
     return this.sendFileSemaphore.withSlot(async () => {
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
           await this.messageRateLimiter.wait();
-          return await this.client!.sendFile("me", params);
+          const normalizedParams = typeof params?.randomId === 'string'
+            ? { ...params, randomId: bigInt(params.randomId) as any }
+            : params;
+          return await this.client!.sendFile(targetPeer, normalizedParams);
         } catch (err: any) {
           const isEntityZero = err?.message?.includes('ID 0') || err?.message?.includes('Entity');
           if (isEntityZero && attempt < maxRetries - 1) {
@@ -491,15 +572,17 @@ export class TelegramClientManager {
   private async sendFileWithOptionalThumb(
     params: Record<string, unknown>,
     thumb?: Blob | null,
+    targetPeer: any = "me",
   ): Promise<{ message: unknown; hasThumbnail: boolean }> {
     if (!thumb) {
-      return { message: await this.sendFileLocked(params), hasThumbnail: false };
+      return { message: await this.sendFileLocked(params, 3, targetPeer), hasThumbnail: false };
     }
     const thumbFile = new File([thumb], 'thumb.jpg', { type: thumb.type || 'image/jpeg' });
     // No silent retry-without-thumb: a media file must not land in the drive
     // without its thumbnail. When a thumb was provided, sending with it MUST
     // succeed or the whole upload fails (the caller marks the file as errored).
-    const message = await this.sendFileLocked({ ...params, thumb: thumbFile });
+    const message = await this.sendFileLocked({ ...params, thumb: thumbFile }, 3, targetPeer);
+    recordUploadedBytes(this.accountId, thumb.size);
     return { message, hasThumbnail: true };
   }
 
@@ -507,92 +590,110 @@ export class TelegramClientManager {
    * Upload a whole file that fits in one Telegram message via GramJS's own
    * sendFile (≤10MB path — CustomFile, not SaveBigFilePart).
    */
-  async uploadSmallFile(file: File, thumb?: Blob | null): Promise<SegmentResult & { hasThumbnail: boolean }> {
+  async uploadSmallFile(
+    file: File,
+    thumb?: Blob | null,
+    targetPeer: any = "me",
+    randomId?: string,
+  ): Promise<SegmentResult & { hasThumbnail: boolean }> {
     await this.waitUntilReady();
     if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
+    const workId = `small-send:${String(generateRandomBigInt())}`;
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
-    const customFile = new CustomFile(file.name, file.size, "", buffer);
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+      const customFile = new CustomFile(file.name, file.size, "", buffer);
 
-    const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
-      file: customFile,
-      workers: 4,
-      forceDocument: true,
-    }, thumb);
+      const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
+        file: customFile,
+        workers: 4,
+        forceDocument: true,
+        ...(randomId ? { randomId } : {}),
+      }, thumb, targetPeer);
+      recordUploadedBytes(this.accountId, file.size);
+      uploadSpeedTracker.recordAccountEffectiveUnit(this.accountId, workId, 'sendFile', file.size);
 
-    const msg = message as Api.Message;
-    let fileId = "";
-    let accessHash: string | undefined;
+      const msg = message as Api.Message;
+      let fileId = "";
+      let accessHash: string | undefined;
 
-    if (msg.media) {
-      const mediaConstructor = (msg.media as { className?: string }).className;
-      if (mediaConstructor === "MessageMediaDocument") {
-        const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
-        fileId = String(doc.document.id);
-        accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
-      } else if (mediaConstructor === "MessageMediaPhoto") {
-        const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
-        fileId = String(photo.photo.id);
-        accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
+      if (msg.media) {
+        const mediaConstructor = (msg.media as { className?: string }).className;
+        if (mediaConstructor === "MessageMediaDocument") {
+          const doc = msg.media as unknown as { document: { id: bigint; accessHash?: bigint } };
+          fileId = String(doc.document.id);
+          accessHash = doc.document.accessHash ? String(doc.document.accessHash) : undefined;
+        } else if (mediaConstructor === "MessageMediaPhoto") {
+          const photo = msg.media as unknown as { photo: { id: bigint; accessHash?: bigint } };
+          fileId = String(photo.photo.id);
+          accessHash = photo.photo.accessHash ? String(photo.photo.accessHash) : undefined;
+        }
       }
-    }
 
-    console.log('[SplitUpload] Small file uploaded, message_id:', msg.id);
-    return { index: 0, message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, account_id: this.accountId, hasThumbnail };
+      console.log('[SplitUpload] Small file uploaded, message_id:', msg.id);
+      return { index: 0, message_id: msg.id, file_id: fileId, access_hash: accessHash, size: file.size, account_id: this.accountId, hasThumbnail };
+    } finally {
+      uploadSpeedTracker.clearAccountEffectiveWork(workId);
+    }
   }
 
-  /**
-   * Upload ONE segment of a large file (up to MAX_PARTS 512KB parts) and turn it
-   * into a single Telegram message. Everything here — the chunk semaphore, the
-   * pacer, the resulting access_hash — belongs to this account alone, which is
-   * what lets sibling segments run on other accounts concurrently.
-   *
-   * The returned index is the caller's segment index: message ids are only
-   * monotonic WITHIN an account, so they cannot order parts that were spread
-   * across accounts. See splitUpload.ts.
-   */
-  async uploadSegment(
-    file: File,
-    segment: { index: number; offset: number; parts: number; size: number },
-    thumb?: Blob | null,
-    onChunkDone?: () => void,
+  asSegmentRunner(sendTarget?: { targetPeer?: any; randomIds?: readonly string[] }): SegmentAttemptRunner {
+    return {
+      accountId: this.accountId,
+      accountName: resolveAccountLogName(this.accountName, this.accountId),
+      run: (input) => this.uploadSegmentAttempt(input, sendTarget),
+    };
+  }
+
+  private async uploadSegmentAttempt(
+    input: SegmentAttemptInput,
+    sendTarget?: { targetPeer?: any; randomIds?: readonly string[] },
   ): Promise<SegmentResult & { hasThumbnail: boolean }> {
+    const { file, segment, thumb, lease, hooks } = input;
     await this.waitUntilReady();
     if (!this.client) throw new Error("Client not initialized. Call initialize() first.");
 
     const fileId = generateRandomBigInt();
     await Promise.all(Array.from({ length: segment.parts }, (_, partIdx) =>
       this.uploadSemaphore.withSlot(async () => {
+        throwIfAborted(hooks.signal);
         const offset = segment.offset + partIdx * PART_SIZE;
         const chunk = file.slice(offset, Math.min(offset + PART_SIZE, file.size));
+        throwIfAborted(hooks.signal);
         const bytes = (globalThis as any).Buffer.from(new Uint8Array(await chunk.arrayBuffer()));
 
         for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
+          throwIfAborted(hooks.signal);
           try {
             await this.sendFilePartGated(new Api.upload.SaveBigFilePart({
               fileId,
               filePart: partIdx,
               fileTotalParts: segment.parts,
               bytes,
-            }), 'SaveBigFilePart');
-            onChunkDone?.();
+            }), 'SaveBigFilePart', { lease, partIndex: partIdx, hooks });
             return;
           } catch (err: any) {
             console.error(`[SplitUpload:${this.accountId}] part ${partIdx} attempt ${retry + 1} FAILED:`, err?.message || err);
             if (retry === CHUNK_RETRY_COUNT - 1) throw err;
             // Exponential backoff (1s/2s/4s...) — FLOOD_WAIT is handled inside
             // sendFilePartGated (rate cut + wait), this covers other transient failures.
-            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
+            await abortableDelay(1000 * Math.pow(2, retry), hooks.signal);
           }
         }
       })
     ));
 
+    // A migrated/revoked lease may have uploaded every byte physically, but
+    // must never create the message that makes that stale attempt logical.
+    throwIfAborted(hooks.signal);
+    if (!hooks.grantFinalize()) throw new LeaseRevokedError();
+    const randomId = sendTarget?.randomIds?.[segment.index];
     const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
       file: new Api.InputFileBig({ id: fileId, parts: segment.parts, name: file.name }),
       forceDocument: true,
-    }, thumb);
+      ...(randomId ? { randomId } : {}),
+    }, segment.index === 0 ? thumb : undefined, sendTarget?.targetPeer ?? "me");
 
     const msg = message as Api.Message;
     const media = msg.media as { className?: string } | undefined;
@@ -631,34 +732,53 @@ export class TelegramClientManager {
    */
   private async uploadFilePartsPaced(buf: { length: number; subarray(start: number, end: number): unknown }, fileName: string): Promise<Api.InputFile> {
     const fileId = generateRandomBigInt();
+    const workId = `upload-part:${String(fileId)}`;
     const partCount = Math.max(1, Math.ceil(buf.length / PART_SIZE));
 
-    await Promise.all(Array.from({ length: partCount }, (_, partIdx) =>
-      this.uploadSemaphore.withSlot(async () => {
-        const bytes = (buf as any).subarray(partIdx * PART_SIZE, Math.min((partIdx + 1) * PART_SIZE, buf.length));
-        for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
-          try {
-            await this.sendFilePartGated(new Api.upload.SaveFilePart({
-              fileId: fileId as any,
-              filePart: partIdx,
-              bytes,
-            }), `SaveFilePart(${fileName})`);
-            return;
-          } catch (err: any) {
-            console.error('[SmallUpload] Part', partIdx, 'of', fileName, 'attempt', retry + 1, 'FAILED:', err?.message || err);
-            if (retry === CHUNK_RETRY_COUNT - 1) throw err;
-            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
+    try {
+      let hasFailure = false;
+      let firstFailure: unknown;
+      const partUploads = Array.from({ length: partCount }, (_, partIdx) =>
+        this.uploadSemaphore.withSlot(async () => {
+          const bytes = (buf as any).subarray(partIdx * PART_SIZE, Math.min((partIdx + 1) * PART_SIZE, buf.length));
+          for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
+            try {
+              await this.sendFilePartGated(new Api.upload.SaveFilePart({
+                fileId: fileId as any,
+                filePart: partIdx,
+                bytes,
+              }), `SaveFilePart(${fileName})`);
+              return;
+            } catch (err: any) {
+              console.error('[SmallUpload] Part', partIdx, 'of', fileName, 'attempt', retry + 1, 'FAILED:', err?.message || err);
+              if (retry === CHUNK_RETRY_COUNT - 1) throw err;
+              await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, retry)));
+            }
           }
+        })
+      );
+      await Promise.allSettled(partUploads.map(async (partUpload) => {
+        try {
+          await partUpload;
+        } catch (error) {
+          if (!hasFailure) {
+            hasFailure = true;
+            firstFailure = error;
+          }
+          throw error;
         }
-      })
-    ));
+      }));
+      if (hasFailure) throw firstFailure;
 
-    return new Api.InputFile({
-      id: fileId as any,
-      parts: partCount,
-      name: fileName,
-      md5Checksum: "",
-    });
+      return new Api.InputFile({
+        id: fileId as any,
+        parts: partCount,
+        name: fileName,
+        md5Checksum: "",
+      });
+    } finally {
+      uploadSpeedTracker.clearAccountEffectiveWork(workId);
+    }
   }
 
   /**
@@ -770,7 +890,10 @@ export class TelegramClientManager {
    * any per-file concurrency slot — safe to call after those have been
    * released, so it never blocks the next file's bytes from starting.
    */
-  async sendAlbum(prepared: PreparedAlbumFile[]): Promise<AlbumFileResult[]> {
+  async sendAlbum(
+    prepared: PreparedAlbumFile[],
+    options?: { targetPeer?: any; randomIds?: string[] },
+  ): Promise<AlbumFileResult[]> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized. Call initialize() first.");
@@ -781,33 +904,49 @@ export class TelegramClientManager {
     const results: AlbumFileResult[] = prepared.map(emptyResult);
 
     if (prepared.length === 0) return results;
+    if (options?.randomIds && options.randomIds.length !== prepared.length) {
+      throw new Error('Album randomIds must match prepared file count');
+    }
+    const targetPeer = options?.targetPeer ?? new Api.InputPeerSelf();
 
     let sendSucceeded = false;
     try {
       const t0 = performance.now();
       await this.messageRateLimiter.wait();
       const tLimiter = performance.now();
-      const multiMedia = prepared.map((p) => new Api.InputSingleMedia({
+      const multiMedia = prepared.map((p, index) => new Api.InputSingleMedia({
         media: p.media,
-        randomId: generateRandomBigInt() as any,
+        randomId: (options?.randomIds?.[index] ? bigInt(options.randomIds[index]) : generateRandomBigInt()) as any,
         message: '',
       }));
       const updates = await invokeWithTimeout(
-        client.invoke(new Api.messages.SendMultiMedia({ peer: new Api.InputPeerSelf(), multiMedia })),
+        client.invoke(new Api.messages.SendMultiMedia({ peer: targetPeer as any, multiMedia })),
         ALBUM_SEND_TIMEOUT_MS,
       ) as { updates?: Array<{ message?: { id: number; media?: { document?: { id: unknown; accessHash?: unknown } } } }> };
       console.log(`[Perf] sendAlbum x${prepared.length}: limiterWait=${Math.round(tLimiter - t0)}ms sendMultiMedia=${Math.round(performance.now() - tLimiter)}ms`);
 
-      // Map back by document id (not array position) — Telegram doesn't guarantee order.
-      const docIdToMessage = new Map<string, { id: number; accessHash?: unknown }>();
+      // Map back by destination media identity, not array position. The persisted
+      // registration must use the destination object Telegram actually created,
+      // never the uploaded InputFile handle or source media identity.
+      const mediaIdToMessage = new Map<string, { id: number; ref: MediaRef }>();
       for (const u of updates.updates ?? []) {
-        const doc = u.message?.media?.document;
-        if (u.message?.id && doc?.id) docIdToMessage.set(String(doc.id), { id: u.message.id, accessHash: doc.accessHash });
+        const message = u.message as Api.Message | undefined;
+        const ref = message?.media ? readMedia(message.media) : null;
+        if (message?.id && ref) mediaIdToMessage.set(ref.id, { id: message.id, ref });
       }
       prepared.forEach((p, i) => {
-        const found = docIdToMessage.get(String(p.docId));
+        const found = mediaIdToMessage.get(String(p.docId));
         results[i] = found
-          ? { message_id: found.id, file_id: String(p.docId), access_hash: found.accessHash ? String(found.accessHash) : undefined, size: p.file.size, has_thumbnail: p.hasThumbnail }
+          ? {
+              message_id: found.id,
+              file_id: found.ref.id,
+              access_hash: found.ref.accessHash ? String(found.ref.accessHash) : undefined,
+              size: found.ref.size || p.file.size,
+              has_thumbnail: p.hasThumbnail,
+              mediaKind: found.ref.kind,
+              mediaId: found.ref.id,
+              photoVariant: found.ref.kind === 'photo' ? found.ref.fullThumbSize : undefined,
+            }
           : emptyResult();
       });
       sendSucceeded = true;
@@ -822,11 +961,25 @@ export class TelegramClientManager {
           const arrayBuffer = await p.file.arrayBuffer();
           const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
           const customFile = new CustomFile(p.file.name, p.file.size, "", buf);
-          const message = await this.sendFileLocked({ file: customFile, workers: 1, forceDocument: true }) as Api.Message;
-          const media = message.media as any;
-          const doc = media?.className === 'MessageMediaDocument' ? media.document : undefined;
-          results[i] = doc
-            ? { message_id: message.id, file_id: String(doc.id), access_hash: doc.accessHash ? String(doc.accessHash) : undefined, size: p.file.size, has_thumbnail: false }
+          const message = await this.sendFileLocked({
+            file: customFile,
+            workers: 1,
+            forceDocument: true,
+            ...(options?.randomIds?.[i] ? { randomId: options.randomIds[i] } : {}),
+          }, 3, options?.targetPeer ?? 'me') as Api.Message;
+          recordUploadedBytes(this.accountId, p.file.size);
+          const ref = message.media ? readMedia(message.media) : null;
+          results[i] = ref
+            ? {
+                message_id: message.id,
+                file_id: ref.id,
+                access_hash: ref.accessHash ? String(ref.accessHash) : undefined,
+                size: ref.size || p.file.size,
+                has_thumbnail: false,
+                mediaKind: ref.kind,
+                mediaId: ref.id,
+                photoVariant: ref.kind === 'photo' ? ref.fullThumbSize : undefined,
+              }
             : emptyResult();
         } catch (err) {
           console.error('[Album] Fallback sendFile failed:', p.file.name, err);
@@ -1095,7 +1248,15 @@ export class TelegramClientManager {
    *   Checked against what Telegram returns so a wrong-account lookup fails
    *   loudly instead of streaming a same-numbered message's contents.
    */
-  async downloadFileChunkedByOffset(messageId: number, offset: number, limit: number, fileSize?: number, expectedFileId?: string): Promise<Blob> {
+  async downloadFileChunkedByOffset(
+    messageId: number,
+    offset: number,
+    limit: number,
+    fileSize?: number,
+    expectedFileId?: string,
+    resolvedRef?: MediaRef,
+    refreshResolvedRef?: () => Promise<MediaRef>,
+  ): Promise<Blob> {
     await this.waitUntilReady();
     if (!this.client) {
       throw new Error("Client not initialized");
@@ -1134,7 +1295,7 @@ export class TelegramClientManager {
 
     // Cached after the first chunk of a given message — subsequent chunks skip getMessages entirely.
     const invokeGetFile = async (off: number, lim: number): Promise<any> => {
-      const ref = await this.getFileLocation(messageId, false, expectedFileId);
+      const ref = resolvedRef ?? await this.getFileLocation(messageId, false, expectedFileId);
       try {
         return await this.getFileFrom(
           new Api.upload.GetFile({ location: toLocation(ref), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
@@ -1143,7 +1304,9 @@ export class TelegramClientManager {
       } catch (err: any) {
         if (/FILE_REFERENCE_EXPIRED/i.test(err?.message || '')) {
           console.warn('[ChunkByOffset] File reference expired, refreshing for message', messageId);
-          const fresh = await this.getFileLocation(messageId, true, expectedFileId);
+          const fresh = refreshResolvedRef
+            ? await refreshResolvedRef()
+            : await this.getFileLocation(messageId, true, expectedFileId);
           return await this.getFileFrom(
             new Api.upload.GetFile({ location: toLocation(fresh), offset: BigInt(off) as any, limit: lim, precise: true, cdnSupported: true }),
             fresh,
@@ -1260,25 +1423,35 @@ export class TelegramClientManager {
     }
   }
 
-  /**
-   * Forward one message into Saved Messages and return the new message.
-   *
-   * ponytail: one message per call, paced by messageRateLimiter (~3/s). Telegram
-   * accepts up to 100 ids per forwardMessages call, which would be ~100x faster;
-   * the upgrade path is batching and matching the returned messages back to
-   * their sources by media id, since the API gives no explicit mapping.
-   */
-  async forwardToSaved(entity: any, messageId: number): Promise<Api.Message> {
+  /** Forward one message to an explicit frozen target using the persisted random id. */
+  async forwardToTarget(
+    entity: any,
+    messageId: number,
+    targetPeer: any,
+    randomId: string,
+  ): Promise<TargetAwareSendResult> {
     await this.waitUntilReady();
     if (!this.client) throw new Error('Client not initialized');
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.messageRateLimiter.wait();
-        const result = await this.client.forwardMessages('me', {
+        const result = await this.client.forwardMessages(targetPeer, {
           messages: [messageId],
           fromPeer: entity,
-        });
-        return unwrapForwardedMessage(result, messageId) as Api.Message;
+          randomId: [bigInt(randomId) as any],
+        } as any);
+        const message = unwrapForwardedMessage(result, messageId) as Api.Message;
+        const ref = message.media ? readMedia(message.media) : null;
+        if (!ref) throw new Error(`Forwarded message ${message.id} has no readable media (source message ${messageId})`);
+        return {
+          messageId: message.id,
+          mediaKind: ref.kind,
+          mediaId: ref.id,
+          size: ref.size,
+          accessHash: ref.accessHash ? String(ref.accessHash) : undefined,
+          photoVariant: ref.kind === 'photo' ? ref.fullThumbSize : undefined,
+          message,
+        };
       } catch (err: any) {
         if (isFloodError(err) && attempt < 2) {
           this.penalizeForFlood('forwardMessages', err);
@@ -1288,6 +1461,17 @@ export class TelegramClientManager {
       }
     }
     throw new Error(`Forward of message ${messageId} failed after retries`);
+  }
+
+  /** Legacy Saved Messages wrapper retained for existing pre-channel call sites. */
+  async forwardToSaved(entity: any, messageId: number): Promise<Api.Message> {
+    const forwarded = await this.forwardToTarget(
+      entity,
+      messageId,
+      'me',
+      String(generateRandomBigInt()),
+    );
+    return forwarded.message;
   }
 
   /**
@@ -1393,6 +1577,8 @@ export class TelegramClientManager {
    * Disconnect and cleanup the Telegram client.
    */
   async disconnect(): Promise<void> {
+    accountActivityRegistry.setAvailability(this.accountId, { online: false, ready: false });
+    this.offline = true;
     if (this.client) {
       await this.client.disconnect();
       this.client = null;
@@ -1414,8 +1600,16 @@ export class TelegramClientManager {
   async connect(): Promise<void> {
     if (this.client && !this.client.connected) {
       console.log('[GramJS] Reconnecting to Telegram...');
-      await this.client.connect();
-      console.log('[GramJS] Reconnected successfully');
+      try {
+        await this.client.connect();
+        this.offline = false;
+        accountActivityRegistry.setAvailability(this.accountId, { online: true, ready: true });
+        console.log('[GramJS] Reconnected successfully');
+      } catch (err) {
+        this.offline = true;
+        accountActivityRegistry.setAvailability(this.accountId, { online: false, ready: false });
+        throw err;
+      }
     }
   }
 
@@ -1476,6 +1670,7 @@ export function adoptClient(
 ): void {
   manager.setAccountIdentity(accountId, accountName);
   clients.set(accountId, manager);
+  accountActivityRegistry.setAvailability(accountId, { online: manager.isConnected(), ready: manager.isConnected() });
 }
 
 /** Primary account's client — login and every non-upload path that doesn't care which account. */
@@ -1614,6 +1809,8 @@ export async function removeAccount(id: number): Promise<void> {
     accounts: loadAccounts().filter((a) => a.id !== id),
   };
   await writeCredentialRecord(credentialCache);
+  uploadSpeedTracker.clearAccount(id);
+  accountActivityRegistry.setAvailability(id, { online: false, ready: false });
   clients.get(id)?.disconnect();
   clients.delete(id);
 }

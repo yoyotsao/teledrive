@@ -1,3 +1,5 @@
+import type { MediaKind } from '../lib/storageLocation.ts';
+
 // Types matching backend FileInfo schema
 export interface FileInfo {
   file_id: string;
@@ -22,6 +24,13 @@ export interface FileInfo {
   file_hash?: string | null;
   /** Linked account whose Saved Messages holds this message — picks the download client. */
   telegram_user_id?: number;
+  /** Physical Telegram location, optional while legacy Saved Messages rows remain readable. */
+  telegram_chat_id?: string | null;
+  telegram_media_kind?: MediaKind | null;
+  telegram_media_id?: string | null;
+  telegram_media_size?: number | null;
+  telegram_photo_variant?: string | null;
+  location_version?: number | null;
 }
 
 export interface FileListResponse {

@@ -51,8 +51,14 @@ async function serveFakeApi(page: Page, drive: FakeDrive): Promise<void> {
     // --- listings ---------------------------------------------------------
     if (method === 'GET' && path === '/files') return json(drive.listFiles(url.searchParams));
     if (method === 'GET' && path === '/folders') return json(drive.listFolders(url.searchParams));
+    if (method === 'GET' && path === '/storage-target') {
+      return json({ storage_mode: 'saved_messages', channel_id: null, channel_title: null, version: 1, accounts_version: 1, verifications: [] });
+    }
     if (method === 'GET' && path === '/accounts') {
-      return json({ accounts: [{ telegram_user_id: ACCOUNT_ID, label: 'test', is_primary: 1, file_count: drive.rows.length }] });
+      return json({ accounts: drive.accounts.map((account) => ({
+        ...account,
+        file_count: account.telegram_user_id === ACCOUNT_ID ? drive.rows.length : account.file_count,
+      })) });
     }
 
     // --- one item ---------------------------------------------------------

@@ -17,8 +17,9 @@
  * upload cap: the wait it demands does not shrink when we send slower, so the
  * pacer's multiplicative rate cut cannot help — and because the cut is
  * persisted, answering a tier cap with a rate cut keeps the account throttled
- * long after Telegram has stopped throttling it. `AdaptiveRateLimiter.pause()`
- * exists precisely for this case, but it was unreachable.
+ * long after Telegram has stopped throttling it. The tagged error routes to
+ * `AdaptiveRateLimiter.reportPremiumFlood()`, which freezes the current pace
+ * before its session-only cautious recovery.
  *
  * `rpcErrorRe` is an exported Map that `RPCMessageToError` iterates on every
  * call, so remapping the PREMIUM pattern to a tagging subclass restores the

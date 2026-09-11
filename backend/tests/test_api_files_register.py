@@ -40,6 +40,56 @@ def test_registering_stores_the_metadata_and_returns_it(client, db, run):
     assert row["access_hash"] == "ah-1"
 
 
+def test_registering_persists_physical_location_wire_fields(client, db, run):
+    """The metadata endpoint must retain the location direct readers resolve."""
+    resp = client.post(
+        "/api/v1/files/register",
+        json=register_payload(
+            telegram_chat_id="1234567890",
+            telegram_media_kind="photo",
+            telegram_media_id="9876543210",
+            telegram_media_size=1234,
+            telegram_photo_variant="w:1280:h:720",
+            location_version=3,
+        ),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["telegram_chat_id"] == "1234567890"
+    assert resp.json()["telegram_media_kind"] == "photo"
+    assert resp.json()["telegram_media_id"] == "9876543210"
+    assert resp.json()["telegram_media_size"] == 1234
+    assert resp.json()["telegram_photo_variant"] == "w:1280:h:720"
+    assert resp.json()["location_version"] == 3
+    row = run(db.get_file("doc1", OWNER_A))
+    assert row["telegram_chat_id"] == "1234567890"
+    assert row["location_version"] == 3
+
+
+def test_reregistering_the_same_file_keeps_its_existing_location(client, db, run):
+    client.post(
+        "/api/v1/files/register",
+        json=register_payload(
+            telegram_chat_id="1234567890",
+            telegram_media_kind="photo",
+            telegram_media_id="9876543210",
+            telegram_media_size=1234,
+            telegram_photo_variant="w:1280:h:720",
+            location_version=3,
+        ),
+    )
+
+    retry = client.post("/api/v1/files/register", json=register_payload(message_id=12))
+
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["telegram_chat_id"] == "1234567890"
+    assert retry.json()["telegram_media_id"] == "9876543210"
+    assert retry.json()["location_version"] == 3
+    row = run(db.get_file("doc1", OWNER_A))
+    assert row["telegram_chat_id"] == "1234567890"
+    assert row["telegram_message_id"] == 11
+
+
 def test_the_file_lands_in_the_requested_folder(client):
     folder = client.post("/api/v1/folders", json={"name": "trip"}).json()
 
@@ -189,6 +239,16 @@ def test_registering_needs_a_token(anon_client, db, run):
 
     assert resp.status_code == 401
     assert run(db.get_file("doc1")) is None
+
+
+def test_operation_register_requires_a_sent_result_and_never_accepts_file_metadata(client):
+    """The journal registration endpoint is a metadata commit, not /files/register v2."""
+    response = client.post(
+        "/api/v1/telegram-operations/unknown/register",
+        json={"filename": "attacker-controlled.bin", "bytes": "forbidden"},
+    )
+
+    assert response.status_code == 404
 
 
 def test_re_registering_one_split_part_is_not_a_conflict(client, db, run):

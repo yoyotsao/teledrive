@@ -1,27 +1,36 @@
 /**
- * Pure helper for reading gramjs's forwardMessages result. Deliberately imports
- * nothing — not even `telegram` — so it can be bundled and run under node by
+ * Pure helpers for reading gramjs's forwardMessages result. Deliberately import
+ * nothing — not even `telegram` — so they can be bundled and run under node by
  * forwardResult.test.ts.
  */
 
 /**
- * Pull the single forwarded message out of what `client.forwardMessages` returns.
+ * Normalize what `client.forwardMessages` returns for one source chat.
  *
- * Its signature says `Promise<Api.Message[]>`, but the implementation pushes ONE
- * ENTRY PER SOURCE CHAT and each entry is itself that chat's array of forwarded
- * messages, so forwarding one message actually yields `[[msg]]`. (The nesting
- * comes from `messages.ForwardMessages` carrying a vector `randomId`, which
- * gramjs auto-fills per id and which sends `_getResponseMessage` down its
- * array-returning branch.) Reading `result[0].id` therefore gets undefined every
- * time — the forward succeeds on Telegram's side and the caller still sees a
- * failure. We accept the flat shape too, so a gramjs release that squares the
- * implementation with the signature doesn't break us back.
+ * GramJS declares `Promise<Api.Message[]>`, but its implementation currently
+ * returns one array per source chat, so forwarding multiple messages from one
+ * chat yields `[[msg1, msg2, ...]]`. We accept both that observed nested shape
+ * and the declared flat shape, then require an exact one-to-one mapping with
+ * the supplied source ids. Missing slots are rejected instead of shifting a
+ * later result onto the wrong migration item.
  */
-export function unwrapForwardedMessage(result: unknown, messageId: number): any {
+export function unwrapForwardedMessages(result: unknown, sourceMessageIds: readonly number[]): any[] {
   const first = Array.isArray(result) ? result[0] : undefined;
-  const forwarded = Array.isArray(first) ? first[0] : first;
-  if (!forwarded?.id) {
-    throw new Error(`Forward of message ${messageId} returned no message`);
+  const forwarded = Array.isArray(first) ? first : (Array.isArray(result) ? result : []);
+  if (forwarded.length !== sourceMessageIds.length) {
+    throw new Error(
+      `Forward result count mismatch: expected ${sourceMessageIds.length}, got ${forwarded.length}`,
+    );
   }
-  return forwarded;
+  return forwarded.map((message, index) => {
+    if (!message?.id) {
+      throw new Error(`Forward of message ${sourceMessageIds[index]} returned no message`);
+    }
+    return message;
+  });
+}
+
+/** Pull one forwarded message while retaining the legacy single-message API. */
+export function unwrapForwardedMessage(result: unknown, messageId: number): any {
+  return unwrapForwardedMessages(result, [messageId])[0];
 }

@@ -32,5 +32,12 @@ export function unwrapForwardedMessages(result: unknown, sourceMessageIds: reado
 
 /** Pull one forwarded message while retaining the legacy single-message API. */
 export function unwrapForwardedMessage(result: unknown, messageId: number): any {
-  return unwrapForwardedMessages(result, [messageId])[0];
+  try {
+    return unwrapForwardedMessages(result, [messageId])[0];
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Forward result count mismatch:')) {
+      throw new Error(`Forward of message ${messageId} returned no message`);
+    }
+    throw error;
+  }
 }

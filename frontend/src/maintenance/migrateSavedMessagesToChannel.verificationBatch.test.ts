@@ -50,9 +50,11 @@ vi.mock('../api/client.ts', () => ({
         result_version: request.evidence.result_version,
       });
       item.state = item.evidence.length >= 2 ? 'verified' : 'pending_quorum';
+      state.summary = { ...state.summary, version: state.summary.version + 1 };
       return item;
     }),
     commitMigrationGroup: vi.fn(async (request: any) => {
+      if (request.expectedJobVersion !== state.summary.version) throw new Error('job version conflict');
       const group = findGroup(request.groupId);
       for (const item of group.items) {
         item.version += 1;
@@ -111,6 +113,7 @@ vi.mock('../lib/channelStorage.ts', () => ({
 vi.mock('../lib/telegramMedia.ts', () => ({ readMedia: vi.fn((media: any) => media?.__ref ?? null) }));
 vi.mock('../lib/telegramOperationRecovery.ts', () => ({ RecoveryCursorStore: class { async save() {} } }));
 
+import { api } from '../api/client.ts';
 import { runMigrationJob } from './migrateSavedMessagesToChannel.ts';
 
 function resetMigration(count: number) {
@@ -195,8 +198,24 @@ function resetMigration(count: number) {
   };
 }
 
+function collapseIntoSingleSplitGroup() {
+  const items = state.groups.flatMap((group) => group.items);
+  for (const [index, item] of items.entries()) {
+    item.group_id = 'split-group';
+    item.part_index = index;
+    const operation = state.operations.get(item.operation_id);
+    operation.group_id = 'split-group';
+    operation.part_index = index;
+  }
+  state.groups = [{ group_id: 'split-group', items }];
+  state.summary = { ...state.summary, total_groups: 1 };
+}
+
 describe('batched migration verification', () => {
-  beforeEach(() => resetMigration(0));
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetMigration(0);
+  });
 
   it('verifies 100 destinations with one Telegram read per reader plus one batched source probe', async () => {
     resetMigration(100);
@@ -211,5 +230,18 @@ describe('batched migration verification', () => {
     expect(source?.ids).toHaveLength(100);
     expect(reader42?.ids).toHaveLength(100);
     expect(reader77?.ids).toHaveLength(100);
+    expect(vi.mocked(api.getMigrationJob)).toHaveBeenCalledTimes(3);
+  });
+
+  it('chunks verification reads when one split group contains more than 100 parts', async () => {
+    resetMigration(101);
+    collapseIntoSingleSplitGroup();
+
+    const result = await runMigrationJob('migration-verify-batch');
+
+    expect(result.state).toBe('completed');
+    expect(state.getMessagesCalls).toHaveLength(6);
+    expect(state.getMessagesCalls.every((call) => call.ids.length <= 100)).toBe(true);
+    expect(state.getMessagesCalls.reduce((total, call) => total + call.ids.length, 0)).toBe(303);
   });
 });

@@ -42,11 +42,20 @@ type MigrationTelegramHook = {
     accountId: number;
     sourceMessageId: number;
   }): Promise<{ ok: boolean }>;
+  readSourceBatch?(params: {
+    accountId: number;
+    sourceMessageIds: number[];
+  }): Promise<Array<{ ok: boolean }>>;
   verifyReader(params: {
     accountId: number;
     targetChannelId: string;
     messageId: number;
   }): Promise<MigrationMediaResult | null>;
+  verifyReaderBatch?(params: {
+    accountId: number;
+    targetChannelId: string;
+    messageIds: number[];
+  }): Promise<Array<MigrationMediaResult | null>>;
 };
 
 export type MigrationRunProgress = {
@@ -132,21 +141,9 @@ async function productionForward(
   return (await productionForwardBatch(accountId, targetChannelId, [{ sourceMessageId, randomId }]))[0];
 }
 
-async function productionReadDestination(
-  accountId: number,
-  targetChannelId: string,
-  messageId?: number | null,
-): Promise<MigrationMediaResult | null> {
-  if (!messageId) return null;
-  const manager = getClientFor(accountId);
-  if (manager.offline) return null;
-  const peer = await resolveChannelPeerForAccount(manager as any, targetChannelId);
-  const raw = (manager as any).client;
-  if (!peer || !raw) return null;
-  const messages = await raw.getMessages(peer, { ids: [messageId] });
-  const message = messages?.[0];
+function migrationMediaResult(message: any): MigrationMediaResult | null {
   const media = message?.media ? readMedia(message.media) : null;
-  if (!media) return null;
+  if (!message?.id || !media) return null;
   return {
     messageId: message.id,
     mediaKind: media.kind,
@@ -156,13 +153,69 @@ async function productionReadDestination(
   };
 }
 
-async function productionReadSource(accountId: number, sourceMessageId: number): Promise<{ ok: boolean }> {
+async function productionReadDestinationBatch(
+  accountId: number,
+  targetChannelId: string,
+  messageIds: number[],
+): Promise<Array<MigrationMediaResult | null>> {
+  if (messageIds.length === 0) return [];
   const manager = getClientFor(accountId);
-  if (manager.offline) return { ok: false };
+  if (manager.offline) return messageIds.map(() => null);
+  const peer = await resolveChannelPeerForAccount(manager as any, targetChannelId);
   const raw = (manager as any).client;
-  if (!raw) return { ok: false };
-  const messages = await raw.getMessages('me', { ids: [sourceMessageId] });
-  return { ok: Boolean(messages?.[0]?.media && readMedia(messages[0].media)) };
+  if (!peer || !raw) return messageIds.map(() => null);
+  const messages = await raw.getMessages(peer, { ids: messageIds });
+  const byId = new Map<number, any>();
+  for (const message of messages ?? []) {
+    if (message?.id != null) byId.set(Number(message.id), message);
+  }
+  return messageIds.map((messageId) => migrationMediaResult(byId.get(messageId)));
+}
+
+async function productionReadDestination(
+  accountId: number,
+  targetChannelId: string,
+  messageId?: number | null,
+): Promise<MigrationMediaResult | null> {
+  if (!messageId) return null;
+  return (await productionReadDestinationBatch(accountId, targetChannelId, [messageId]))[0];
+}
+
+async function productionReadSourceBatch(
+  accountId: number,
+  sourceMessageIds: number[],
+): Promise<Array<{ ok: boolean }>> {
+  if (sourceMessageIds.length === 0) return [];
+  const manager = getClientFor(accountId);
+  if (manager.offline) return sourceMessageIds.map(() => ({ ok: false }));
+  const raw = (manager as any).client;
+  if (!raw) return sourceMessageIds.map(() => ({ ok: false }));
+  const messages = await raw.getMessages('me', { ids: sourceMessageIds });
+  const byId = new Map<number, any>();
+  for (const message of messages ?? []) {
+    if (message?.id != null) byId.set(Number(message.id), message);
+  }
+  return sourceMessageIds.map((messageId) => {
+    const message = byId.get(messageId);
+    return { ok: Boolean(message?.media && readMedia(message.media)) };
+  });
+}
+
+async function productionReadSource(accountId: number, sourceMessageId: number): Promise<{ ok: boolean }> {
+  return (await productionReadSourceBatch(accountId, [sourceMessageId]))[0];
+}
+
+async function productionVerifyReaderBatch(
+  accountId: number,
+  targetChannelId: string,
+  messageIds: number[],
+): Promise<Array<MigrationMediaResult | null>> {
+  if (messageIds.length === 0) return [];
+  const manager = getClientFor(accountId);
+  if (manager.offline) return messageIds.map(() => null);
+  const verification = await validateChannelForAccount(manager as any, targetChannelId);
+  if (!verification.can_read) return messageIds.map(() => null);
+  return productionReadDestinationBatch(accountId, targetChannelId, messageIds);
 }
 
 async function productionVerifyReader(
@@ -170,11 +223,7 @@ async function productionVerifyReader(
   targetChannelId: string,
   messageId: number,
 ): Promise<MigrationMediaResult | null> {
-  const manager = getClientFor(accountId);
-  if (manager.offline) return null;
-  const verification = await validateChannelForAccount(manager as any, targetChannelId);
-  if (!verification.can_read) return null;
-  return productionReadDestination(accountId, targetChannelId, messageId);
+  return (await productionVerifyReaderBatch(accountId, targetChannelId, [messageId]))[0];
 }
 
 type MigrationTelegramAdapter = MigrationTelegramHook & {
@@ -183,6 +232,15 @@ type MigrationTelegramAdapter = MigrationTelegramHook & {
     targetChannelId: string;
     entries: MigrationForwardBatchEntry[];
   }): Promise<MigrationMediaResult[]>;
+  readSourceBatch(params: {
+    accountId: number;
+    sourceMessageIds: number[];
+  }): Promise<Array<{ ok: boolean }>>;
+  verifyReaderBatch(params: {
+    accountId: number;
+    targetChannelId: string;
+    messageIds: number[];
+  }): Promise<Array<MigrationMediaResult | null>>;
 };
 
 function telegramAdapter(): MigrationTelegramAdapter {
@@ -197,6 +255,17 @@ function telegramAdapter(): MigrationTelegramAdapter {
           sourceMessageId: entry.sourceMessageId,
           randomId: entry.randomId,
         })))),
+      readSourceBatch: hook.readSourceBatch ?? (({ accountId, sourceMessageIds }) =>
+        Promise.all(sourceMessageIds.map((sourceMessageId) => hook.readSource({
+          accountId,
+          sourceMessageId,
+        })))),
+      verifyReaderBatch: hook.verifyReaderBatch ?? (({ accountId, targetChannelId, messageIds }) =>
+        Promise.all(messageIds.map((messageId) => hook.verifyReader({
+          accountId,
+          targetChannelId,
+          messageId,
+        })))),
     };
   }
   return {
@@ -207,8 +276,12 @@ function telegramAdapter(): MigrationTelegramAdapter {
     readDestination: ({ accountId, targetChannelId, messageId }) =>
       productionReadDestination(accountId, targetChannelId, messageId),
     readSource: ({ accountId, sourceMessageId }) => productionReadSource(accountId, sourceMessageId),
+    readSourceBatch: ({ accountId, sourceMessageIds }) =>
+      productionReadSourceBatch(accountId, sourceMessageIds),
     verifyReader: ({ accountId, targetChannelId, messageId }) =>
       productionVerifyReader(accountId, targetChannelId, messageId),
+    verifyReaderBatch: ({ accountId, targetChannelId, messageIds }) =>
+      productionVerifyReaderBatch(accountId, targetChannelId, messageIds),
   };
 }
 
@@ -423,47 +496,87 @@ function sameMedia(result: MigrationMediaResult, operation: TelegramOperation): 
     && (result.photoVariant ?? null) === (operation.destination_photo_variant ?? null);
 }
 
-async function collectEvidence(job: StorageMigrationJob, item: StorageMigrationItem): Promise<StorageMigrationItem> {
-  if (!item.operation_id) return item;
-  const operation = await api.getTelegramOperation(item.operation_id);
-  if (operation.result_version == null || operation.destination_message_id == null) return item;
+async function collectEvidenceBatch(
+  job: StorageMigrationJob,
+  items: StorageMigrationItem[],
+): Promise<StorageMigrationItem[]> {
+  if (items.length === 0) return [];
+  const currentByItem = new Map(items.map((item) => [item.item_id, item]));
+  const operations = new Map<string, TelegramOperation>();
+  await Promise.all(items.map(async (item) => {
+    if (!item.operation_id) return;
+    const operation = await api.getTelegramOperation(item.operation_id);
+    if (operation.result_version != null && operation.destination_message_id != null) {
+      operations.set(item.item_id, operation);
+    }
+  }));
+
   const accounts = await api.listAccounts();
   const adapter = telegramAdapter();
-  let current = item;
-
   for (const account of accounts) {
-    if (current.evidence.some(row => row.telegram_user_id === account.telegram_user_id
-      && row.result_version === operation.result_version)) continue;
-    const result = await adapter.verifyReader({
+    const candidates = items.flatMap((original) => {
+      const current = currentByItem.get(original.item_id) ?? original;
+      const operation = operations.get(original.item_id);
+      if (!operation) return [];
+      if (current.evidence.some((row) => row.telegram_user_id === account.telegram_user_id
+        && row.result_version === operation.result_version)) return [];
+      return [{ item: current, operation }];
+    });
+    if (candidates.length === 0) continue;
+
+    const results = await adapter.verifyReaderBatch({
       accountId: account.telegram_user_id,
       targetChannelId: job.target_channel_id,
-      messageId: operation.destination_message_id,
+      messageIds: candidates.map(({ operation }) => operation.destination_message_id!),
     });
-    if (!result || !sameMedia(result, operation)) continue;
-    const sourceAccount = sourceNumber(item, 'telegram_user_id');
-    const sourceProbe = account.telegram_user_id === sourceAccount
-      ? await adapter.readSource({ accountId: sourceAccount, sourceMessageId: sourceNumber(item, 'telegram_message_id') })
-      : { ok: false };
-    current = await api.putMigrationEvidence({
-      migrationId: job.migration_id,
-      itemId: item.item_id,
-      telegramUserId: account.telegram_user_id,
-      evidence: {
-        expected_item_version: current.version,
-        result_version: operation.result_version,
-        target_channel_id: job.target_channel_id,
-        destination_message_id: operation.destination_message_id,
-        media_kind: operation.destination_media_kind as 'document' | 'photo',
-        media_id: operation.destination_media_id!,
-        size_bytes: operation.destination_size!,
-        photo_variant: result.photoVariant ?? null,
-        read_probe_ok: true,
-        checked_at: new Date().toISOString(),
-        source_read_probe_ok: sourceProbe.ok,
-      },
-    });
+    if (results.length !== candidates.length) {
+      throw new Error(`Migration verification result count mismatch: expected ${candidates.length}, got ${results.length}`);
+    }
+
+    const sourceCandidates = candidates.filter(({ item }) =>
+      sourceNumber(item, 'telegram_user_id') === account.telegram_user_id);
+    const sourceResults = sourceCandidates.length > 0
+      ? await adapter.readSourceBatch({
+        accountId: account.telegram_user_id,
+        sourceMessageIds: sourceCandidates.map(({ item }) => sourceNumber(item, 'telegram_message_id')),
+      })
+      : [];
+    if (sourceResults.length !== sourceCandidates.length) {
+      throw new Error(`Migration source verification result count mismatch: expected ${sourceCandidates.length}, got ${sourceResults.length}`);
+    }
+    const sourceOk = new Map(sourceCandidates.map(({ item }, index) => [
+      item.item_id,
+      sourceResults[index]?.ok === true,
+    ]));
+
+    for (let index = 0; index < candidates.length; index++) {
+      const { item: original, operation } = candidates[index];
+      const result = results[index];
+      if (!result || !sameMedia(result, operation)) continue;
+      const current = currentByItem.get(original.item_id) ?? original;
+      const updated = await api.putMigrationEvidence({
+        migrationId: job.migration_id,
+        itemId: current.item_id,
+        telegramUserId: account.telegram_user_id,
+        evidence: {
+          expected_item_version: current.version,
+          result_version: operation.result_version!,
+          target_channel_id: job.target_channel_id,
+          destination_message_id: operation.destination_message_id!,
+          media_kind: operation.destination_media_kind as 'document' | 'photo',
+          media_id: operation.destination_media_id!,
+          size_bytes: operation.destination_size!,
+          photo_variant: result.photoVariant ?? null,
+          read_probe_ok: true,
+          checked_at: new Date().toISOString(),
+          source_read_probe_ok: sourceOk.get(current.item_id) ?? false,
+        },
+      });
+      currentByItem.set(updated.item_id, updated);
+    }
   }
-  return current;
+
+  return items.map((item) => currentByItem.get(item.item_id) ?? item);
 }
 
 async function processItem(
@@ -487,9 +600,6 @@ async function processItem(
       // Sending/recovering may safely replay the same persisted random id only.
       current = await forwardItem(job, item, leaseOwner);
     }
-  }
-  if (['forwarded', 'pending_quorum', 'verified'].includes(current.state)) {
-    current = await collectEvidence(job, current);
   }
   return current;
 }
@@ -598,15 +708,11 @@ export async function runMigrationJob(
       }
       if (control.pauseRequested) break;
 
-      for (const group of claimedGroups) {
-        for (const original of group.items) {
-          let current = currentByItem.get(original.item_id) ?? original;
-          if (['forwarded', 'pending_quorum', 'verified'].includes(current.state)) {
-            current = await collectEvidence(job, current);
-            currentByItem.set(current.item_id, current);
-          }
-        }
-      }
+      const evidenceCandidates = claimedGroups
+        .flatMap((group) => group.items.map((item) => currentByItem.get(item.item_id) ?? item))
+        .filter((item) => ['forwarded', 'pending_quorum', 'verified'].includes(item.state));
+      const evidenced = await collectEvidenceBatch(job, evidenceCandidates);
+      evidenced.forEach((item) => currentByItem.set(item.item_id, item));
 
       for (const group of claimedGroups) {
         const processed = group.items.map((item) => currentByItem.get(item.item_id) ?? item);

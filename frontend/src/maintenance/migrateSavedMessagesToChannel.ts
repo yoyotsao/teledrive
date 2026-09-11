@@ -85,6 +85,33 @@ function isConflict(error: unknown): boolean {
   return Number((error as any)?.response?.status) === 409;
 }
 
+class MigrationForwardBatchError extends Error {
+  constructor(readonly original: unknown) {
+    super((original as Error)?.message ?? String(original));
+    this.name = 'MigrationForwardBatchError';
+  }
+}
+
+function forwardErrorText(error: unknown): string {
+  const value = error as any;
+  return [value?.errorMessage, value?.message, value?.response?.data?.detail]
+    .filter(Boolean)
+    .join(' ');
+}
+
+function transientForwardLeaseSeconds(error: unknown): number | null {
+  const value = error as any;
+  const text = forwardErrorText(error);
+  if (text.includes('WORKER_BUSY_TOO_LONG_RETRY')) return 15;
+  if (text.includes('FLOOD')) {
+    const seconds = Number(value?.seconds);
+    return Number.isFinite(seconds) && seconds > 0 ? Math.min(300, Math.max(1, Math.ceil(seconds))) : 30;
+  }
+  const status = Number(value?.response?.status);
+  if ((status >= 500 && status < 600) || /(^|\D)5\d\d(?=\D|$)/.test(text)) return 10;
+  return null;
+}
+
 function sourceNumber(item: StorageMigrationItem, key: string): number {
   const value = item.source_location[key];
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -400,14 +427,19 @@ async function sendPreparedBatch(
   if (prepared.some((entry) => entry.sourceAccountId !== sourceAccountId)) {
     throw new Error('Migration forward batch may not mix source accounts');
   }
-  const results = await telegramAdapter().forwardBatch({
-    accountId: sourceAccountId,
-    targetChannelId: job.target_channel_id,
-    entries: prepared.map((entry) => ({
-      sourceMessageId: entry.sourceMessageId,
-      randomId: entry.operation.random_id,
-    })),
-  });
+  let results: MigrationMediaResult[];
+  try {
+    results = await telegramAdapter().forwardBatch({
+      accountId: sourceAccountId,
+      targetChannelId: job.target_channel_id,
+      entries: prepared.map((entry) => ({
+        sourceMessageId: entry.sourceMessageId,
+        randomId: entry.operation.random_id,
+      })),
+    });
+  } catch (error) {
+    throw new MigrationForwardBatchError(error);
+  }
   if (results.length !== prepared.length) {
     throw new Error(`Migration forward result count mismatch: expected ${prepared.length}, got ${results.length}`);
   }
@@ -425,6 +457,47 @@ async function sendPreparedBatch(
     }));
   }
   return reconciled;
+}
+
+async function parkTransientForwardBatch(
+  prepared: PreparedForward[],
+  leaseOwner: string,
+  error: unknown,
+  leaseSeconds: number,
+): Promise<StorageMigrationItem[]> {
+  const detail = forwardErrorText(error).slice(0, 1024) || 'Transient Telegram forward failure';
+  const parked: StorageMigrationItem[] = [];
+  for (const entry of prepared) {
+    try {
+      await api.patchTelegramOperation(entry.operation.operation_id, {
+        expected_operation_version: entry.operation.version,
+        state: 'retryable',
+        error_code: detail.slice(0, 255),
+      });
+    } catch (operationError) {
+      if (!isConflict(operationError)) {
+        console.warn('[Migration] Failed to mark operation retryable:', entry.operation.operation_id, operationError);
+      }
+    }
+    try {
+      parked.push(await api.claimMigrationItem({
+        migrationId: entry.item.migration_id,
+        itemId: entry.item.item_id,
+        expectedVersion: entry.leased.version,
+        leaseOwner,
+        leaseSeconds,
+        operationId: entry.operation.operation_id,
+        state: 'retryable',
+        error: detail,
+      }));
+    } catch (itemError) {
+      if (!isConflict(itemError)) {
+        console.warn('[Migration] Failed to park item after transient forward error:', entry.item.item_id, itemError);
+      }
+      parked.push(entry.leased);
+    }
+  }
+  return parked;
 }
 
 async function recoverWithoutBlindSend(
@@ -669,6 +742,7 @@ export async function runMigrationJob(
 
       const currentByItem = new Map<string, StorageMigrationItem>();
       const prepared: PreparedForward[] = [];
+      const skippedGroupIds = new Set<string>();
 
       for (const group of claimedGroups) {
         for (const item of group.items) {
@@ -701,8 +775,24 @@ export async function runMigrationJob(
         for (let offset = 0; offset < entries.length; offset += FORWARD_BATCH_SIZE) {
           if (control.pauseRequested) break;
           const chunk = entries.slice(offset, offset + FORWARD_BATCH_SIZE);
-          const reconciled = await sendPreparedBatch(job, chunk);
-          reconciled.forEach((item) => currentByItem.set(item.item_id, item));
+          try {
+            const reconciled = await sendPreparedBatch(job, chunk);
+            reconciled.forEach((item) => currentByItem.set(item.item_id, item));
+          } catch (error) {
+            if (!(error instanceof MigrationForwardBatchError)) throw error;
+            const leaseSeconds = transientForwardLeaseSeconds(error.original);
+            if (leaseSeconds == null) throw error.original;
+            const parked = await parkTransientForwardBatch(chunk, control.runId, error.original, leaseSeconds);
+            parked.forEach((item) => currentByItem.set(item.item_id, item));
+            chunk.forEach((entry) => skippedGroupIds.add(entry.item.group_id));
+            onProgress?.({
+              phase: 'running',
+              currentGroupId: chunk[0]?.item.group_id,
+              currentSourceAccount: chunk[0]?.sourceAccountId,
+              lastError: `Skipped transient forward batch (${chunk.length} items): ${forwardErrorText(error.original)}`,
+            });
+            console.warn(`[Migration] Skipped transient forward batch x${chunk.length}; retry in ~${leaseSeconds}s`, error.original);
+          }
         }
         if (control.pauseRequested) break;
       }
@@ -715,6 +805,7 @@ export async function runMigrationJob(
       evidenced.forEach((item) => currentByItem.set(item.item_id, item));
 
       for (const group of claimedGroups) {
+        if (skippedGroupIds.has(group.group_id)) continue;
         const processed = group.items.map((item) => currentByItem.get(item.item_id) ?? item);
         if (processed.length > 0 && processed.every((item) => item.state === 'verified')) {
           job = await api.getMigrationJob(jobId);

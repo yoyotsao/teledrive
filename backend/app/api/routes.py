@@ -2,7 +2,17 @@ from fastapi import APIRouter, HTTPException, Query, Depends, Header
 from fastapi.responses import JSONResponse
 from typing import Annotated, Optional, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
-from app.models.schemas import FileListResponse, FileInfo
+from app.models.schemas import (
+    FileListResponse,
+    FileInfo,
+    FileLocationGroupSwitchRequest,
+    FileLocationSwitchRequest,
+    ReconcileTelegramOperationResultRequest,
+    StorageTargetPutRequest,
+    StorageTargetResponse,
+    TelegramOperationCreateRequest,
+    TelegramOperationPatchRequest,
+)
 from app.services import get_file_service
 from app.services.database import get_database
 from app.auth import get_current_user, create_jwt, refresh_jwt
@@ -60,6 +70,12 @@ class RegisterFileRequest(BaseModel):
     split_group_id: Optional[str] = Field(None, max_length=512)
     file_hash: Optional[str] = Field(None, pattern=FILE_HASH_PATTERN)
     telegram_user_id: Optional[int] = Field(None, gt=0)
+    telegram_chat_id: Optional[str] = Field(None, max_length=32)
+    telegram_media_kind: Optional[Literal["document", "photo"]] = None
+    telegram_media_id: Optional[str] = Field(None, max_length=64)
+    telegram_media_size: Optional[int] = Field(None, ge=0)
+    telegram_photo_variant: Optional[str] = Field(None, max_length=255)
+    location_version: int = Field(0, ge=0)
 
     @field_validator("filename")
     @classmethod
@@ -106,6 +122,15 @@ class ChallengeResponse(BaseModel):
 
 class VerifyRequest(BaseModel):
     nonce: str = Field(..., min_length=1, max_length=128)
+
+
+def _operation_error(exc: Exception) -> HTTPException:
+    """Map metadata journal failures without leaking another drive's records."""
+    if isinstance(exc, (KeyError, PermissionError)):
+        return HTTPException(status_code=404, detail="Telegram operation or file not found")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/auth/challenge", response_model=ChallengeResponse)
@@ -174,6 +199,164 @@ async def list_accounts(current_user: int = Depends(get_current_user)):
     return {"accounts": await db.list_linked_accounts(current_user)}
 
 
+@router.get("/storage-target", response_model=StorageTargetResponse)
+async def get_storage_target(current_user: int = Depends(get_current_user)):
+    """Return this owner's saved channel selection and historical enable audit."""
+    db = await get_database()
+    return await db.get_storage_target(current_user)
+
+
+@router.put("/storage-target", response_model=StorageTargetResponse)
+async def put_storage_target(
+    request: StorageTargetPutRequest,
+    current_user: int = Depends(get_current_user),
+):
+    """Persist a CAS-protected channel selection after a fresh browser audit."""
+    db = await get_database()
+    verifications = [
+        {
+            **verification.model_dump(mode="json"),
+            "channel_id": request.channel_id,
+            "accounts_version": request.expected_accounts_version,
+        }
+        for verification in request.verifications
+    ]
+    try:
+        target = await db.put_storage_target(
+            current_user,
+            {
+                "storage_mode": request.storage_mode,
+                "channel_id": request.channel_id,
+                "channel_title": request.channel_title,
+            },
+            request.expected_version,
+            request.expected_accounts_version,
+            verifications,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if target is None:
+        raise HTTPException(status_code=409, detail="Storage target changed; refresh and try again")
+    return target
+
+
+@router.post("/telegram-operations")
+async def create_telegram_operation(request: TelegramOperationCreateRequest, current_user: int = Depends(get_current_user)):
+    """Durably record browser-owned Telegram intent before any browser RPC."""
+    db = await get_database()
+    try:
+        operation = await db.create_or_get_telegram_operation(current_user, request.model_dump())
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+    if operation is None:
+        raise HTTPException(status_code=409, detail="Storage target or accounts version changed")
+    return operation
+
+
+@router.get("/telegram-operations")
+async def list_telegram_operations(include_terminal: bool = Query(False), current_user: int = Depends(get_current_user)):
+    db = await get_database()
+    return {"operations": await db.list_telegram_operations(current_user, include_terminal)}
+
+
+@router.get("/telegram-operations/{operation_id}")
+async def get_telegram_operation(operation_id: str, current_user: int = Depends(get_current_user)):
+    db = await get_database()
+    operation = await db.get_telegram_operation(current_user, operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Telegram operation not found")
+    return operation
+
+
+@router.patch("/telegram-operations/{operation_id}")
+async def patch_telegram_operation(
+    operation_id: str, request: TelegramOperationPatchRequest, current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        if request.mapping is not None:
+            operation = await db.record_operation_mapping(
+                current_user, operation_id, request.expected_operation_version,
+                request.mapping, request.media_identity,
+            )
+        else:
+            operation = await db.transition_telegram_operation(
+                current_user, operation_id, request.expected_operation_version, request.state,
+                retry_at=request.retry_at, error_code=request.error_code,
+                tombstone_reason=request.tombstone_reason,
+            )
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+    if operation is None:
+        raise HTTPException(status_code=409, detail="Telegram operation version conflict")
+    return operation
+
+
+@router.post("/telegram-operations/{operation_id}/reconcile-result")
+async def reconcile_telegram_operation_result(
+    operation_id: str, request: ReconcileTelegramOperationResultRequest,
+    current_user: int = Depends(get_current_user),
+):
+    """Persist a browser-read result; this endpoint never contacts Telegram."""
+    db = await get_database()
+    try:
+        operation = await db.complete_operation_result(
+            current_user, operation_id, request.expected_operation_version,
+            request.mapping, request.media_identity,
+        )
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+    if operation is None:
+        raise HTTPException(status_code=409, detail="Telegram operation version conflict")
+    return operation
+
+
+@router.post("/telegram-operations/{operation_id}/register")
+async def register_telegram_operation(operation_id: str, current_user: int = Depends(get_current_user)):
+    db = await get_database()
+    try:
+        return await db.register_telegram_operation(current_user, operation_id)
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+
+
+@router.post("/telegram-operation-groups/{group_id}/register")
+async def register_telegram_operation_group(group_id: str, current_user: int = Depends(get_current_user)):
+    db = await get_database()
+    try:
+        return {"bindings": await db.register_telegram_operation_group(current_user, group_id)}
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+
+
+@router.post("/file-locations/{file_id}/switch")
+async def switch_file_location(
+    file_id: str, request: FileLocationSwitchRequest, current_user: int = Depends(get_current_user),
+):
+    """Atomically update only one existing row's physical Telegram location."""
+    db = await get_database()
+    try:
+        return await db.switch_existing_file_location(
+            current_user, file_id, request.expected_location_version,
+            request.operation_id, request.result_version,
+        )
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+
+
+@router.post("/file-location-groups/switch")
+async def switch_file_location_group(
+    request: FileLocationGroupSwitchRequest, current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return {"bindings": await db.switch_existing_file_location_group(
+            current_user, [part.model_dump() for part in request.parts]
+        )}
+    except Exception as exc:
+        raise _operation_error(exc) from exc
+
+
 @router.post("/accounts/challenge", response_model=ChallengeResponse)
 async def account_challenge(current_user: int = Depends(get_current_user)):
     """Same one-time nonce flow as login — the account to be linked DMs it to the bot."""
@@ -234,7 +417,11 @@ async def unlink_account(tg_user_id: int, current_user: int = Depends(get_curren
             detail=f"This account still stores {file_count} file(s); they would become undownloadable",
         )
 
-    await db.unlink_account(current_user, tg_user_id)
+    if not await db.unlink_account(current_user, tg_user_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Account still has storage dependencies; refresh and try again",
+        )
     return {"message": "Account unlinked", "telegram_user_id": tg_user_id}
 
 
@@ -313,6 +500,12 @@ async def register_file(
             owner_id=current_user,
             telegram_user_id=storage_account,
             file_hash=request.file_hash,
+            telegram_chat_id=request.telegram_chat_id,
+            telegram_media_kind=request.telegram_media_kind,
+            telegram_media_id=request.telegram_media_id,
+            telegram_media_size=request.telegram_media_size,
+            telegram_photo_variant=request.telegram_photo_variant,
+            location_version=request.location_version,
         )
         return file_info
     except ValueError as e:

@@ -3,9 +3,37 @@
 The walls here are the same ones test_linked_accounts.py pins at the database
 layer; this file proves the HTTP endpoints actually enforce them.
 """
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
 from conftest import OWNER_A, OWNER_B
 
 A_SECOND = 3003  # a second Telegram account, not yet linked anywhere
+
+
+def storage_target_payload(*, channel_id="1234567890", version=0, accounts_version=2,
+                           account_ids=(OWNER_A, A_SECOND), checked_at=None):
+    """A fresh, complete browser audit for one owner-scoped channel target."""
+    checked_at = checked_at or datetime.now(timezone.utc).isoformat()
+    return {
+        "storage_mode": "channel",
+        "channel_id": channel_id,
+        "channel_title": "Drive storage",
+        "expected_version": version,
+        "expected_accounts_version": accounts_version,
+        "verifications": [
+            {
+                "telegram_user_id": account_id,
+                "channel_title": "Drive storage",
+                "can_read": True,
+                "can_write": True,
+                "status": "verified",
+                "checked_at": checked_at,
+            }
+            for account_id in account_ids
+        ],
+    }
 
 
 def test_accounts_lists_only_this_drives_accounts(client, db, run):
@@ -118,3 +146,103 @@ def test_an_empty_secondary_account_unlinks_cleanly(client, db, run):
 
     assert resp.status_code == 200
     assert run(db.get_owner_of(A_SECOND)) is None
+
+
+def test_storage_target_saves_a_fresh_complete_audit(client, db, run):
+    run(db.link_account(OWNER_A, OWNER_A, is_primary=True))
+    run(db.link_account(OWNER_A, A_SECOND))
+    payload = storage_target_payload()
+
+    resp = client.put("/api/v1/storage-target", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    result = resp.json()
+    assert {key: result[key] for key in (
+        "storage_mode", "channel_id", "channel_title", "version", "accounts_version",
+    )} == {
+        "storage_mode": "channel", "channel_id": "1234567890",
+        "channel_title": "Drive storage", "version": 1, "accounts_version": 2,
+    }
+    expected_verifications = [
+        {
+            "telegram_user_id": OWNER_A,
+            "channel_id": "1234567890",
+            "channel_title": "Drive storage",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": None,
+            "accounts_version": 2,
+        },
+        {
+            "telegram_user_id": A_SECOND,
+            "channel_id": "1234567890",
+            "channel_title": "Drive storage",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": None,
+            "accounts_version": 2,
+        },
+    ]
+    for index, verification in enumerate(result["verifications"]):
+        assert datetime.fromisoformat(verification["checked_at"].replace("Z", "+00:00")) == (
+            datetime.fromisoformat(payload["verifications"][index]["checked_at"])
+        )
+        verification["checked_at"] = None
+    assert result["verifications"] == expected_verifications
+
+
+def test_storage_target_rejects_a_stale_target_version(client, db, run):
+    run(db.link_account(OWNER_A, OWNER_A, is_primary=True))
+    run(db.link_account(OWNER_A, A_SECOND))
+    payload = storage_target_payload()
+
+    assert client.put("/api/v1/storage-target", json=payload).status_code == 200
+    assert client.put("/api/v1/storage-target", json=payload).status_code == 409
+
+
+def test_storage_target_rejects_a_stale_accounts_version(client, db, run):
+    run(db.link_account(OWNER_A, OWNER_A, is_primary=True))
+    payload = storage_target_payload(accounts_version=1, account_ids=(OWNER_A, A_SECOND))
+    run(db.link_account(OWNER_A, A_SECOND))
+
+    resp = client.put("/api/v1/storage-target", json=payload)
+
+    assert resp.status_code == 409
+
+
+@pytest.mark.parametrize("account_ids", [(A_SECOND,), (OWNER_A,)])
+def test_storage_target_requires_every_current_linked_account(client, db, run, account_ids):
+    run(db.link_account(OWNER_A, OWNER_A, is_primary=True))
+    run(db.link_account(OWNER_A, A_SECOND))
+
+    resp = client.put(
+        "/api/v1/storage-target",
+        json=storage_target_payload(account_ids=account_ids),
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("offset", [timedelta(minutes=1), timedelta(seconds=-301)])
+def test_storage_target_requires_a_nonexpired_nonfuture_audit(client, db, run, offset):
+    run(db.link_account(OWNER_A, OWNER_A, is_primary=True))
+    run(db.link_account(OWNER_A, A_SECOND))
+
+    resp = client.put(
+        "/api/v1/storage-target",
+        json=storage_target_payload(checked_at=(datetime.now(timezone.utc) + offset).isoformat()),
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("channel_id", ["0", "01", "997852516353", "-1001234567890"])
+def test_storage_target_rejects_noncanonical_channel_ids(client, db, run, channel_id):
+    run(db.link_account(OWNER_A, OWNER_A, is_primary=True))
+    run(db.link_account(OWNER_A, A_SECOND))
+
+    resp = client.put("/api/v1/storage-target", json=storage_target_payload(channel_id=channel_id))
+
+    assert resp.status_code == 422

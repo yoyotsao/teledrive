@@ -6,6 +6,7 @@ runtime, so an endpoint added without an auth dependency fails this file even
 though nobody wrote a test for it.
 """
 import inspect
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import params
@@ -24,6 +25,20 @@ PROTECTED = [
     ("/api/v1/accounts/challenge", "POST", "/api/v1/accounts/challenge", None),
     ("/api/v1/accounts/verify", "POST", "/api/v1/accounts/verify", {"nonce": "x"}),
     ("/api/v1/accounts/{tg_user_id}", "DELETE", "/api/v1/accounts/123", None),
+    ("/api/v1/storage-target", "GET", "/api/v1/storage-target", None),
+    ("/api/v1/storage-target", "PUT", "/api/v1/storage-target", {
+        "storage_mode": "channel", "channel_id": "1234567890",
+        "expected_version": 0, "expected_accounts_version": 0, "verifications": [],
+    }),
+    ("/api/v1/telegram-operations", "GET", "/api/v1/telegram-operations", None),
+    ("/api/v1/telegram-operations", "POST", "/api/v1/telegram-operations", {}),
+    ("/api/v1/telegram-operations/{operation_id}", "GET", "/api/v1/telegram-operations/op", None),
+    ("/api/v1/telegram-operations/{operation_id}", "PATCH", "/api/v1/telegram-operations/op", {}),
+    ("/api/v1/telegram-operations/{operation_id}/reconcile-result", "POST", "/api/v1/telegram-operations/op/reconcile-result", {}),
+    ("/api/v1/telegram-operations/{operation_id}/register", "POST", "/api/v1/telegram-operations/op/register", None),
+    ("/api/v1/telegram-operation-groups/{group_id}/register", "POST", "/api/v1/telegram-operation-groups/group/register", None),
+    ("/api/v1/file-locations/{file_id}/switch", "POST", "/api/v1/file-locations/file/switch", {}),
+    ("/api/v1/file-location-groups/switch", "POST", "/api/v1/file-location-groups/switch", {}),
     ("/api/v1/files/check-hash", "GET", "/api/v1/files/check-hash?hash=" + "a" * 64, None),
     ("/api/v1/files/check-hashes", "POST", "/api/v1/files/check-hashes", {"hashes": []}),
     ("/api/v1/files/register", "POST", "/api/v1/files/register", {
@@ -91,6 +106,44 @@ def test_a_valid_token_still_stops_at_the_drive_boundary(client, make_file, meth
 
     assert resp.status_code == 404, "%s %s answered %d" % (method, path, resp.status_code)
     assert "theirs.txt" not in resp.text
+
+
+def test_storage_target_is_scoped_to_the_authenticated_owner(client, other_client, db, run):
+    """A signed-in drive can only read and replace its own target row."""
+    run(db.link_account(OWNER_B, OWNER_B, is_primary=True))
+    saved = run(db.put_storage_target(
+        OWNER_B,
+        {"storage_mode": "channel", "channel_id": "1234567890", "channel_title": "B only"},
+        expected_version=0,
+        expected_accounts_version=1,
+        verifications=[{
+            "telegram_user_id": OWNER_B,
+            "channel_id": "1234567890",
+            "channel_title": "B only",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "accounts_version": 1,
+        }],
+    ))
+    assert saved is not None
+
+    run(db.link_account(1001, 1001, is_primary=True))
+    own = client.put("/api/v1/storage-target", json={
+        "storage_mode": "channel", "channel_id": "9876543210",
+        "expected_version": 0, "expected_accounts_version": 1,
+        "verifications": [{
+            "telegram_user_id": 1001, "can_read": True, "can_write": True,
+            "status": "verified", "checked_at": datetime.now(timezone.utc).isoformat(),
+        }],
+    })
+    foreign = other_client.get("/api/v1/storage-target")
+
+    assert own.status_code == 200
+    assert own.json()["channel_id"] == "9876543210"
+    assert foreign.status_code == 200
+    assert foreign.json()["channel_id"] == "1234567890"
 
 
 def _requires_authentication(endpoint) -> bool:

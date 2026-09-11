@@ -133,6 +133,100 @@ export interface ChallengeResponse {
   expires_in: number;
 }
 
+/** Persisted channel selection plus enable-time audit; never runtime authority. */
+export interface StorageTargetResponse {
+  storage_mode: 'saved_messages' | 'channel';
+  channel_id: string | null;
+  channel_title: string | null;
+  version: number;
+  accounts_version: number;
+  verifications: StorageTargetVerification[];
+}
+
+export interface StorageTargetVerification {
+  telegram_user_id: number;
+  channel_id: string;
+  channel_title: string | null;
+  can_read: boolean;
+  can_write: boolean;
+  status: 'verified';
+  checked_at: string;
+  accounts_version: number;
+}
+
+export interface StorageTargetPutRequest {
+  storage_mode: 'saved_messages' | 'channel';
+  channel_id?: string;
+  channel_title?: string;
+  expected_version: number;
+  expected_accounts_version: number;
+  verifications: StorageTargetVerificationRequest[];
+}
+
+/** Durable, metadata-only send intent. Telegram bytes and credentials stay in GramJS. */
+export interface TelegramOperationRequest {
+  operation_id: string;
+  kind: 'upload' | 'chat_import' | 'migration';
+  logical_file_id: string;
+  group_id?: string | null;
+  part_index?: number | null;
+  uploader_id: number;
+  target_kind: 'saved_messages' | 'channel' | '@me';
+  target_channel_id?: string | null;
+  target_peer_key: string;
+  created_target_version: number;
+  created_accounts_version: number;
+  random_id: string;
+  rpc_kind: string;
+  request_metadata: Record<string, unknown>;
+}
+
+export interface TelegramOperation extends TelegramOperationRequest {
+  state: string;
+  version: number;
+  result_version?: number | null;
+  registered_file_id?: string | null;
+  destination_message_id?: number | null;
+  destination_media_kind?: string | null;
+  destination_media_id?: string | null;
+  destination_size?: number | null;
+  destination_access_hash?: string | null;
+}
+
+export interface TelegramOperationPatch {
+  expected_operation_version: number;
+  state?: 'sending' | 'recovering' | 'retryable' | 'uncertain' | 'tombstoned';
+  retry_at?: string;
+  error_code?: string;
+  tombstone_reason?: string;
+  mapping?: Record<string, unknown>;
+  media_identity?: Record<string, unknown>;
+}
+
+export interface FileLocationSwitchBinding {
+  owner_id: number;
+  file_id: string;
+  operation_id: string;
+  result_version: number;
+  location_version: number;
+}
+
+export interface TelegramOperationRegistrationBinding {
+  operation_id: string;
+  owner_id: number;
+  file_id: string;
+}
+
+/** Browser-provided enable-time audit submitted with a storage-target save. */
+export interface StorageTargetVerificationRequest {
+  telegram_user_id: number;
+  channel_title?: string | null;
+  can_read: boolean;
+  can_write: boolean;
+  status: 'verified';
+  checked_at: string;
+}
+
 export const api = {
   reportUploadStatistics: async (report: UploadReport): Promise<UploadReportSendResult> => {
     try {
@@ -177,6 +271,100 @@ export const api = {
 
   unlinkAccount: async (telegramUserId: number): Promise<void> => {
     await client.delete(`/accounts/${telegramUserId}`);
+  },
+
+  getStorageTarget: async (): Promise<StorageTargetResponse> => {
+    const response = await client.get<StorageTargetResponse>('/storage-target');
+    return response.data;
+  },
+
+  putStorageTarget: async (request: StorageTargetPutRequest): Promise<StorageTargetResponse> => {
+    const response = await client.put<StorageTargetResponse>('/storage-target', request);
+    return response.data;
+  },
+
+  createTelegramOperation: async (request: TelegramOperationRequest): Promise<TelegramOperation> => {
+    const response = await client.post<TelegramOperation>('/telegram-operations', request);
+    return response.data;
+  },
+
+  getTelegramOperation: async (operationId: string): Promise<TelegramOperation> => {
+    const response = await client.get<TelegramOperation>(`/telegram-operations/${operationId}`);
+    return response.data;
+  },
+
+  listTelegramOperations: async (includeTerminal = false): Promise<TelegramOperation[]> => {
+    const response = await client.get<{ operations: TelegramOperation[] }>('/telegram-operations', {
+      params: includeTerminal ? { include_terminal: true } : undefined,
+    });
+    return response.data.operations;
+  },
+
+  patchTelegramOperation: async (operationId: string, request: TelegramOperationPatch): Promise<TelegramOperation> => {
+    const response = await client.patch<TelegramOperation>(`/telegram-operations/${operationId}`, request);
+    return response.data;
+  },
+
+  persistReconciledOperationResult: async (params: {
+    operationId: string;
+    expectedOperationVersion: number;
+    mapping: Record<string, unknown>;
+    mediaIdentity: Record<string, unknown>;
+  }): Promise<TelegramOperation> => {
+    const response = await client.post<TelegramOperation>(
+      `/telegram-operations/${params.operationId}/reconcile-result`,
+      {
+        expected_operation_version: params.expectedOperationVersion,
+        mapping: params.mapping,
+        media_identity: params.mediaIdentity,
+      },
+    );
+    return response.data;
+  },
+
+  registerTelegramOperation: async (operationId: string): Promise<TelegramOperationRegistrationBinding> => {
+    const response = await client.post<TelegramOperationRegistrationBinding>(
+      `/telegram-operations/${operationId}/register`,
+    );
+    return response.data;
+  },
+
+  registerTelegramOperationGroup: async (groupId: string): Promise<TelegramOperationRegistrationBinding[]> => {
+    const response = await client.post<{ bindings: TelegramOperationRegistrationBinding[] }>(
+      `/telegram-operation-groups/${groupId}/register`,
+    );
+    return response.data.bindings;
+  },
+
+  switchExistingFileLocation: async (params: {
+    fileId: string;
+    expectedLocationVersion: number;
+    operationId: string;
+    resultVersion: number;
+  }): Promise<FileLocationSwitchBinding> => {
+    const response = await client.post<FileLocationSwitchBinding>(`/file-locations/${params.fileId}/switch`, {
+      expected_location_version: params.expectedLocationVersion,
+      operation_id: params.operationId,
+      result_version: params.resultVersion,
+    });
+    return response.data;
+  },
+
+  switchExistingFileLocationGroup: async (parts: Array<{
+    fileId: string;
+    expectedLocationVersion: number;
+    operationId: string;
+    resultVersion: number;
+  }>): Promise<FileLocationSwitchBinding[]> => {
+    const response = await client.post<{ bindings: FileLocationSwitchBinding[] }>('/file-location-groups/switch', {
+      parts: parts.map((part) => ({
+        file_id: part.fileId,
+        expected_location_version: part.expectedLocationVersion,
+        operation_id: part.operationId,
+        result_version: part.resultVersion,
+      })),
+    });
+    return response.data.bindings;
   },
   listFiles: async (
     page: number = 1,

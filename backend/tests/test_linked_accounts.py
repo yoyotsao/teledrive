@@ -11,6 +11,10 @@ The properties encoded here are security ones, not conveniences:
 These are the database-layer statements of the rules; test_api_accounts.py
 checks that the endpoints actually enforce them.
 """
+from datetime import datetime, timezone
+
+import pytest
+
 from conftest import OWNER_A, OWNER_B
 
 A_SECOND = 3003  # second Telegram account linked to drive A
@@ -58,6 +62,102 @@ async def test_unlink_is_refused_while_the_account_still_stores_files(db, make_f
     assert await db.count_files_on_account(OWNER_A, A_SECOND) == 0
     assert await db.unlink_account(OWNER_A, A_SECOND) is True
     assert await db.get_owner_of(A_SECOND) is None
+
+
+async def test_link_and_unlink_increment_the_owner_accounts_version(db):
+    assert (await db.get_storage_target(OWNER_A))["accounts_version"] == 0
+
+    assert await db.link_account(OWNER_A, OWNER_A, is_primary=True)
+    assert (await db.get_storage_target(OWNER_A))["accounts_version"] == 1
+
+    assert await db.link_account(OWNER_A, A_SECOND)
+    assert (await db.get_storage_target(OWNER_A))["accounts_version"] == 2
+
+    assert await db.unlink_account(OWNER_A, A_SECOND)
+    assert (await db.get_storage_target(OWNER_A))["accounts_version"] == 3
+
+
+async def test_unlink_rejects_trashed_and_split_saved_messages_dependencies(db, make_file):
+    """A trash row or one split part still needs its original Saved Messages account."""
+    await db.link_account(OWNER_A, OWNER_A, is_primary=True)
+    await db.link_account(OWNER_A, A_SECOND)
+    await make_file("trashed", telegram_user_id=A_SECOND, trashed=True)
+    await make_file(
+        "part-0", telegram_user_id=A_SECOND, is_split_file=True,
+        split_group_id="g", part_index=0, total_parts=2,
+    )
+    await make_file(
+        "part-1", telegram_user_id=A_SECOND, is_split_file=True,
+        split_group_id="g", part_index=1, total_parts=2,
+    )
+
+    assert await db.count_files_on_account(OWNER_A, A_SECOND) == 3
+    assert await db.unlink_account(OWNER_A, A_SECOND) is False
+    assert await db.get_owner_of(A_SECOND) == OWNER_A
+
+
+async def test_unlink_allows_historical_channel_uploader_with_another_reader(db, make_file):
+    await db.link_account(OWNER_A, OWNER_A, is_primary=True)
+    await db.link_account(OWNER_A, A_SECOND)
+    await make_file("channel-file", telegram_user_id=A_SECOND)
+    await db._conn.execute(
+        "UPDATE files SET telegram_chat_id = ? WHERE file_id = ?", ("1234567890", "channel-file")
+    )
+    await db._conn.commit()
+    checked_at = datetime.now(timezone.utc).isoformat()
+    await db.put_storage_target(
+        OWNER_A,
+        {"storage_mode": "channel", "channel_id": "1234567890", "channel_title": "Shared"},
+        expected_version=0,
+        expected_accounts_version=2,
+        verifications=[{
+            "telegram_user_id": OWNER_A,
+            "channel_id": "1234567890",
+            "channel_title": "Shared",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": checked_at,
+            "accounts_version": 2,
+        }, {
+            "telegram_user_id": A_SECOND,
+            "channel_id": "1234567890",
+            "channel_title": "Shared",
+            "can_read": True,
+            "can_write": True,
+            "status": "verified",
+            "checked_at": checked_at,
+            "accounts_version": 2,
+        }],
+    )
+
+    assert await db.count_files_on_account(OWNER_A, A_SECOND) == 0
+    assert await db.unlink_account(OWNER_A, A_SECOND) is True
+    assert await db.get_owner_of(A_SECOND) is None
+
+
+async def test_storage_target_repository_rejects_noncanonical_channel_ids(db):
+    """Direct callers cannot bypass the API's canonical raw-ID contract."""
+    await db.link_account(OWNER_A, OWNER_A, is_primary=True)
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    with pytest.raises(ValueError, match="canonical positive raw channel ID"):
+        await db.put_storage_target(
+            OWNER_A,
+            {"storage_mode": "channel", "channel_id": "01", "channel_title": "Shared"},
+            expected_version=0,
+            expected_accounts_version=1,
+            verifications=[{
+                "telegram_user_id": OWNER_A,
+                "channel_id": "01",
+                "channel_title": "Shared",
+                "can_read": True,
+                "can_write": True,
+                "status": "verified",
+                "checked_at": checked_at,
+                "accounts_version": 1,
+            }],
+        )
 
 
 async def test_dedup_spans_every_account_in_the_drive(db, file_service, make_file):

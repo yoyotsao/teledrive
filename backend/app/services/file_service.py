@@ -45,6 +45,12 @@ class FileService:
             # Which linked account stores this message — the frontend picks its
             # GramJS client by this field. access_hash is only valid for that account.
             telegram_user_id=row.get('telegram_user_id') or 0,
+            telegram_chat_id=row.get('telegram_chat_id'),
+            telegram_media_kind=row.get('telegram_media_kind'),
+            telegram_media_id=row.get('telegram_media_id'),
+            telegram_media_size=row.get('telegram_media_size'),
+            telegram_photo_variant=row.get('telegram_photo_variant'),
+            location_version=row.get('location_version') or 0,
             trashed_at=(
                 datetime.fromisoformat(row['trashed_at'])
                 if row.get('trashed_at') else None
@@ -121,6 +127,12 @@ class FileService:
         telegram_user_id: int = 0,
         file_hash: Optional[str] = None,
         owner_id: int = 0,
+        telegram_chat_id: Optional[str] = None,
+        telegram_media_kind: Optional[str] = None,
+        telegram_media_id: Optional[str] = None,
+        telegram_media_size: Optional[int] = None,
+        telegram_photo_variant: Optional[str] = None,
+        location_version: int = 0,
     ) -> FileInfo:
         """
         Register a file that was uploaded directly via MTProto.
@@ -152,6 +164,10 @@ class FileService:
                 owner_id=owner_id,
                 exclude_split_group_id=split_group_id,
             )
+            # A metadata retry for the same logical row is an upsert, not a
+            # replacement.  Keeping it lets Database preserve or CAS-update
+            # the immutable physical location.
+            stale = [row for row in stale if row['file_id'] != file_id]
             if stale:
                 old_groups = sorted({r.get('split_group_id') or r['file_id'] for r in stale})
                 logger.info(
@@ -174,7 +190,14 @@ class FileService:
             direct_url=None,
             access_hash=access_hash,
             parent_id=parent_id,
-            isDir=False
+            isDir=False,
+            telegram_user_id=telegram_user_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_media_kind=telegram_media_kind,
+            telegram_media_id=telegram_media_id,
+            telegram_media_size=telegram_media_size,
+            telegram_photo_variant=telegram_photo_variant,
+            location_version=location_version,
         )
 
         # Store in SQLite instead of memory
@@ -199,14 +222,21 @@ class FileService:
             telegram_user_id=telegram_user_id,
             file_hash=file_hash,
             owner_id=owner_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_media_kind=telegram_media_kind,
+            telegram_media_id=telegram_media_id,
+            telegram_media_size=telegram_media_size,
+            telegram_photo_variant=telegram_photo_variant,
+            location_version=location_version,
         )
 
         logger.info(
             f"Registered MTProto upload: {filename}, file_id: {file_id}, "
             f"has_thumbnail: {has_thumbnail}, stored on account {telegram_user_id}"
         )
-        
-        return file_info
+
+        stored = await db.get_file(file_info.file_id, owner_id=owner_id)
+        return self._row_to_file_info(stored) if stored else file_info
     
     async def get_file_info(self, file_id: str, owner_id: Optional[int] = None) -> Optional[FileInfo]:
         """Get file metadata, optionally scoped to a drive."""
@@ -393,7 +423,7 @@ class FileService:
         db = await self._get_db()
         rows = await self._collect_subtree_rows(file_id, owner_id)
         ids = [r['file_id'] for r in rows]
-        deleted = await db.delete_files_by_ids(ids, owner_id)
+        deleted = await db.purge_files_by_ids(ids, owner_id)
         logger.info(f"Purged {deleted} metadata record(s) under {file_id}; Telegram messages retained")
         return deleted
 

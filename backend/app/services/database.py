@@ -2165,6 +2165,33 @@ class Database:
         from app.services import storage_migration
         return await storage_migration.get_migration_job(self, owner_id, migration_id)
 
+    async def list_migration_groups(
+        self, owner_id: int, migration_id: str, *, scope: str = "runnable",
+        limit: int = 25, after: Optional[str] = None,
+    ) -> Optional[dict]:
+        from app.services import storage_migration
+        return await storage_migration.list_migration_groups(
+            self, owner_id, migration_id, scope=scope, limit=limit, after=after,
+        )
+
+    async def get_migration_group(
+        self, owner_id: int, migration_id: str, group_id: str,
+    ) -> Optional[dict]:
+        from app.services import storage_migration
+        return await storage_migration.get_migration_group(
+            self, owner_id, migration_id, group_id,
+        )
+
+    async def claim_migration_group(
+        self, owner_id: int, migration_id: str, group_id: str,
+        expected_item_versions: Dict[str, int], *, lease_owner: str, lease_seconds: int,
+    ) -> dict:
+        from app.services import storage_migration
+        return await storage_migration.claim_migration_group(
+            self, owner_id, migration_id, group_id, expected_item_versions,
+            lease_owner=lease_owner, lease_seconds=lease_seconds,
+        )
+
     async def claim_migration_item(
         self, owner_id: int, migration_id: str, item_id: str,
         expected_version: int, lease_owner: str, lease_seconds: int,

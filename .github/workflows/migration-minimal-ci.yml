@@ -1,0 +1,63 @@
+name: Migration Minimal CI
+
+on:
+  push:
+    branches:
+      - feat/batched-storage-migration-minimal
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt pytest >/dev/null
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Typecheck
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Focused migration regression
+        working-directory: frontend
+        run: >-
+          npx vitest run
+          src/lib/forwardResult.test.ts
+          src/lib/gramjs.forwardBatch.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.photo.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.batch.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.transient.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.verificationBatch.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.uploadIsolation.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.uploadYieldRace.test.ts
+      - name: Focused backend migration regression
+        working-directory: backend
+        run: >-
+          python -m pytest -q
+          tests/test_storage_migration.py
+          tests/test_storage_migration_batching.py
+          tests/test_storage_migration_scale.py
+          tests/test_storage_migration_applied_evidence.py
+          tests/test_storage_migration_partial_rollback.py
+          tests/test_api_authz.py
+      - name: Full isolated test suite
+        env:
+          VITE_ENABLE_STORAGE_MIGRATION: 'true'
+        run: node scripts/run-tests.mjs

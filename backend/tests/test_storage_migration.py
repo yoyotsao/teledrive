@@ -51,6 +51,14 @@ async def _saved_file(db, file_id="legacy", *, split_group_id=None, part_index=N
     return await db.get_file(file_id, OWNER_A)
 
 
+async def _first_runnable_item(db, job):
+    page = await db.list_migration_groups(
+        OWNER_A, job["migration_id"], scope="runnable", limit=25,
+    )
+    assert page and page["groups"]
+    return page["groups"][0]["items"][0]
+
+
 def _source(row):
     return {key: row[key] for key in (
         "file_id", "telegram_user_id", "telegram_chat_id", "telegram_message_id",
@@ -124,8 +132,12 @@ async def test_manifest_is_owner_scoped_and_snapshots_source_location(db):
     )
 
     assert job["dry_run"] is True
-    assert len(job["items"]) == 1
-    assert job["items"][0]["source_location"]["telegram_message_id"] == row["telegram_message_id"]
+    assert "items" not in job
+    assert job["total_items"] == 1
+    assert job["total_groups"] == 1
+    assert job["item_counts"]["planned"] == 1
+    group = await db.get_migration_group(OWNER_A, job["migration_id"], row["file_id"])
+    assert group["items"][0]["source_location"]["telegram_message_id"] == row["telegram_message_id"]
     assert await db.get_migration_job(OWNER_B, job["migration_id"]) is None
     assert await db.list_migration_jobs(OWNER_B) == []
 
@@ -134,7 +146,7 @@ async def test_uncertain_item_only_reconciles_against_persisted_operation_result
     target = await _target_channel(db)
     row = await _saved_file(db)
     job = await db.create_migration_manifest(OWNER_A, target["version"], target["accounts_version"])
-    item = job["items"][0]
+    item = await _first_runnable_item(db, job)
     operation = await _sent_operation(db, row, "migration-op")
 
     claimed = await db.claim_migration_item(
@@ -157,7 +169,7 @@ async def test_commit_requires_two_current_readers_including_non_uploader(db):
     target = await _target_channel(db)
     row = await _saved_file(db)
     job = await db.create_migration_manifest(OWNER_A, target["version"], target["accounts_version"])
-    item = job["items"][0]
+    item = await _first_runnable_item(db, job)
     operation = await _sent_operation(db, row, "migration-quorum")
     claimed = await db.claim_migration_item(
         OWNER_A, job["migration_id"], item["item_id"], item["version"],
@@ -181,7 +193,7 @@ async def test_commit_requires_two_current_readers_including_non_uploader(db):
         OWNER_A, job["migration_id"], item["group_id"], job["version"],
         {item["item_id"]: item["version"]},
     )
-    assert result["items"][0]["state"] == "applied"
+    assert result["group"]["items"][0]["state"] == "applied"
     moved = await db.get_file(row["file_id"], OWNER_A)
     assert moved["telegram_chat_id"] == CHANNEL_ID
     assert moved["location_version"] == 1
@@ -191,7 +203,7 @@ async def test_unlinked_evidence_account_stops_counting_without_retransmit(db):
     target = await _target_channel(db)
     row = await _saved_file(db)
     job = await db.create_migration_manifest(OWNER_A, target["version"], target["accounts_version"])
-    item = job["items"][0]
+    item = await _first_runnable_item(db, job)
     operation = await _sent_operation(db, row, "migration-unlink")
     claimed = await db.claim_migration_item(OWNER_A, job["migration_id"], item["item_id"], item["version"], "tab", 30, operation_id=operation["operation_id"], state="uncertain")
     item = await db.transition_reconciled_item(OWNER_A, job["migration_id"], item["item_id"], claimed["version"], operation["result_version"])
@@ -208,7 +220,7 @@ async def test_rollback_uses_applied_location_cas_and_restores_only_location(db)
     target = await _target_channel(db)
     row = await _saved_file(db)
     job = await db.create_migration_manifest(OWNER_A, target["version"], target["accounts_version"])
-    item = job["items"][0]
+    item = await _first_runnable_item(db, job)
     operation = await _sent_operation(db, row, "migration-rollback")
     claimed = await db.claim_migration_item(OWNER_A, job["migration_id"], item["item_id"], item["version"], "tab", 30, operation_id=operation["operation_id"], state="uncertain")
     item = await db.transition_reconciled_item(OWNER_A, job["migration_id"], item["item_id"], claimed["version"], operation["result_version"])
@@ -216,7 +228,7 @@ async def test_rollback_uses_applied_location_cas_and_restores_only_location(db)
     item = await _evidence(db, job, item, operation, 1102, source_ok=True)
     job = await db.get_migration_job(OWNER_A, job["migration_id"])
     applied = await db.commit_migration_group(OWNER_A, job["migration_id"], item["group_id"], job["version"], {item["item_id"]: item["version"]})
-    applied_item = applied["items"][0]
+    applied_item = applied["group"]["items"][0]
 
     await db._conn.execute(
         "UPDATE files SET filename = ? WHERE file_id = ? AND owner_id = ?",
@@ -228,7 +240,7 @@ async def test_rollback_uses_applied_location_cas_and_restores_only_location(db)
 
     rolled = await db.rollback_migration_group(OWNER_A, job["migration_id"], item["group_id"], {item["item_id"]: applied_item["applied_location_version"]})
     restored = await db.get_file(row["file_id"], OWNER_A)
-    assert rolled["items"][0]["state"] == "rolled_back"
+    assert rolled["group"]["items"][0]["state"] == "rolled_back"
     assert restored["telegram_chat_id"] is None
     assert restored["telegram_message_id"] == row["telegram_message_id"]
     assert restored["filename"] == "renamed-after-migration.bin"

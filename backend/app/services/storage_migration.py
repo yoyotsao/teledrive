@@ -94,6 +94,10 @@ async def ensure_schema(db) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_storage_migration_items_group
             ON storage_migration_items(migration_id, group_id, part_index);
+        CREATE INDEX IF NOT EXISTS idx_storage_migration_items_state_retry_group
+            ON storage_migration_items(migration_id, state, retry_at, group_id);
+        CREATE INDEX IF NOT EXISTS idx_storage_migration_items_group_order
+            ON storage_migration_items(migration_id, group_id, part_index, item_id);
 
         CREATE TABLE IF NOT EXISTS storage_migration_evidence (
             migration_id TEXT NOT NULL,
@@ -162,29 +166,175 @@ async def _item_record(db, owner_id: int, migration_id: str, item_id: str) -> Di
     return result
 
 
+async def _job_summary(db, row) -> Dict[str, Any]:
+    result = dict(row)
+    result["dry_run"] = bool(result["dry_run"])
+    result["target_snapshot"] = json.loads(result.pop("target_snapshot_json"))
+    stamp = _iso()
+    cursor = await db._conn.execute("""
+        SELECT COUNT(*) AS total_items,
+               COUNT(DISTINCT group_id) AS total_groups,
+               MIN(CASE
+                     WHEN state = 'retryable' AND retry_at IS NOT NULL AND retry_at > ?
+                     THEN retry_at
+                   END) AS next_retry_at
+        FROM storage_migration_items
+        WHERE migration_id = ?
+    """, (stamp, result["migration_id"]))
+    totals = await cursor.fetchone()
+    result["total_items"] = int(totals["total_items"] or 0)
+    result["total_groups"] = int(totals["total_groups"] or 0)
+    result["next_retry_at"] = totals["next_retry_at"]
+
+    counts = {state: 0 for state in sorted(ITEM_STATES)}
+    cursor = await db._conn.execute("""
+        SELECT state, COUNT(*) AS count
+        FROM storage_migration_items
+        WHERE migration_id = ?
+        GROUP BY state
+    """, (result["migration_id"],))
+    for count_row in await cursor.fetchall():
+        counts[count_row["state"]] = int(count_row["count"])
+    result["item_counts"] = counts
+    return result
+
+
 async def get_migration_job(db, owner_id: int, migration_id: str) -> Optional[Dict[str, Any]]:
     await ensure_schema(db)
     row = await _job_row(db, owner_id, migration_id)
     if row is None:
         return None
-    result = dict(row)
-    result["dry_run"] = bool(result["dry_run"])
-    result["target_snapshot"] = json.loads(result.pop("target_snapshot_json"))
-    cursor = await db._conn.execute(
-        "SELECT item_id FROM storage_migration_items WHERE migration_id = ? ORDER BY group_id, part_index, item_id",
-        (migration_id,),
-    )
-    result["items"] = [await _item_record(db, owner_id, migration_id, item[0]) for item in await cursor.fetchall()]
-    return result
+    return await _job_summary(db, row)
 
 
 async def list_migration_jobs(db, owner_id: int) -> List[Dict[str, Any]]:
     await ensure_schema(db)
     cursor = await db._conn.execute(
-        "SELECT migration_id FROM storage_migrations WHERE owner_id = ? ORDER BY created_at DESC",
+        "SELECT * FROM storage_migrations WHERE owner_id = ? ORDER BY created_at DESC",
         (owner_id,),
     )
-    return [await get_migration_job(db, owner_id, row[0]) for row in await cursor.fetchall()]
+    return [await _job_summary(db, row) for row in await cursor.fetchall()]
+
+
+async def _load_migration_groups(
+    db, owner_id: int, migration_id: str, group_ids: List[str],
+) -> List[Dict[str, Any]]:
+    if not group_ids:
+        return []
+    placeholders = ",".join("?" for _ in group_ids)
+    cursor = await db._conn.execute(f"""
+        SELECT i.*
+        FROM storage_migration_items i
+        JOIN storage_migrations m ON m.migration_id = i.migration_id
+        WHERE i.migration_id = ? AND m.owner_id = ?
+          AND i.group_id IN ({placeholders})
+        ORDER BY i.group_id, COALESCE(i.part_index, 0), i.item_id
+    """, (migration_id, owner_id, *group_ids))
+    rows = await cursor.fetchall()
+
+    cursor = await db._conn.execute(f"""
+        SELECT i.item_id,
+               e.telegram_user_id, e.result_version, e.target_channel_id,
+               e.destination_message_id, e.media_kind, e.media_id, e.size_bytes,
+               e.photo_variant, e.read_probe_ok, e.checked_at,
+               e.source_read_probe_ok, e.source_checked_at
+        FROM storage_migration_evidence e
+        JOIN storage_migration_items i
+          ON i.migration_id = e.migration_id AND i.item_id = e.item_id
+        JOIN storage_migrations m ON m.migration_id = i.migration_id
+        WHERE i.migration_id = ? AND m.owner_id = ?
+          AND i.group_id IN ({placeholders})
+        ORDER BY i.group_id, COALESCE(i.part_index, 0), i.item_id, e.telegram_user_id
+    """, (migration_id, owner_id, *group_ids))
+    evidence_by_item: Dict[str, List[Dict[str, Any]]] = {}
+    for evidence_row in await cursor.fetchall():
+        evidence = dict(evidence_row)
+        item_id = evidence.pop("item_id")
+        evidence_by_item.setdefault(item_id, []).append(evidence)
+
+    by_group: Dict[str, Dict[str, Any]] = {
+        group_id: {"group_id": group_id, "items": []} for group_id in group_ids
+    }
+    for row in rows:
+        item = dict(row)
+        item["source_location"] = json.loads(item.pop("source_location_json"))
+        item["evidence"] = evidence_by_item.get(item["item_id"], [])
+        by_group[item["group_id"]]["items"].append(item)
+    return [by_group[group_id] for group_id in group_ids if by_group[group_id]["items"]]
+
+
+async def get_migration_group(
+    db, owner_id: int, migration_id: str, group_id: str,
+) -> Optional[Dict[str, Any]]:
+    await ensure_schema(db)
+    if await _job_row(db, owner_id, migration_id) is None:
+        return None
+    groups = await _load_migration_groups(db, owner_id, migration_id, [group_id])
+    return groups[0] if groups else None
+
+
+async def list_migration_groups(
+    db,
+    owner_id: int,
+    migration_id: str,
+    *,
+    scope: str = "runnable",
+    limit: int = 25,
+    after: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    await ensure_schema(db)
+    if scope not in {"runnable", "applied"}:
+        raise ValueError("unknown migration group scope")
+    if limit < 1 or limit > 25:
+        raise ValueError("migration group limit must be between 1 and 25")
+    job = await _job_row(db, owner_id, migration_id)
+    if job is None:
+        return None
+    if scope == "runnable" and bool(job["dry_run"]):
+        return {"groups": [], "next_after": None}
+
+    if scope == "runnable":
+        stamp = _iso()
+        cursor = await db._conn.execute("""
+            SELECT group_id
+            FROM storage_migration_items
+            WHERE migration_id = ? AND owner_id = ?
+            GROUP BY group_id
+            HAVING MAX(CASE WHEN state IN ('blocked', 'failed', 'applied', 'rolled_back') THEN 1 ELSE 0 END) = 0
+               AND MAX(CASE
+                     WHEN state = 'retryable' AND retry_at IS NOT NULL AND retry_at > ? THEN 1
+                     ELSE 0
+                   END) = 0
+               AND MAX(CASE
+                     WHEN lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at > ? THEN 1
+                     ELSE 0
+                   END) = 0
+               AND MAX(CASE
+                     WHEN state IN ('planned', 'sending', 'forwarded', 'recovering', 'retryable',
+                                    'uncertain', 'pending_quorum', 'verified') THEN 1
+                     ELSE 0
+                   END) = 1
+            ORDER BY group_id
+            LIMIT ?
+        """, (migration_id, owner_id, stamp, stamp, limit))
+        group_ids = [row["group_id"] for row in await cursor.fetchall()]
+        groups = await _load_migration_groups(db, owner_id, migration_id, group_ids)
+        return {"groups": groups, "next_after": None}
+
+    cursor = await db._conn.execute("""
+        SELECT group_id
+        FROM storage_migration_items
+        WHERE migration_id = ? AND owner_id = ?
+          AND (? IS NULL OR group_id > ?)
+        GROUP BY group_id
+        HAVING MAX(CASE WHEN state != 'applied' THEN 1 ELSE 0 END) = 0
+        ORDER BY group_id
+        LIMIT ?
+    """, (migration_id, owner_id, after, after, limit))
+    group_ids = [row["group_id"] for row in await cursor.fetchall()]
+    groups = await _load_migration_groups(db, owner_id, migration_id, group_ids)
+    next_after = group_ids[-1] if len(group_ids) == limit else None
+    return {"groups": groups, "next_after": next_after}
 
 
 async def create_migration_manifest(
@@ -223,28 +373,105 @@ async def create_migration_manifest(
         """, (migration_id, owner_id, 1 if dry_run else 0, target["channel_id"],
               target["version"], target["accounts_version"], json.dumps(snapshot, sort_keys=True), stamp, stamp))
 
-        cursor = await conn.execute("""
-            SELECT * FROM files
+        await conn.execute("""
+            INSERT INTO storage_migration_items (
+                migration_id, item_id, owner_id, file_id, group_id, part_index,
+                state, version, source_location_json, expected_location_version,
+                created_at, updated_at
+            )
+            SELECT ?, file_id, owner_id, file_id, COALESCE(split_group_id, file_id), part_index,
+                   'planned', 1,
+                   json_object(
+                       'file_id', file_id,
+                       'telegram_user_id', telegram_user_id,
+                       'telegram_chat_id', telegram_chat_id,
+                       'telegram_message_id', telegram_message_id,
+                       'telegram_media_kind', telegram_media_kind,
+                       'telegram_media_id', telegram_media_id,
+                       'telegram_media_size', telegram_media_size,
+                       'telegram_photo_variant', telegram_photo_variant,
+                       'location_version', location_version,
+                       'access_hash', access_hash
+                   ),
+                   location_version, ?, ?
+            FROM files
             WHERE owner_id = ? AND isDir = 0 AND telegram_chat_id IS NULL
-            ORDER BY COALESCE(split_group_id, file_id), COALESCE(part_index, 0), file_id
-        """, (owner_id,))
-        rows = [dict(row) for row in await cursor.fetchall()]
-        for row in rows:
-            group_id = row["split_group_id"] or row["file_id"]
-            await conn.execute("""
-                INSERT INTO storage_migration_items (
-                    migration_id, item_id, owner_id, file_id, group_id, part_index,
-                    state, version, source_location_json, expected_location_version,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'planned', 1, ?, ?, ?, ?)
-            """, (migration_id, row["file_id"], owner_id, row["file_id"], group_id,
-                  row["part_index"], json.dumps(_source_snapshot(row), sort_keys=True),
-                  row["location_version"], stamp, stamp))
+        """, (migration_id, stamp, stamp, owner_id))
         await conn.commit()
     except Exception:
         await conn.rollback()
         raise
     return await get_migration_job(db, owner_id, migration_id)
+
+
+async def claim_migration_group(
+    db,
+    owner_id: int,
+    migration_id: str,
+    group_id: str,
+    expected_item_versions: Dict[str, int],
+    *,
+    lease_owner: str,
+    lease_seconds: int,
+) -> Dict[str, Any]:
+    await ensure_schema(db)
+    if not lease_owner or lease_seconds <= 0:
+        raise ValueError("lease_owner and positive lease_seconds are required")
+    conn = db._conn
+    await conn.execute("BEGIN IMMEDIATE")
+    try:
+        job = await _job_row(db, owner_id, migration_id)
+        if job is None:
+            raise KeyError("Migration not found")
+        if bool(job["dry_run"]):
+            raise ValueError("dry-run migration cannot be claimed")
+        cursor = await conn.execute("""
+            SELECT * FROM storage_migration_items
+            WHERE migration_id = ? AND owner_id = ? AND group_id = ?
+            ORDER BY COALESCE(part_index, 0), item_id
+        """, (migration_id, owner_id, group_id))
+        items = await cursor.fetchall()
+        if not items:
+            raise KeyError("Migration group not found")
+        if set(expected_item_versions) != {item["item_id"] for item in items}:
+            raise ValueError("claim must include every migration group item")
+
+        now = _now()
+        for item in items:
+            if expected_item_versions[item["item_id"]] != item["version"]:
+                raise ValueError("migration item version conflict")
+            if item["state"] in {"blocked", "failed", "applied", "rolled_back"}:
+                raise ValueError("migration group is not runnable")
+            retry_at = _parse_time(item["retry_at"])
+            if item["state"] == "retryable" and retry_at and retry_at > now:
+                raise ValueError("migration item retry is not due")
+            expiry = _parse_time(item["lease_expires_at"])
+            if expiry and expiry > now and item["lease_owner"] not in (None, lease_owner):
+                raise ValueError("migration item lease is active")
+
+        lease_expires = (now + timedelta(seconds=lease_seconds)).isoformat()
+        stamp = _iso()
+        cursor = await conn.execute("""
+            UPDATE storage_migration_items
+            SET lease_owner = ?, lease_expires_at = ?, version = version + 1, updated_at = ?
+            WHERE migration_id = ? AND owner_id = ? AND group_id = ?
+              AND state NOT IN ('blocked', 'failed', 'applied', 'rolled_back')
+        """, (lease_owner, lease_expires, stamp, migration_id, owner_id, group_id))
+        if cursor.rowcount != len(items):
+            raise ValueError("migration group claim conflict")
+        await conn.execute("""
+            UPDATE storage_migrations
+            SET state = 'running', version = version + 1, updated_at = ?
+            WHERE migration_id = ? AND owner_id = ?
+        """, (stamp, migration_id, owner_id))
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    return {
+        "group": await get_migration_group(db, owner_id, migration_id, group_id),
+        "job": await get_migration_job(db, owner_id, migration_id),
+    }
 
 
 async def _validate_operation_for_item(db, owner_id: int, job, item, operation_id: str):
@@ -429,8 +656,8 @@ async def upsert_migration_evidence(
             raise KeyError("Migration item not found")
         if item["version"] != expected_item_version:
             raise ValueError("migration item version conflict")
-        if item["state"] not in {"forwarded", "pending_quorum", "verified"}:
-            raise ValueError("migration evidence requires a forwarded item")
+        if item["state"] not in {"forwarded", "pending_quorum", "verified", "applied"}:
+            raise ValueError("migration evidence requires a forwarded or applied item")
         cursor = await conn.execute(
             "SELECT 1 FROM linked_accounts WHERE owner_id = ? AND telegram_user_id = ?",
             (owner_id, telegram_user_id),
@@ -480,10 +707,14 @@ async def upsert_migration_evidence(
               target_channel_id, destination_message_id, media_kind, media_id,
               size_bytes, photo_variant, checked_at, 1 if source_read_probe_ok else 0,
               checked_at if source_read_probe_ok else None, stamp))
-        # Evidence itself never applies metadata. It only advances the readiness hint.
+        # Evidence itself never applies metadata. It only advances the readiness
+        # hint before commit. Fresh rollback evidence must never move an applied
+        # item back into a pre-commit state.
         state = "verified" if await _quorum(db, owner_id, migration_id, item, operation) else "pending_quorum"
         await conn.execute("""
-            UPDATE storage_migration_items SET state = ?, version = version + 1, updated_at = ?
+            UPDATE storage_migration_items
+            SET state = CASE WHEN state = 'applied' THEN 'applied' ELSE ? END,
+                version = version + 1, updated_at = ?
             WHERE migration_id = ? AND item_id = ? AND version = ?
         """, (state, stamp, migration_id, item_id, expected_item_version))
         await conn.execute("UPDATE storage_migrations SET version = version + 1, updated_at = ? WHERE migration_id = ?", (stamp, migration_id))
@@ -562,7 +793,10 @@ async def commit_migration_group(
     except Exception:
         await conn.rollback()
         raise
-    return await get_migration_job(db, owner_id, migration_id)
+    return {
+        "group": await get_migration_group(db, owner_id, migration_id, group_id),
+        "job": await get_migration_job(db, owner_id, migration_id),
+    }
 
 
 async def _fresh_source_evidence(db, owner_id: int, migration_id: str, item) -> bool:
@@ -667,4 +901,7 @@ async def rollback_migration_group(
     except Exception:
         await conn.rollback()
         raise
-    return await get_migration_job(db, owner_id, migration_id)
+    return {
+        "group": await get_migration_group(db, owner_id, migration_id, group_id),
+        "job": await get_migration_job(db, owner_id, migration_id),
+    }

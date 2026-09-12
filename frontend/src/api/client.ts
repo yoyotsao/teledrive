@@ -191,6 +191,10 @@ export interface StorageMigrationItem {
   operation_id?: string | null;
   operation_result_version?: number | null;
   applied_location_version?: number | null;
+  lease_owner?: string | null;
+  lease_expires_at?: string | null;
+  retry_at?: string | null;
+  error?: string | null;
   evidence: StorageMigrationEvidence[];
 }
 
@@ -203,7 +207,27 @@ export interface StorageMigrationJob {
   target_version: number;
   accounts_version: number;
   target_snapshot: Record<string, unknown>;
+  total_items: number;
+  total_groups: number;
+  item_counts: Record<string, number>;
+  next_retry_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StorageMigrationGroup {
+  group_id: string;
   items: StorageMigrationItem[];
+}
+
+export interface StorageMigrationGroupPage {
+  groups: StorageMigrationGroup[];
+  next_after?: string | null;
+}
+
+export interface StorageMigrationGroupResult {
+  group: StorageMigrationGroup;
+  job: StorageMigrationJob;
 }
 
 /** Durable, metadata-only send intent. Telegram bytes and credentials stay in GramJS. */
@@ -349,6 +373,37 @@ export const api = {
     return response.data;
   },
 
+  listMigrationGroups: async (params: {
+    migrationId: string;
+    scope?: 'runnable' | 'applied';
+    limit?: number;
+    after?: string;
+  }): Promise<StorageMigrationGroupPage> => {
+    const response = await client.get<StorageMigrationGroupPage>(
+      `/storage-migrations/${params.migrationId}/groups`,
+      { params: { scope: params.scope ?? 'runnable', limit: params.limit ?? 25, after: params.after } },
+    );
+    return response.data;
+  },
+
+  claimMigrationGroup: async (params: {
+    migrationId: string;
+    groupId: string;
+    expectedItemVersions: Record<string, number>;
+    leaseOwner: string;
+    leaseSeconds: number;
+  }): Promise<StorageMigrationGroupResult> => {
+    const response = await client.post<StorageMigrationGroupResult>(
+      `/storage-migrations/${params.migrationId}/groups/${params.groupId}/claim`,
+      {
+        expected_item_versions: params.expectedItemVersions,
+        lease_owner: params.leaseOwner,
+        lease_seconds: params.leaseSeconds,
+      },
+    );
+    return response.data;
+  },
+
   claimMigrationItem: async (params: {
     migrationId: string;
     itemId: string;
@@ -407,8 +462,8 @@ export const api = {
     groupId: string;
     expectedJobVersion: number;
     expectedItemVersions: Record<string, number>;
-  }): Promise<StorageMigrationJob> => {
-    const response = await client.post<StorageMigrationJob>(
+  }): Promise<StorageMigrationGroupResult> => {
+    const response = await client.post<StorageMigrationGroupResult>(
       `/storage-migrations/${params.migrationId}/groups/${params.groupId}/commit`,
       {
         expected_job_version: params.expectedJobVersion,
@@ -422,8 +477,8 @@ export const api = {
     migrationId: string;
     groupId: string;
     expectedLocationVersions: Record<string, number>;
-  }): Promise<StorageMigrationJob> => {
-    const response = await client.post<StorageMigrationJob>(
+  }): Promise<StorageMigrationGroupResult> => {
+    const response = await client.post<StorageMigrationGroupResult>(
       `/storage-migrations/${params.migrationId}/groups/${params.groupId}/rollback`,
       { expected_location_versions: params.expectedLocationVersions },
     );

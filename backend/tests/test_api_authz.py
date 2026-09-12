@@ -33,6 +33,8 @@ PROTECTED = [
     ("/api/v1/storage-migrations", "GET", "/api/v1/storage-migrations", None),
     ("/api/v1/storage-migrations", "POST", "/api/v1/storage-migrations", {}),
     ("/api/v1/storage-migrations/{migration_id}", "GET", "/api/v1/storage-migrations/migration", None),
+    ("/api/v1/storage-migrations/{migration_id}/groups", "GET", "/api/v1/storage-migrations/migration/groups", None),
+    ("/api/v1/storage-migrations/{migration_id}/groups/{group_id}/claim", "POST", "/api/v1/storage-migrations/migration/groups/group/claim", {}),
     ("/api/v1/storage-migrations/{migration_id}/items/{item_id}", "PATCH", "/api/v1/storage-migrations/migration/items/item", {}),
     ("/api/v1/storage-migrations/{migration_id}/items/{item_id}/reconcile", "POST", "/api/v1/storage-migrations/migration/items/item/reconcile", {}),
     ("/api/v1/storage-migrations/{migration_id}/items/{item_id}/verifications/{telegram_user_id}", "PUT", "/api/v1/storage-migrations/migration/items/item/verifications/123", {}),
@@ -176,11 +178,19 @@ def test_storage_migration_routes_are_owner_scoped(client, db, run, make_file):
     job = run(db.create_migration_manifest(
         OWNER_B, target["version"], target["accounts_version"],
     ))
-    item = job["items"][0]
+    page = run(db.list_migration_groups(
+        OWNER_B, job["migration_id"], scope="runnable", limit=25,
+    ))
+    item = page["groups"][0]["items"][0]
 
     assert client.get("/api/v1/storage-migrations").json() == {"migrations": []}
     requests = [
         ("GET", f"/api/v1/storage-migrations/{job['migration_id']}", None),
+        ("GET", f"/api/v1/storage-migrations/{job['migration_id']}/groups", None),
+        ("POST", f"/api/v1/storage-migrations/{job['migration_id']}/groups/{item['group_id']}/claim", {
+            "expected_item_versions": {item["item_id"]: item["version"]},
+            "lease_owner": "other", "lease_seconds": 30,
+        }),
         ("PATCH", f"/api/v1/storage-migrations/{job['migration_id']}/items/{item['item_id']}", {
             "expected_version": item["version"], "lease_owner": "other", "lease_seconds": 30,
         }),

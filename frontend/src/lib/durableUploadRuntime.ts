@@ -25,6 +25,14 @@ export interface DurableUploadRuntimeResult extends SplitUploadResult {
   operationIds: string[];
 }
 
+export interface FrozenUploadContext {
+  frozen: FrozenUploadTarget;
+  writer: FrozenUploadWriter<TelegramClientManager>;
+  writers: FrozenUploadWriter<TelegramClientManager>[];
+}
+
+let frozenUploadContextInFlight: Promise<FrozenUploadContext> | null = null;
+
 function uuid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   return `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -48,11 +56,7 @@ function managerWriter(writer: FrozenUploadWriter): FrozenUploadWriter<TelegramC
   return writer as unknown as FrozenUploadWriter<TelegramClientManager>;
 }
 
-export async function resolveFrozenUploadContext(): Promise<{
-  frozen: FrozenUploadTarget;
-  writer: FrozenUploadWriter<TelegramClientManager>;
-  writers: FrozenUploadWriter<TelegramClientManager>[];
-}> {
+async function buildFrozenUploadContext(): Promise<FrozenUploadContext> {
   const [target, accounts] = await Promise.all([api.getStorageTarget(), api.listAccounts()]);
   const frozen = freezeUploadTarget(target, accounts);
   const managers = getAllClients() as unknown as UploadManagerLike[];
@@ -69,6 +73,28 @@ export async function resolveFrozenUploadContext(): Promise<{
   });
   const writers = selected.map(managerWriter);
   return { frozen, writer: writers[0], writers };
+}
+
+/**
+ * Coalesce concurrent target/account/writer resolution into one request set.
+ * A large upload batch can start hundreds of files at once; without this gate
+ * every file independently calls /storage-target, /accounts and GetDialogs,
+ * exhausting the browser connection pool and tripping Telegram flood waits.
+ * The promise is cleared as soon as it settles, so later batches still observe
+ * storage-target/account changes instead of reusing stale configuration.
+ */
+export async function resolveFrozenUploadContext(): Promise<FrozenUploadContext> {
+  if (frozenUploadContextInFlight) return frozenUploadContextInFlight;
+
+  const pending = buildFrozenUploadContext();
+  frozenUploadContextInFlight = pending;
+  try {
+    return await pending;
+  } finally {
+    if (frozenUploadContextInFlight === pending) {
+      frozenUploadContextInFlight = null;
+    }
+  }
 }
 
 function operationRequest(

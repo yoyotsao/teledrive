@@ -24,7 +24,7 @@
     "qrcode.react": "^4.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "telegram": "^2.26.22"
+    "telegram": "2.26.21"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

@@ -542,7 +542,17 @@ async def account_verify(request: VerifyRequest, current_user: int = Depends(get
     db = await get_database()
     existing_owner = await db.get_owner_of(tg_user_id)
     if existing_owner == current_user:
-        raise HTTPException(status_code=409, detail="This account is already linked to your drive")
+        accounts = await db.list_linked_accounts(current_user)
+        existing = next(
+            account for account in accounts
+            if account["telegram_user_id"] == tg_user_id
+        )
+        return {
+            "telegram_user_id": existing["telegram_user_id"],
+            "label": existing["label"],
+            "is_primary": existing["is_primary"],
+            "file_count": existing["file_count"],
+        }
     if existing_owner is not None:
         # One account, one drive — otherwise linking would expose the other drive's files.
         raise HTTPException(status_code=409, detail="This Telegram account already belongs to another drive")

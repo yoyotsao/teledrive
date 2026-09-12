@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.api.routes import VerifyRequest, account_verify
+from app.services import bot_challenge
 from conftest import OWNER_A, OWNER_B
 
 A_SECOND = 3003  # a second Telegram account, not yet linked anywhere
@@ -82,15 +84,23 @@ def test_linking_waits_for_the_dm_then_attaches_the_account(client, bot_login, d
     assert run(db.get_owner_of(A_SECOND)) == OWNER_A
 
 
-def test_relinking_an_account_this_drive_already_has_is_a_conflict(client, bot_login, db, run):
+def test_reauthenticating_an_account_this_drive_already_has_returns_its_existing_link(bot_login, db, run):
     run(db.link_account(OWNER_A, A_SECOND))
-    nonce = client.post("/api/v1/accounts/challenge").json()["nonce"]
+    nonce = bot_challenge.new_challenge()
     bot_login.deliver(nonce, user_id=A_SECOND)
 
-    resp = client.post("/api/v1/accounts/verify", json={"nonce": nonce})
+    result = run(account_verify(VerifyRequest(nonce=nonce), current_user=OWNER_A))
 
-    assert resp.status_code == 409
-    assert "already linked to your drive" in resp.json()["detail"]
+    assert result == {
+        "telegram_user_id": A_SECOND,
+        "label": None,
+        "is_primary": 0,
+        "file_count": 0,
+    }
+    assert [
+        account["telegram_user_id"]
+        for account in run(db.list_linked_accounts(OWNER_A))
+    ] == [A_SECOND]
 
 
 def test_an_account_cannot_be_stolen_from_another_drive(client, bot_login, db, run):

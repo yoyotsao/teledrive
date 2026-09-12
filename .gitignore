@@ -69,6 +69,7 @@ tmp/
 nul
 
 # Archives
+/backups/
 project.tar.gz
 *.tar.gz
 *.zip

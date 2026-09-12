@@ -11,7 +11,14 @@ type Props = { onClose: () => void };
 
 type Row = LinkedAccount & { online: boolean; rate: number | null };
 type SettingsTab = 'accounts' | 'storage' | 'statistics';
+type AccountLoginMode = { kind: 'add' } | { kind: 'relogin'; account: Row } | null;
 const SETTINGS_TABS: SettingsTab[] = ['accounts', 'storage', 'statistics'];
+
+export function assertReloginTarget(expectedTelegramUserId: number, actualTelegramUserId: number): void {
+  if (expectedTelegramUserId !== actualTelegramUserId) {
+    throw new Error('登入的 Telegram 帳號與所選帳號不符，請改用正確的帳號重試');
+  }
+}
 
 export async function flushThenUnlinkSecondaryAccount(
   telegramUserId: number,
@@ -46,7 +53,7 @@ function tabLabel(value: SettingsTab): string {
 export default function SettingsDialog({ onClose }: Props) {
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState('');
-  const [adding, setAdding] = useState(false);
+  const [loginMode, setLoginMode] = useState<AccountLoginMode>(null);
   const [linking, setLinking] = useState('');
   const [tab, setTab] = useState<SettingsTab>('accounts');
 
@@ -73,12 +80,15 @@ export default function SettingsDialog({ onClose }: Props) {
         linked = await api.verifyAccount(nonce);
       }
       if (!linked) throw new Error('Telegram 驗證逾時，請重試');
+      if (loginMode?.kind === 'relogin') {
+        assertReloginTarget(loginMode.account.telegram_user_id, linked.telegram_user_id);
+      }
 
       const accountName = linked.label ?? String(linked.telegram_user_id);
       adoptClient(linked.telegram_user_id, client, accountName);
       await saveAccount({ id: linked.telegram_user_id, label: accountName, session: sessionString });
       invalidateFrozenUploadContext();
-      setAdding(false);
+      setLoginMode(null);
       setLinking('');
       await reload();
     } catch (err: any) {
@@ -152,20 +162,28 @@ export default function SettingsDialog({ onClose }: Props) {
                   {row.rate != null && ` · ${row.rate.toFixed(1)} parts/s`}
                 </div>
               </div>
-              {!row.is_primary && <button onClick={() => unlink(row)} style={{ padding: '4px 10px', border: '1px solid var(--td-border)', borderRadius: 6, background: 'var(--td-surface)', fontSize: 12, cursor: 'pointer', color: 'var(--td-text)' }}>移除</button>}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {!row.online && <button onClick={() => { setError(''); setLoginMode({ kind: 'relogin', account: row }); }} style={{ padding: '4px 10px', border: '1px solid #2563eb', borderRadius: 6, background: 'var(--td-surface)', fontSize: 12, cursor: 'pointer', color: '#2563eb' }}>登入</button>}
+                {!row.is_primary && <button onClick={() => unlink(row)} style={{ padding: '4px 10px', border: '1px solid var(--td-border)', borderRadius: 6, background: 'var(--td-surface)', fontSize: 12, cursor: 'pointer', color: 'var(--td-text)' }}>移除</button>}
+              </div>
             </div>
           ))}
 
           {error && <p style={{ margin: '12px 0 0', fontSize: 12, color: '#dc2626' }}>{error}</p>}
           {linking && <p style={{ margin: '12px 0 0', fontSize: 12, color: 'var(--td-text-muted)' }}>{linking}</p>}
 
-          {adding ? (
+          {loginMode ? (
             <div style={{ marginTop: 20 }}>
+              {loginMode.kind === 'relogin' && (
+                <h3 style={{ margin: '0 0 14px', fontSize: 15 }}>
+                  重新登入 {loginMode.account.label || loginMode.account.telegram_user_id}
+                </h3>
+              )}
               <SessionTabs onLogin={linkAccount} />
-              <button onClick={() => { setAdding(false); setLinking(''); }} style={{ marginTop: 12, padding: '6px 14px', border: '1px solid var(--td-border)', borderRadius: 6, background: 'var(--td-surface)', fontSize: 13, cursor: 'pointer', color: 'var(--td-text)' }}>取消</button>
+              <button onClick={() => { setLoginMode(null); setLinking(''); }} style={{ marginTop: 12, padding: '6px 14px', border: '1px solid var(--td-border)', borderRadius: 6, background: 'var(--td-surface)', fontSize: 13, cursor: 'pointer', color: 'var(--td-text)' }}>取消</button>
             </div>
           ) : (
-            <button onClick={() => { setError(''); setAdding(true); }} style={{ marginTop: 20, padding: '8px 16px', border: 'none', borderRadius: 6, background: '#2563eb', color: '#fff', fontSize: 13, cursor: 'pointer' }}>＋ 新增 Telegram 帳號</button>
+            <button onClick={() => { setError(''); setLoginMode({ kind: 'add' }); }} style={{ marginTop: 20, padding: '8px 16px', border: 'none', borderRadius: 6, background: '#2563eb', color: '#fff', fontSize: 13, cursor: 'pointer' }}>＋ 新增 Telegram 帳號</button>
           )}
         </div>
       </div>

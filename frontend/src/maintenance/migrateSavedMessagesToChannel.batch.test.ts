@@ -205,34 +205,40 @@ function resetMigration(sourceAccounts: number[]) {
 describe('batched storage migration forwards', () => {
   beforeEach(() => resetMigration([]));
 
-  it('forwards 100 same-source items in one Telegram batch while retaining one operation/random id per item', async () => {
+  it('caps runner bursts at 25 while retaining one operation/random id per item', async () => {
     resetMigration(Array(100).fill(42));
 
     await runMigrationJob('migration-batch');
 
     expect(state.singleCalls).toHaveLength(0);
-    expect(state.batchCalls).toHaveLength(1);
-    expect(state.batchCalls[0].accountId).toBe(42);
-    expect(state.batchCalls[0].entries).toHaveLength(100);
+    expect(state.batchCalls.map((call) => call.entries.length)).toEqual([25, 25, 25, 25]);
+    expect(state.batchCalls.every((call) => call.accountId === 42)).toBe(true);
     expect(state.operations).toHaveLength(100);
-    expect(new Set(state.batchCalls[0].entries.map((entry) => entry.randomId)).size).toBe(100);
+    const randomIds = state.batchCalls.flatMap((call) => call.entries.map((entry) => entry.randomId));
+    expect(new Set(randomIds).size).toBe(100);
   });
 
-  it('splits 101 same-source items into 100 + 1 Telegram batches', async () => {
+  it('splits 101 same-source items into bounded 25-item Telegram batches', async () => {
     resetMigration(Array(101).fill(42));
 
     await runMigrationJob('migration-batch');
 
     expect(state.singleCalls).toHaveLength(0);
-    expect(state.batchCalls.map((call) => call.entries.length)).toEqual([100, 1]);
+    expect(state.batchCalls.map((call) => call.entries.length)).toEqual([25, 25, 25, 25, 1]);
   });
 
-  it('never mixes different source accounts in one Telegram batch', async () => {
+  it('never mixes different source accounts and never exceeds the runner batch cap', async () => {
     resetMigration([...Array(60).fill(42), ...Array(40).fill(77)]);
 
     await runMigrationJob('migration-batch');
 
     expect(state.singleCalls).toHaveLength(0);
-    expect(state.batchCalls.map((call) => [call.accountId, call.entries.length])).toEqual([[42, 60], [77, 40]]);
+    expect(state.batchCalls.every((call) => call.entries.length <= 25)).toBe(true);
+    const totals = new Map<number, number>();
+    for (const call of state.batchCalls) {
+      totals.set(call.accountId, (totals.get(call.accountId) ?? 0) + call.entries.length);
+    }
+    expect(totals.get(42)).toBe(60);
+    expect(totals.get(77)).toBe(40);
   });
 });

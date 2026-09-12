@@ -323,12 +323,12 @@ export class TelegramClientManager {
    * concurrent parts each sleep and retry on their own schedule — exactly the
    * herd behavior the pacer's virtual-time scheduling avoids.
    *
-   * Both the sender handoff and the send itself run under a deadline. Neither
-   * can be trusted to settle on its own: getSender's _connectSender retries in
-   * an unbounded while(true), and MTProtoSender.send() returns a promise that
-   * gramjs abandons — never rejects — when the connection breaks. The caller
-   * holds an uploadSemaphore slot for this whole call, so an unbounded wait
-   * here costs the account that slot permanently.
+   * New uploads target the session's home DC, so request the already-connected
+   * main sender with getSender() and do not pass session.dcId. Passing the home
+   * dcId asks GramJS for an exported same-DC sender; its release/reconnect
+   * lifecycle can collide with pending file parts and cause a reconnect storm.
+   * The sender lookup and send still run under deadlines so a broken transport
+   * cannot hold an uploadSemaphore slot forever.
    *
    * Non-flood, non-transient errors are thrown to the caller (which has its
    * own retry loop).
@@ -346,7 +346,7 @@ export class TelegramClientManager {
       let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
       try {
         await sendWithDeadline(async () => {
-          sender = await (client as any).getSender((client.session as any).dcId);
+          sender = await (client as any).getSender();
         }, CHUNK_SEND_TIMEOUT_MS, label);
         throwIfAborted(context?.hooks.signal);
         if (context && !context.hooks.onRpcStart()) throw new LeaseRevokedError();

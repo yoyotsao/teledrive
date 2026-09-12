@@ -20,6 +20,7 @@ export interface AccountPoolOptions<TClient extends AccountPoolClient> {
 export interface AccountPool<TClient extends AccountPoolClient> {
   nextAccount(): TClient;
   withAccountSlot<T>(fn: (client: TClient) => Promise<T>): Promise<T>;
+  withAccountSlotFrom<T>(clients: readonly TClient[], fn: (client: TClient) => Promise<T>): Promise<T>;
   withSlotOn<T>(client: TClient, fn: () => Promise<T>): Promise<T>;
 }
 
@@ -46,8 +47,7 @@ export function createAccountPool<TClient extends AccountPoolClient>(options: Ac
       && runtime.activeByteUploadJobs < options.maxConcurrentFiles;
   };
 
-  const chooseAccount = (): TClient => {
-    const clients = options.clients();
+  const chooseAccount = (clients: readonly TClient[] = options.clients()): TClient => {
     if (clients.length === 0) throw new Error('沒有可用的 Telegram 帳號（全部離線）');
 
     const start = cursor++ % clients.length;
@@ -86,19 +86,33 @@ export function createAccountPool<TClient extends AccountPoolClient>(options: Ac
     }
   };
 
+  const withCandidateSlot = async <T>(
+    candidates: () => readonly TClient[],
+    fn: (client: TClient) => Promise<T>,
+  ): Promise<T> => {
+    while (true) {
+      const clients = candidates();
+      const client = chooseAccount(clients);
+      const result = await acquireOn(client, () => fn(client));
+      if (result.acquired) return result.value;
+
+      const refreshed = candidates();
+      if (refreshed.some(isEligible)) continue;
+      await waitForActivityChange();
+    }
+  };
+
   return {
-    nextAccount: chooseAccount,
+    nextAccount: () => chooseAccount(),
 
     async withAccountSlot<T>(fn: (client: TClient) => Promise<T>): Promise<T> {
-      while (true) {
-        const client = chooseAccount();
-        const result = await acquireOn(client, () => fn(client));
-        if (result.acquired) return result.value;
+      return withCandidateSlot(options.clients, fn);
+    },
 
-        const clients = options.clients();
-        if (clients.some(isEligible)) continue;
-        await waitForActivityChange();
-      }
+    async withAccountSlotFrom<T>(clients: readonly TClient[], fn: (client: TClient) => Promise<T>): Promise<T> {
+      const candidates = [...clients];
+      if (candidates.length === 0) throw new Error('沒有可用的 Telegram 帳號（全部離線）');
+      return withCandidateSlot(() => candidates, fn);
     },
 
     async withSlotOn<T>(client: TClient, fn: () => Promise<T>): Promise<T> {
@@ -125,6 +139,14 @@ export function nextAccount(): TelegramClientManager {
 /** Pick an account and hold one activity-aware file slot for fn's byte lifetime. */
 export function withAccountSlot<T>(fn: (client: TelegramClientManager) => Promise<T>): Promise<T> {
   return productionPool.withAccountSlot(fn);
+}
+
+/** Pick only from the supplied verified writers, then hold that writer's byte slot. */
+export function withAccountSlotFrom<T>(
+  clients: readonly TelegramClientManager[],
+  fn: (client: TelegramClientManager) => Promise<T>,
+): Promise<T> {
+  return productionPool.withAccountSlotFrom(clients, fn);
 }
 
 /** Hold a file slot on one pinned account; it never switches accounts while waiting. */

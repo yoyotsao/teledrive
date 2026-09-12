@@ -58,4 +58,6 @@ jobs:
           tests/test_storage_migration_partial_rollback.py
           tests/test_api_authz.py
       - name: Full isolated test suite
+        env:
+          VITE_ENABLE_STORAGE_MIGRATION: 'true'
         run: node scripts/run-tests.mjs

@@ -50,8 +50,8 @@ export class SegmentScheduler {
   constructor(private readonly options: SegmentSchedulerOptions) {
     this.maxJobsPerAccount = options.maxJobsPerAccount ?? MAX_CONCURRENT_FILES;
     this.clock = options.clock ?? Date.now;
-    this.setTimer = options.setTimer ?? setTimeout;
-    this.clearTimer = options.clearTimer ?? clearTimeout;
+    this.setTimer = options.setTimer ?? globalThis.setTimeout.bind(globalThis);
+    this.clearTimer = options.clearTimer ?? globalThis.clearTimeout.bind(globalThis);
     options.activity.subscribe(() => this.reevaluate());
   }
 

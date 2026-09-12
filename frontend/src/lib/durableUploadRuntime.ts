@@ -95,7 +95,9 @@ export async function resolveFrozenUploadContext(): Promise<FrozenUploadContext>
   frozenUploadContextInFlight = pending;
   try {
     const context = await pending;
-    frozenUploadContextCache = context;
+    if (frozenUploadContextInFlight === pending) {
+      frozenUploadContextCache = context;
+    }
     return context;
   } finally {
     if (frozenUploadContextInFlight === pending) {

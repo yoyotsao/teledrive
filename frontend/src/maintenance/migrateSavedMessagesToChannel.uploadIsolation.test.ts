@@ -94,7 +94,7 @@ describe('migration isolation from normal uploads', () => {
     })).resolves.toEqual(summary);
 
     expect(state.claimCalls).toBe(0);
-    expect(state.progress.at(-1)).toMatchObject({
+    expect(state.progress[state.progress.length - 1]).toMatchObject({
       phase: 'idle',
       currentSourceAccount: 42,
       lastError: 'Normal upload active; migration yielded',

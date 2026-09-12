@@ -1,8 +1,9 @@
-name: Migration Minimal CI
+name: Migration and Upload CI
 
 on:
   push:
     branches:
+      - feat/batched-storage-migration
       - feat/batched-storage-migration-minimal
   workflow_dispatch:
 
@@ -38,8 +39,18 @@ jobs:
         working-directory: frontend
         run: >-
           npx vitest run
+          src/components/ChonkyDrive.folderChannelUpload.test.ts
+          src/components/SettingsDialog.topology-invalidation.test.ts
+          src/lib/accountPool.test.ts
+          src/lib/accountPool.verified-writers.test.ts
+          src/lib/durableUploadRuntime.topology-cache.test.ts
+          src/lib/durableUploadWriters.test.ts
+          src/lib/splitUpload.test.ts
+          src/lib/splitUploadTarget.test.ts
+          src/lib/splitUpload.multi-writer-target.test.ts
           src/lib/segmentScheduler.browser-timer.test.ts
           src/lib/gramjsUploadSender.test.ts
+          src/lib/gramjsTargetAware.test.ts
           src/lib/forwardResult.test.ts
           src/lib/gramjs.forwardBatch.test.ts
           src/maintenance/migrateSavedMessagesToChannel.test.ts

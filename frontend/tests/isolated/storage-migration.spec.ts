@@ -416,13 +416,44 @@ test('uncertain reload recovery reuses the persisted operation/random id and nev
 
 test('applied migration exposes rollback and uses location-version CAS metadata only', async ({ page, openDrive }) => {
   await installMigrationTelegramHook(page);
-  const appliedItem = { ...makeJob().items[0], state: 'applied', version: 8, applied_location_version: 1 };
+  const operationId = 'rollback-op-stable';
+  const appliedItem = {
+    ...makeJob().items[0],
+    state: 'applied',
+    version: 8,
+    applied_location_version: 1,
+    operation_id: operationId,
+    operation_result_version: 2,
+  };
   const backend = await installMigrationApi(page, [makeJob({ state: 'completed', version: 6, items: [appliedItem] })]);
+  backend.operations.set(operationId, {
+    operation_id: operationId,
+    kind: 'migration',
+    logical_file_id: 'saved-file',
+    group_id: 'saved-file',
+    part_index: null,
+    uploader_id: 42,
+    target_kind: 'channel',
+    target_channel_id: '123456789',
+    target_peer_key: '123456789',
+    created_target_version: 3,
+    created_accounts_version: 2,
+    random_id: '9988776655443322',
+    rpc_kind: 'messages.forwardMessages',
+    request_metadata: { source: sourceLocation() },
+    state: 'sent',
+    version: 9,
+    result_version: 2,
+    destination_message_id: 901,
+    destination_media_kind: 'document',
+    destination_media_id: '9901',
+    destination_size: 12,
+  });
   await openDrive();
   await openMigration(page);
 
   await page.getByRole('button', { name: '回滾' }).click();
-  await expect(page.getByText('rolled_back')).toBeVisible();
+  await expect(page.getByText('rolled_back', { exact: true })).toBeVisible();
   const rollback = backend.logs.find(row => row.path.endsWith('/rollback'));
   expect(rollback?.body).toEqual({ expected_location_versions: { 'item-1': 1 } });
   expect(JSON.stringify(rollback?.body)).not.toMatch(/filename|parent|session|access_hash|bytes/i);

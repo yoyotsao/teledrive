@@ -43,7 +43,7 @@ import { RateLimiter } from "./rateLimiter";
 import { AdaptiveRateLimiter } from "./adaptiveRateLimiter";
 import { readMedia, isOwnAccount, senderDcFor, type MediaRef } from "./telegramMedia";
 import { sendWithDeadline, isTransientServerError } from './chunkSendGuard';
-import { unwrapForwardedMessage } from "./forwardResult";
+import { unwrapForwardedMessages } from "./forwardResult";
 import { installPremiumFloodTag, isPremiumFlood } from "./gramjsFloodPatch";
 import { formatAccountLog, resolveAccountLogName } from "./accountLog";
 import { recordUploadedBytes } from './uploadStatisticsSync';
@@ -323,12 +323,12 @@ export class TelegramClientManager {
    * concurrent parts each sleep and retry on their own schedule — exactly the
    * herd behavior the pacer's virtual-time scheduling avoids.
    *
-   * Both the sender handoff and the send itself run under a deadline. Neither
-   * can be trusted to settle on its own: getSender's _connectSender retries in
-   * an unbounded while(true), and MTProtoSender.send() returns a promise that
-   * gramjs abandons — never rejects — when the connection breaks. The caller
-   * holds an uploadSemaphore slot for this whole call, so an unbounded wait
-   * here costs the account that slot permanently.
+   * New uploads target the session's home DC, so request the already-connected
+   * main sender with getSender() and do not pass session.dcId. Passing the home
+   * dcId asks GramJS for an exported same-DC sender; its release/reconnect
+   * lifecycle can collide with pending file parts and cause a reconnect storm.
+   * The sender lookup and send still run under deadlines so a broken transport
+   * cannot hold an uploadSemaphore slot forever.
    *
    * Non-flood, non-transient errors are thrown to the caller (which has its
    * own retry loop).
@@ -346,7 +346,7 @@ export class TelegramClientManager {
       let sender: { send: (req: unknown) => Promise<unknown>; isConnected?: () => boolean } | undefined;
       try {
         await sendWithDeadline(async () => {
-          sender = await (client as any).getSender((client.session as any).dcId);
+          sender = await (client as any).getSender();
         }, CHUNK_SEND_TIMEOUT_MS, label);
         throwIfAborted(context?.hooks.signal);
         if (context && !context.hooks.onRpcStart()) throw new LeaseRevokedError();
@@ -1423,35 +1423,45 @@ export class TelegramClientManager {
     }
   }
 
-  /** Forward one message to an explicit frozen target using the persisted random id. */
-  async forwardToTarget(
+  /** Forward up to 100 messages to one frozen target with one persisted random id per source item. */
+  async forwardBatchToTarget(
     entity: any,
-    messageId: number,
+    entries: readonly { messageId: number; randomId: string }[],
     targetPeer: any,
-    randomId: string,
-  ): Promise<TargetAwareSendResult> {
+  ): Promise<TargetAwareSendResult[]> {
+    if (entries.length < 1 || entries.length > 100) {
+      throw new Error(`Forward batch size must be between 1 and 100 messages (got ${entries.length})`);
+    }
     await this.waitUntilReady();
     if (!this.client) throw new Error('Client not initialized');
+
+    const sourceMessageIds = entries.map((entry) => entry.messageId);
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.messageRateLimiter.wait();
         const result = await this.client.forwardMessages(targetPeer, {
-          messages: [messageId],
+          messages: sourceMessageIds,
           fromPeer: entity,
-          randomId: [bigInt(randomId) as any],
+          randomId: entries.map((entry) => bigInt(entry.randomId) as any),
         } as any);
-        const message = unwrapForwardedMessage(result, messageId) as Api.Message;
-        const ref = message.media ? readMedia(message.media) : null;
-        if (!ref) throw new Error(`Forwarded message ${message.id} has no readable media (source message ${messageId})`);
-        return {
-          messageId: message.id,
-          mediaKind: ref.kind,
-          mediaId: ref.id,
-          size: ref.size,
-          accessHash: ref.accessHash ? String(ref.accessHash) : undefined,
-          photoVariant: ref.kind === 'photo' ? ref.fullThumbSize : undefined,
-          message,
-        };
+        const messages = unwrapForwardedMessages(result, sourceMessageIds) as Api.Message[];
+        return messages.map((message, index) => {
+          const ref = message.media ? readMedia(message.media) : null;
+          if (!ref) {
+            throw new Error(
+              `Forwarded message ${message.id} has no readable media (source message ${sourceMessageIds[index]})`,
+            );
+          }
+          return {
+            messageId: message.id,
+            mediaKind: ref.kind,
+            mediaId: ref.id,
+            size: ref.size,
+            accessHash: ref.accessHash ? String(ref.accessHash) : undefined,
+            photoVariant: ref.kind === 'photo' ? ref.fullThumbSize : undefined,
+            message,
+          };
+        });
       } catch (err: any) {
         if (isFloodError(err) && attempt < 2) {
           this.penalizeForFlood('forwardMessages', err);
@@ -1460,7 +1470,21 @@ export class TelegramClientManager {
         throw err;
       }
     }
-    throw new Error(`Forward of message ${messageId} failed after retries`);
+    throw new Error(`Forward batch failed after retries (${entries.length} messages)`);
+  }
+
+  /** Forward one message using the batch primitive while preserving the existing API. */
+  async forwardToTarget(
+    entity: any,
+    messageId: number,
+    targetPeer: any,
+    randomId: string,
+  ): Promise<TargetAwareSendResult> {
+    return (await this.forwardBatchToTarget(
+      entity,
+      [{ messageId, randomId }],
+      targetPeer,
+    ))[0];
   }
 
   /** Legacy Saved Messages wrapper retained for existing pre-channel call sites. */

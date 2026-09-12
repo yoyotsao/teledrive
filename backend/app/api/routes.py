@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.models.schemas import (
     FileListResponse,
     FileInfo,
+    ClaimGroupRequest,
     CommitGroupRequest,
     CreateMigrationRequest,
     EvidenceRequest,
@@ -283,6 +284,41 @@ async def get_storage_migration(
     if migration is None:
         raise HTTPException(status_code=404, detail="Storage migration not found")
     return migration
+
+
+@router.get("/storage-migrations/{migration_id}/groups")
+async def list_storage_migration_groups(
+    migration_id: str,
+    scope: Literal["runnable", "applied"] = Query("runnable"),
+    after: Optional[str] = Query(None),
+    limit: int = Query(25, ge=1, le=25),
+    current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        result = await db.list_migration_groups(
+            current_user, migration_id, scope=scope, limit=limit, after=after,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Storage migration not found")
+    return result
+
+
+@router.post("/storage-migrations/{migration_id}/groups/{group_id}/claim")
+async def claim_storage_migration_group(
+    migration_id: str, group_id: str, request: ClaimGroupRequest,
+    current_user: int = Depends(get_current_user),
+):
+    db = await get_database()
+    try:
+        return await db.claim_migration_group(
+            current_user, migration_id, group_id, request.expected_item_versions,
+            lease_owner=request.lease_owner, lease_seconds=request.lease_seconds,
+        )
+    except Exception as exc:
+        raise _migration_error(exc) from exc
 
 
 @router.patch("/storage-migrations/{migration_id}/items/{item_id}")

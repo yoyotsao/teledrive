@@ -2,6 +2,16 @@ from conftest import OWNER_A
 from test_storage_migration import _evidence, _saved_file, _sent_operation, _target_channel
 
 
+async def _find_group(db, job, file_id, *, scope="runnable"):
+    page = await db.list_migration_groups(
+        OWNER_A, job["migration_id"], scope=scope, limit=25,
+    )
+    for group in page["groups"]:
+        if any(item["file_id"] == file_id for item in group["items"]):
+            return group
+    raise AssertionError(f"missing {scope} group for {file_id}")
+
+
 async def _apply_group(db, job, item, row, operation_id):
     operation = await _sent_operation(db, row, operation_id)
     claimed = await db.claim_migration_item(
@@ -43,14 +53,19 @@ async def test_partial_group_rollback_keeps_job_resumable_until_all_applied_grou
         target["accounts_version"],
     )
 
-    first_item = next(item for item in job["items"] if item["file_id"] == "first")
-    job = await _apply_group(db, job, first_item, first, "migration-first")
+    first_group = await _find_group(db, job, "first")
+    first_item = first_group["items"][0]
+    first_result = await _apply_group(db, job, first_item, first, "migration-first")
+    job = first_result["job"]
 
-    second_item = next(item for item in job["items"] if item["file_id"] == "second")
-    job = await _apply_group(db, job, second_item, second, "migration-second")
+    second_group = await _find_group(db, job, "second")
+    second_item = second_group["items"][0]
+    second_result = await _apply_group(db, job, second_item, second, "migration-second")
+    job = second_result["job"]
     assert job["state"] == "completed"
 
-    first_applied = next(item for item in job["items"] if item["file_id"] == "first")
+    first_applied_group = await _find_group(db, job, "first", scope="applied")
+    first_applied = first_applied_group["items"][0]
     partial = await db.rollback_migration_group(
         OWNER_A,
         job["migration_id"],
@@ -58,15 +73,15 @@ async def test_partial_group_rollback_keeps_job_resumable_until_all_applied_grou
         {first_applied["item_id"]: first_applied["applied_location_version"]},
     )
 
-    assert partial["state"] == "running"
-    assert next(item for item in partial["items"] if item["file_id"] == "first")["state"] == "rolled_back"
-    assert next(item for item in partial["items"] if item["file_id"] == "second")["state"] == "applied"
+    assert partial["job"]["state"] == "running"
+    assert partial["group"]["items"][0]["state"] == "rolled_back"
 
-    second_applied = next(item for item in partial["items"] if item["file_id"] == "second")
+    second_applied_group = await _find_group(db, partial["job"], "second", scope="applied")
+    second_applied = second_applied_group["items"][0]
     final = await db.rollback_migration_group(
         OWNER_A,
         job["migration_id"],
         second_applied["group_id"],
         {second_applied["item_id"]: second_applied["applied_location_version"]},
     )
-    assert final["state"] == "rolled_back"
+    assert final["job"]["state"] == "rolled_back"

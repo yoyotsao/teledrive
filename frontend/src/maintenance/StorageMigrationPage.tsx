@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, type StorageMigrationJob } from '../api/client.ts';
-import { rollbackMigrationJob, runMigrationJob } from './migrateSavedMessagesToChannel.ts';
+import {
+  pauseMigrationJob,
+  rollbackMigrationJob,
+  runMigrationJob,
+  type MigrationRunProgress,
+} from './migrateSavedMessagesToChannel.ts';
 
 const panel: React.CSSProperties = {
   maxWidth: 980,
@@ -18,9 +23,15 @@ const button: React.CSSProperties = {
   cursor: 'pointer',
 };
 
+const visibleStates = [
+  'planned', 'sending', 'recovering', 'uncertain', 'forwarded',
+  'pending_quorum', 'retryable', 'verified', 'applied', 'failed', 'blocked', 'rolled_back',
+];
+
 export default function StorageMigrationPage() {
   const [jobs, setJobs] = useState<StorageMigrationJob[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Record<string, MigrationRunProgress>>({});
   const [error, setError] = useState('');
 
   const reload = useCallback(async () => {
@@ -52,11 +63,15 @@ export default function StorageMigrationPage() {
     }
   };
 
+  const track = (jobId: string) => (next: MigrationRunProgress) => {
+    setProgress(current => ({ ...current, [jobId]: next }));
+  };
+
   const run = async (job: StorageMigrationJob) => {
     setBusy(job.migration_id);
     setError('');
     try {
-      const updated = await runMigrationJob(job.migration_id);
+      const updated = await runMigrationJob(job.migration_id, track(job.migration_id));
       setJobs(current => current.map(row => row.migration_id === updated.migration_id ? updated : row));
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? err?.message ?? String(err));
@@ -66,11 +81,19 @@ export default function StorageMigrationPage() {
     }
   };
 
+  const pause = (job: StorageMigrationJob) => {
+    pauseMigrationJob(job.migration_id);
+    setProgress(current => ({
+      ...current,
+      [job.migration_id]: { ...(current[job.migration_id] ?? {}), phase: 'paused' },
+    }));
+  };
+
   const rollback = async (job: StorageMigrationJob) => {
     setBusy(`rollback:${job.migration_id}`);
     setError('');
     try {
-      const updated = await rollbackMigrationJob(job.migration_id);
+      const updated = await rollbackMigrationJob(job.migration_id, track(job.migration_id));
       setJobs(current => current.map(row => row.migration_id === updated.migration_id ? updated : row));
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? err?.message ?? String(err));
@@ -86,7 +109,7 @@ export default function StorageMigrationPage() {
         <div>
           <h1 style={{ margin: 0, fontSize: 24 }}>Shared Channel Storage Migration</h1>
           <p style={{ margin: '6px 0 0', fontSize: 13, color: 'var(--td-text-muted)' }}>
-            維護工具：把既有 Saved Messages 實體位置搬到目前凍結的共用私人頻道。Telegram bytes 永遠只留在瀏覽器。
+            維護工具：分批把 Saved Messages 實體位置搬到目前凍結的共用私人頻道。Telegram bytes 永遠只留在瀏覽器。
           </p>
         </div>
         <a href="/" style={{ marginLeft: 'auto', color: 'var(--td-accent)' }}>返回檔案</a>
@@ -103,28 +126,49 @@ export default function StorageMigrationPage() {
       <section style={{ marginTop: 24, display: 'grid', gap: 12 }}>
         {jobs.length === 0 && <p style={{ color: 'var(--td-text-muted)' }}>尚無 migration job。</p>}
         {jobs.map(job => {
-          const applied = job.items.some(item => item.state === 'applied');
+          const applied = (job.item_counts.applied ?? 0) > 0;
+          const running = busy === job.migration_id;
+          const current = progress[job.migration_id];
           return (
             <article key={job.migration_id} style={{ border: '1px solid var(--td-border)', borderRadius: 8, padding: 14, background: 'var(--td-surface)' }}>
               <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                 <strong>{job.migration_id}</strong>
                 <span>{job.state}</span>
                 {job.dry_run && <span>dry-run</span>}
-                <span style={{ color: 'var(--td-text-muted)', fontSize: 12 }}>{job.items.length} item(s)</span>
-                {!job.dry_run && !['completed', 'rolled_back'].includes(job.state) && (
+                <span style={{ color: 'var(--td-text-muted)', fontSize: 12 }}>
+                  {job.total_groups} group(s) / {job.total_items} item(s)
+                </span>
+                {!job.dry_run && !['completed', 'rolled_back'].includes(job.state) && !running && (
                   <button style={{ ...button, marginLeft: 'auto' }} disabled={busy !== null} onClick={() => void run(job)}>
                     執行 / 繼續
                   </button>
                 )}
-                {applied && (
+                {running && (
+                  <button style={{ ...button, marginLeft: 'auto' }} onClick={() => pause(job)}>暫停</button>
+                )}
+                {applied && !running && (
                   <button style={{ ...button, marginLeft: 'auto' }} disabled={busy !== null} onClick={() => void rollback(job)}>
                     回滾
                   </button>
                 )}
               </div>
-              <div style={{ marginTop: 8, fontSize: 12, color: 'var(--td-text-muted)' }}>
-                {job.items.map(item => `${item.item_id}:${item.state}`).join(' · ')}
+              <div style={{ marginTop: 8, fontSize: 12, color: 'var(--td-text-muted)', display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                {visibleStates.filter(state => (job.item_counts[state] ?? 0) > 0).map(state => (
+                  <span key={state}>{state}: {job.item_counts[state]}</span>
+                ))}
               </div>
+              {(current?.currentGroupId || current?.currentSourceAccount) && (
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--td-text-muted)' }}>
+                  {current.currentGroupId && <>目前群組：{current.currentGroupId}</>}
+                  {current.currentSourceAccount && <> · 來源帳號：{current.currentSourceAccount}</>}
+                </div>
+              )}
+              {job.next_retry_at && (
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--td-text-muted)' }}>
+                  下次可重試：{new Date(job.next_retry_at).toLocaleString()}
+                </div>
+              )}
+              {current?.lastError && <div style={{ marginTop: 8, fontSize: 12 }}>{current.lastError}</div>}
             </article>
           );
         })}

@@ -41,6 +41,6 @@ describe('TelegramClientManager upload sender', () => {
     );
 
     expect(send).toHaveBeenCalledTimes(1);
-    expect(getSender).not.toHaveBeenCalled();
+    expect(getSender.mock.calls).toEqual([[]]);
   });
 });

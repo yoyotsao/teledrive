@@ -5,6 +5,7 @@ import { adoptClient, getClientFor, saveAccount, removeAccount, TelegramClientMa
 import UploadStatisticsPanel from './UploadStatisticsPanel';
 import { flushUploadStatistics } from '../lib/uploadStatisticsSync';
 import { StorageTargetDialog } from './StorageTargetDialog';
+import { invalidateFrozenUploadContext } from '../lib/durableUploadRuntime';
 
 type Props = { onClose: () => void };
 
@@ -76,6 +77,7 @@ export default function SettingsDialog({ onClose }: Props) {
       const accountName = linked.label ?? String(linked.telegram_user_id);
       adoptClient(linked.telegram_user_id, client, accountName);
       await saveAccount({ id: linked.telegram_user_id, label: accountName, session: sessionString });
+      invalidateFrozenUploadContext();
       setAdding(false);
       setLinking('');
       await reload();
@@ -94,6 +96,7 @@ export default function SettingsDialog({ onClose }: Props) {
         unlink: api.unlinkAccount,
         forget: removeAccount,
       });
+      invalidateFrozenUploadContext();
       await reload();
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? err?.message ?? String(err));
@@ -131,7 +134,7 @@ export default function SettingsDialog({ onClose }: Props) {
         </div>
 
         {tab === 'statistics' && <div id="settings-panel-statistics" role="tabpanel" aria-labelledby="settings-tab-statistics"><UploadStatisticsPanel /></div>}
-        {tab === 'storage' && <div id="settings-panel-storage" role="tabpanel" aria-labelledby="settings-tab-storage"><StorageTargetDialog /></div>}
+        {tab === 'storage' && <div id="settings-panel-storage" role="tabpanel" aria-labelledby="settings-tab-storage"><StorageTargetDialog onSaved={invalidateFrozenUploadContext} /></div>}
         <div id="settings-panel-accounts" role="tabpanel" aria-labelledby="settings-tab-accounts" hidden={tab !== 'accounts'}>
           <p style={{ margin: '0 0 16px', fontSize: 12, color: 'var(--td-text-muted)' }}>
             多綁幾個帳號，上傳會分散到各帳號並行，總吞吐大致等比放大。

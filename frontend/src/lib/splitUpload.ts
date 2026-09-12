@@ -37,9 +37,27 @@ export type SplitUploadProgressDetail =
 
 export type SplitUploadProgress = (percent: number, detail?: SplitUploadProgressDetail) => void;
 
-export interface FrozenSplitSendTarget {
+export interface FrozenSplitWriterTarget {
+  manager: TelegramClientManager;
   targetPeer: any;
+}
+
+export interface FrozenSplitAttemptContext {
+  segmentIndex: number;
+  accountId: number;
+}
+
+export interface FrozenSplitSendTarget {
+  targetPeer?: any;
   randomIds: readonly string[];
+  /** Verified writers for one immutable shared-channel target. */
+  writers?: readonly FrozenSplitWriterTarget[];
+  /** Durable intent hook. Runs before this segment can issue any Telegram RPC. */
+  beforeSegmentAttempt?: (context: FrozenSplitAttemptContext) => Promise<void>;
+  /** Durable result hook. Must finish before the scheduler marks the segment complete. */
+  afterSegmentAttempt?: (
+    context: FrozenSplitAttemptContext & { result: SegmentResult & { hasThumbnail: boolean } },
+  ) => Promise<void>;
 }
 
 export interface SplitUploadDependencies {
@@ -91,18 +109,40 @@ export function createUploadFileSpread(deps: SplitUploadDependencies): typeof up
     }
 
     const segments = plan(file.size);
-    const runners = (pinned ? [pinned] : deps.clients()).map((client) =>
-      client.asSegmentRunner(pinned ? sendTarget : undefined),
-    );
+    const targetWriters: readonly FrozenSplitWriterTarget[] = sendTarget?.writers?.length
+      ? sendTarget.writers
+      : pinned
+        ? [{ manager: pinned, targetPeer: sendTarget?.targetPeer }]
+        : deps.clients().map((manager) => ({ manager, targetPeer: sendTarget?.targetPeer }));
+    const runners = targetWriters.map(({ manager, targetPeer }) => {
+      const base = manager.asSegmentRunner(
+        sendTarget ? { targetPeer, randomIds: sendTarget.randomIds } : undefined,
+      );
+      if (!sendTarget?.beforeSegmentAttempt && !sendTarget?.afterSegmentAttempt) return base;
+      return {
+        accountId: base.accountId,
+        accountName: base.accountName,
+        run: async (attempt: Parameters<typeof base.run>[0]) => {
+          const context: FrozenSplitAttemptContext = {
+            segmentIndex: attempt.segment.index,
+            accountId: base.accountId,
+          };
+          await sendTarget.beforeSegmentAttempt?.(context);
+          const result = await base.run(attempt);
+          await sendTarget.afterSegmentAttempt?.({ ...context, result });
+          return result;
+        },
+      };
+    });
     const input: SegmentFileJobInput = {
       fileJobId: fileJobIdFor(file),
       file,
       segments,
       runners,
       thumb,
-      // A pinned caller may not move to another account; all other segment
-      // jobs deliberately defer account assignment to the shared scheduler.
-      migrationEnabled: !pinned,
+      // A durable multi-writer job may fan out at initial dispatch, but once a
+      // segment's uploader_id is persisted that segment must never migrate.
+      migrationEnabled: sendTarget?.writers?.length ? false : !pinned,
       onProgress: ({ logicalFileBytes }) => onProgress?.(percentage(logicalFileBytes, file.size)),
       onMigration: ({ logicalFileBytes, message }) => onProgress?.(
         percentage(logicalFileBytes, file.size),

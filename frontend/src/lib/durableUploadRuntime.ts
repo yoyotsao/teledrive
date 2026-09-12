@@ -1,17 +1,16 @@
 import { api, type TelegramOperation, type TelegramOperationRequest } from '../api/client.ts';
 import { validateChannelForAccount, resolveChannelPeerForAccount } from './channelStorage.ts';
 import { getAllClients, type SegmentResult, type TelegramClientManager } from './gramjs.ts';
+import { withAccountSlotFrom } from './accountPool.ts';
 import {
-  chooseFrozenUploadWriter,
   freezeUploadTarget,
-  runPreparedDurableUploadGroup,
-  type DurableOperationRecord,
   type DurableSendResult,
   type DurableUploadPart,
   type FrozenUploadTarget,
   type FrozenUploadWriter,
   type UploadManagerLike,
 } from './uploadOperations.ts';
+import { resolveFrozenUploadWriters } from './durableUploadWriters.ts';
 import { RecoveryCursorStore } from './telegramOperationRecovery.ts';
 import {
   planSegments,
@@ -52,23 +51,29 @@ function managerWriter(writer: FrozenUploadWriter): FrozenUploadWriter<TelegramC
 export async function resolveFrozenUploadContext(): Promise<{
   frozen: FrozenUploadTarget;
   writer: FrozenUploadWriter<TelegramClientManager>;
+  writers: FrozenUploadWriter<TelegramClientManager>[];
 }> {
   const [target, accounts] = await Promise.all([api.getStorageTarget(), api.listAccounts()]);
   const frozen = freezeUploadTarget(target, accounts);
   const managers = getAllClients() as unknown as UploadManagerLike[];
-  const selected = await chooseFrozenUploadWriter(frozen, managers, async (manager, channelId) => {
+  const selected = await resolveFrozenUploadWriters(frozen, managers, async (manager, channelId) => {
     const channelManager = manager as unknown as TelegramClientManager;
+    // App authentication becomes visible before every Telegram handshake has
+    // necessarily settled. Do not freeze a batch-wide writer snapshot while a
+    // linked secondary account is still connecting.
+    await channelManager.waitUntilReady();
     const verification = await validateChannelForAccount(channelManager as any, channelId);
     if (!verification.can_write) return { can_write: false, peer: null };
     const peer = await resolveChannelPeerForAccount(channelManager as any, channelId);
     return { can_write: peer != null, peer };
   });
-  return { frozen, writer: managerWriter(selected) };
+  const writers = selected.map(managerWriter);
+  return { frozen, writer: writers[0], writers };
 }
 
 function operationRequest(
   frozen: FrozenUploadTarget,
-  writer: FrozenUploadWriter<TelegramClientManager>,
+  uploaderId: number,
   file: File,
   part: DurableUploadPart,
   logicalFileId: string,
@@ -83,7 +88,7 @@ function operationRequest(
     logical_file_id: totalParts > 1 ? `${logicalFileId}:part:${part.partIndex}` : logicalFileId,
     group_id: groupId,
     part_index: part.partIndex,
-    uploader_id: writer.manager.accountId,
+    uploader_id: uploaderId,
     target_kind: frozen.storageMode,
     target_channel_id: frozen.channelId,
     target_peer_key: frozen.targetPeerKey,
@@ -97,8 +102,11 @@ function operationRequest(
       mime_type: file.type || undefined,
       parent_id: parentId ?? undefined,
       has_thumbnail: Boolean(part.hasThumbnail),
-      original_name: file.name,
+      is_split_file: totalParts > 1,
+      split_group_id: totalParts > 1 ? groupId ?? undefined : undefined,
+      part_index: part.partIndex,
       total_parts: totalParts,
+      original_name: file.name,
       ...(fileHash ? { file_hash: fileHash } : {}),
     },
   };
@@ -121,11 +129,25 @@ async function markSending(operation: TelegramOperation): Promise<TelegramOperat
   });
 }
 
-async function persistResult(
-  operation: TelegramOperation,
-  result: DurableSendResult,
-): Promise<TelegramOperation> {
-  return api.persistReconciledOperationResult({
+function reconcileError(error: unknown): { status: number | null; detail: string | null } {
+  const response = (error as {
+    response?: { status?: unknown; data?: { detail?: unknown } };
+  } | null)?.response;
+  return {
+    status: typeof response?.status === 'number' ? response.status : null,
+    detail: typeof response?.data?.detail === 'string' ? response.data.detail : null,
+  };
+}
+
+function persistedResultMatches(operation: TelegramOperation, result: DurableSendResult): boolean {
+  return operation.destination_message_id === result.messageId
+    && operation.destination_media_kind === result.mediaKind
+    && operation.destination_media_id === result.mediaId
+    && operation.destination_size === result.size;
+}
+
+function persistResultRequest(operation: TelegramOperation, result: DurableSendResult) {
+  return {
     operationId: operation.operation_id,
     expectedOperationVersion: operation.version,
     mapping: {
@@ -140,6 +162,54 @@ async function persistResult(
       destination_size: result.size,
       ...(result.photoVariant ? { destination_photo_variant: result.photoVariant } : {}),
     },
+  };
+}
+
+async function persistResult(
+  operation: TelegramOperation,
+  result: DurableSendResult,
+): Promise<TelegramOperation> {
+  try {
+    return await api.persistReconciledOperationResult(persistResultRequest(operation, result));
+  } catch (error) {
+    const { status, detail } = reconcileError(error);
+    console.error(
+      `[DurableUpload:${operation.operation_id}] reconcile-result failed`,
+      { status, detail, state: operation.state, version: operation.version, uploaderId: operation.uploader_id },
+    );
+    if (status !== 409 || detail !== 'Telegram operation version conflict') throw error;
+
+    // Telegram already accepted the message, so a metadata CAS race must not
+    // turn a successful upload into a failed file. Refresh the journal row and
+    // either retry from its current version or accept an identical terminal
+    // result that another recovery path already persisted.
+    const current = await api.getTelegramOperation(operation.operation_id);
+    if (['sent', 'registered', 'committed'].includes(current.state)) {
+      if (persistedResultMatches(current, result)) return current;
+      throw error;
+    }
+    if (!['sending', 'recovering', 'uncertain'].includes(current.state)) throw error;
+
+    console.warn(
+      `[DurableUpload:${operation.operation_id}] reconcile CAS advanced ${operation.version} -> ${current.version}; retrying`,
+    );
+    return api.persistReconciledOperationResult(persistResultRequest(current, result));
+  }
+}
+
+async function saveRecoveryCursor(
+  cursor: RecoveryCursorStore,
+  frozen: FrozenUploadTarget,
+  operation: TelegramOperation,
+  phase: 'intent_persisted' | 'result_persisted',
+): Promise<void> {
+  await cursor.save({
+    ownerId: frozen.primaryAccountId,
+    operationId: operation.operation_id,
+    randomId: operation.random_id,
+    uploaderId: operation.uploader_id,
+    targetPeerKey: operation.target_peer_key,
+    phase,
   });
 }
 
@@ -152,7 +222,7 @@ export async function durableUploadFile(
     onProgress?: SplitUploadProgress;
   },
 ): Promise<DurableUploadRuntimeResult> {
-  const { frozen, writer } = await resolveFrozenUploadContext();
+  const { frozen, writers } = await resolveFrozenUploadContext();
   const segmentPlan = file.size <= SMALL_FILE_LIMIT
     ? [{ index: 0, size: file.size }]
     : planSegments(file.size).map((segment) => ({ index: segment.index, size: segment.size }));
@@ -163,90 +233,100 @@ export async function durableUploadFile(
     randomId: generateDurableRandomId(),
     hasThumbnail: segment.index === 0 && Boolean(options.thumb),
   }));
+  const partByIndex = new Map(parts.map((part) => [part.partIndex, part] as const));
   const logicalFileId = uuid();
   const cursor = new RecoveryCursorStore();
   let uploadResult: SplitUploadResult | null = null;
   const operationIds = parts.map((part) => part.operationId);
 
   if (parts.length === 1) {
-    const request = operationRequest(
-      frozen, writer, file, parts[0], logicalFileId, null, 1, options.parentId, options.fileHash,
-    );
-    const planned = await api.createTelegramOperation(request);
-    const sending = await markSending(planned);
-    await cursor.save({
-      ownerId: frozen.primaryAccountId,
-      operationId: sending.operation_id,
-      randomId: sending.random_id,
-      uploaderId: sending.uploader_id,
-      targetPeerKey: sending.target_peer_key,
-      phase: 'intent_persisted',
-    });
-    uploadResult = await uploadFileSpread(
-      file,
-      options.onProgress,
-      options.thumb,
-      writer.manager,
-      { targetPeer: writer.peer, randomIds: [parts[0].randomId] },
-    );
-    const sent = await persistResult(sending, durableResult(uploadResult.parts[0]));
-    await cursor.save({
-      ownerId: frozen.primaryAccountId,
-      operationId: sent.operation_id,
-      randomId: sent.random_id,
-      uploaderId: sent.uploader_id,
-      targetPeerKey: sent.target_peer_key,
-      phase: 'result_persisted',
-    });
-    await api.registerTelegramOperation(sent.operation_id);
-    await cursor.clear();
-  } else {
-    const groupId = uuid();
-    await runPreparedDurableUploadGroup({
-      frozen,
-      writer,
-      groupId,
-      logicalFileId,
-      filename: file.name,
-      mimeType: file.type || undefined,
-      parentId: options.parentId,
-      fileHash: options.fileHash,
-      parts,
-    }, {
-      createOperation: async (raw) => api.createTelegramOperation(raw as unknown as TelegramOperationRequest) as unknown as Promise<DurableOperationRecord>,
-      markSending: async (operation) => markSending(operation as unknown as TelegramOperation) as unknown as Promise<DurableOperationRecord>,
-      saveCursor: async (value) => cursor.save({
-        ownerId: frozen.primaryAccountId,
-        operationId: value.operationId,
-        randomId: value.randomId,
-        uploaderId: value.uploaderId,
-        targetPeerKey: value.targetPeerKey,
-        phase: 'intent_persisted',
-      }),
-      sendAll: async (preparedParts) => {
-        uploadResult = await uploadFileSpread(
+    // Do not pin thousands of queued files to one writer before capacity is
+    // available. Acquire a slot from the verified writer set first; only then
+    // persist uploader_id and begin the Telegram RPC on that exact account.
+    uploadResult = await withAccountSlotFrom(
+      writers.map((writer) => writer.manager),
+      async (manager) => {
+        const writer = writers.find((candidate) => candidate.manager === manager)
+          ?? writers.find((candidate) => candidate.manager.accountId === manager.accountId);
+        if (!writer) throw new Error(`Verified writer ${manager.accountId} disappeared before upload`);
+
+        const request = operationRequest(
+          frozen,
+          writer.manager.accountId,
+          file,
+          parts[0],
+          logicalFileId,
+          null,
+          1,
+          options.parentId,
+          options.fileHash,
+        );
+        const planned = await api.createTelegramOperation(request);
+        const sending = await markSending(planned);
+        await saveRecoveryCursor(cursor, frozen, sending, 'intent_persisted');
+        const result = await uploadFileSpread(
           file,
           options.onProgress,
           options.thumb,
           writer.manager,
-          { targetPeer: writer.peer, randomIds: preparedParts.map((part) => part.randomId) },
+          { targetPeer: writer.peer, randomIds: [parts[0].randomId] },
         );
-        return uploadResult.parts.map(durableResult);
+        const sent = await persistResult(sending, durableResult(result.parts[0]));
+        await saveRecoveryCursor(cursor, frozen, sent, 'result_persisted');
+        await api.registerTelegramOperation(sent.operation_id);
+        return result;
       },
-      persistResult: async (operation, result) => {
-        const sent = await persistResult(operation as unknown as TelegramOperation, result);
-        await cursor.save({
-          ownerId: frozen.primaryAccountId,
-          operationId: sent.operation_id,
-          randomId: sent.random_id,
-          uploaderId: sent.uploader_id,
-          targetPeerKey: sent.target_peer_key,
-          phase: 'result_persisted',
-        });
-        return sent as unknown as DurableOperationRecord;
+    );
+    await cursor.clear();
+  } else {
+    const groupId = uuid();
+    const operations = new Map<number, TelegramOperation>();
+
+    uploadResult = await uploadFileSpread(
+      file,
+      options.onProgress,
+      options.thumb,
+      undefined,
+      {
+        randomIds: parts.map((part) => part.randomId),
+        writers: writers.map((writer) => ({
+          manager: writer.manager,
+          targetPeer: writer.peer,
+        })),
+        beforeSegmentAttempt: async ({ segmentIndex, accountId }) => {
+          const part = partByIndex.get(segmentIndex);
+          if (!part) throw new Error(`Missing durable upload part ${segmentIndex}`);
+          if (operations.has(segmentIndex)) {
+            throw new Error(`Durable upload segment ${segmentIndex} was dispatched more than once`);
+          }
+          const planned = await api.createTelegramOperation(operationRequest(
+            frozen,
+            accountId,
+            file,
+            part,
+            logicalFileId,
+            groupId,
+            parts.length,
+            options.parentId,
+            options.fileHash,
+          ));
+          const sending = await markSending(planned);
+          await saveRecoveryCursor(cursor, frozen, sending, 'intent_persisted');
+          operations.set(segmentIndex, sending);
+        },
+        afterSegmentAttempt: async ({ segmentIndex, result }) => {
+          const operation = operations.get(segmentIndex);
+          if (!operation) throw new Error(`Missing durable operation for segment ${segmentIndex}`);
+          const sent = await persistResult(operation, durableResult(result));
+          await saveRecoveryCursor(cursor, frozen, sent, 'result_persisted');
+        },
       },
-      registerGroup: async (id) => api.registerTelegramOperationGroup(id),
-    });
+    );
+
+    if (operations.size !== parts.length) {
+      throw new Error(`Incomplete durable upload intents: expected ${parts.length}, created ${operations.size}`);
+    }
+    await api.registerTelegramOperationGroup(groupId);
     await cursor.clear();
   }
 

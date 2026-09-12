@@ -46,6 +46,7 @@ jobs:
           src/maintenance/migrateSavedMessagesToChannel.transient.test.ts
           src/maintenance/migrateSavedMessagesToChannel.verificationBatch.test.ts
           src/maintenance/migrateSavedMessagesToChannel.uploadIsolation.test.ts
+          src/maintenance/migrateSavedMessagesToChannel.uploadYieldRace.test.ts
       - name: Focused backend migration regression
         working-directory: backend
         run: >-

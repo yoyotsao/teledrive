@@ -8,7 +8,7 @@
  * the whole file.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
-import { canonicalExistingParts } from './uploadPlanner.ts';
+import { canonicalExistingParts, splitRegistrationIdentity } from './uploadPlanner.ts';
 import { FileInfo } from '../types/index.ts';
 
 const SEGMENT = 524_288_000; // CHUNK_SIZE * MAX_PARTS_PER_FILE
@@ -116,6 +116,22 @@ describe('canonicalExistingParts', () => {
       ];
 
       expect(canonicalExistingParts(stubPlusIntact, ORIGINAL_SPLIT)).toHaveLength(3);
+    });
+  });
+});
+
+describe('splitRegistrationIdentity', () => {
+  it('omits the split group for a single-part upload', () => {
+    expect(splitRegistrationIdentity(1, 'generated-group')).toEqual({
+      isSplitFile: false,
+      splitGroupId: undefined,
+    });
+  });
+
+  it('retains the split group for a multi-part upload', () => {
+    expect(splitRegistrationIdentity(2, 'generated-group')).toEqual({
+      isSplitFile: true,
+      splitGroupId: 'generated-group',
     });
   });
 });

@@ -12,7 +12,7 @@ import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { ThumbBatchQueue } from '../lib/thumbQueue';
 import { ALBUM_BATCH } from '../config';
-import { registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, checkFileHashesBounded, canonicalExistingParts, assertPartsCoverFile, RegisterableExistingPart } from '../lib/uploadPlanner';
+import { registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, checkFileHashesBounded, canonicalExistingParts, assertPartsCoverFile, splitRegistrationIdentity, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { useUploadQueue } from '../hooks/useUploadQueue';
 import { safeErrorMessage, type UploadErrorStage } from '../lib/uploadQueue';
@@ -916,6 +916,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   ): Promise<void> => {
     assertPartsCoverFile(file, parts);
     const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const splitIdentity = splitRegistrationIdentity(parts.length, splitGroupId);
     await Promise.all(parts.map((part, i) =>
       api.registerFile({
         filename: file.name,
@@ -929,8 +930,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
         // Only genuinely multi-part uploads are "split files" — a single-part
         // result must report false so the backend's same-name+parent replace
         // logic (file_service.py's register_uploaded_file) can fire on re-upload.
-        isSplitFile: parts.length > 1,
-        splitGroupId: splitGroupId,
+        isSplitFile: splitIdentity.isSplitFile,
+        splitGroupId: splitIdentity.splitGroupId,
         partIndex: i,
         totalParts: parts.length,
         originalName: file.name,
@@ -1230,6 +1231,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
     ): Promise<void> => {
       assertPartsCoverFile(file, parts);
       const splitGroupId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      const splitIdentity = splitRegistrationIdentity(parts.length, splitGroupId);
       await Promise.all(parts.map((part, j) =>
         registerFileBounded({
           filename: file.name,
@@ -1240,8 +1242,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           accessHash: part.access_hash,
           parentId: folderId ?? undefined,
           hasThumbnail: j === 0 && hasThumbnail,
-          isSplitFile: parts.length > 1,
-          splitGroupId: splitGroupId,
+          isSplitFile: splitIdentity.isSplitFile,
+          splitGroupId: splitIdentity.splitGroupId,
           partIndex: j,
           totalParts: parts.length,
           originalName: file.name,

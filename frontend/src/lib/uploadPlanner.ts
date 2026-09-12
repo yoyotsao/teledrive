@@ -23,6 +23,18 @@ export function registerFileBounded(
   return registerSemaphore.withSlot(() => api.registerFile(params));
 }
 
+/** Keep single-message rows out of split-group workflows. */
+export function splitRegistrationIdentity(partCount: number, generatedGroupId: string): {
+  isSplitFile: boolean;
+  splitGroupId: string | undefined;
+} {
+  const isSplitFile = partCount > 1;
+  return {
+    isSplitFile,
+    splitGroupId: isSplitFile ? generatedGroupId : undefined,
+  };
+}
+
 /** Compute a file's dedup hash without blocking on upload concurrency slots. */
 export async function hashFileBounded(file: File): Promise<string | null> {
   return hashSemaphore.withSlot(() => sha256File(file).catch(() => null));

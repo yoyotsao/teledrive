@@ -1796,7 +1796,10 @@ class Database:
         file_row = await self.get_file(file_id, owner_id)
         if file_row is None:
             raise KeyError("File not found")
-        if file_row["is_split_file"] or file_row["split_group_id"]:
+        # Older single-message registrations populated split_group_id even
+        # though is_split_file was false. They are still logical single files
+        # and must use this endpoint; genuine split rows remain group-only.
+        if file_row["is_split_file"]:
             raise ValueError("split file location must be switched through its group")
         await self._conn.execute("BEGIN IMMEDIATE")
         try:

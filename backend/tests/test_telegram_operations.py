@@ -268,3 +268,33 @@ async def test_single_location_switch_preserves_logical_metadata_and_is_idempote
     assert row["parent_id"] == "folder"
     assert row["telegram_message_id"] == 42
     assert row["location_version"] == 1
+
+
+async def test_single_location_switch_accepts_legacy_single_part_group_id(db):
+    await db.insert_file(
+        "legacy-single", "legacy.bin", 17, "application/octet-stream", "other", 7,
+        "2026-01-01T00:00:00+00:00", None, "old-hash", "folder", False,
+        is_split_file=False, part_index=0, total_parts=1, split_group_id="legacy-group",
+        owner_id=OWNER_A, telegram_user_id=OWNER_A,
+    )
+    current = await db.get_file("legacy-single", OWNER_A)
+    source = {
+        key: current[key]
+        for key in (
+            "file_id", "telegram_user_id", "telegram_chat_id", "telegram_message_id",
+            "telegram_media_kind", "telegram_media_id", "telegram_media_size",
+            "telegram_photo_variant", "location_version", "access_hash",
+        )
+    }
+    operation = await _sent_operation(
+        db, "move-legacy-single", "legacy-single", "1000000001004", source=source,
+    )
+
+    switched = await db.switch_existing_file_location(
+        OWNER_A, "legacy-single", 0, operation["operation_id"], operation["result_version"],
+    )
+
+    row = await db.get_file("legacy-single", OWNER_A)
+    assert switched["location_version"] == 1
+    assert row["telegram_message_id"] == 42
+    assert row["location_version"] == 1

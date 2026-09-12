@@ -1,8 +1,9 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { CustomFile } from "telegram/client/uploads";
-import { Api } from "telegram/tl";
+import { Api, serializeBytes } from "telegram/tl";
 import bigInt from "big-integer";
+import type { Buffer as BufferType } from "buffer";
 import {
   MAX_CONCURRENT_CHUNKS,
   CHUNK_RETRY_COUNT,
@@ -51,6 +52,11 @@ import { accountActivityRegistry } from './accountActivityRegistry';
 import { uploadSpeedTracker } from './uploadSpeedTracker';
 import type { AttemptLease, SegmentAttemptHooks, SegmentAttemptInput, SegmentAttemptRunner, SegmentResult } from './segmentUploadTypes';
 export type { SegmentResult } from './segmentUploadTypes';
+
+// telegram@2.26.21 validates byte fields with `instanceof` against the exact
+// Buffer constructor captured inside its serializer. The page-level polyfill
+// may be a separate bundled copy, so derive the constructor from GramJS itself.
+const TelegramBuffer = serializeBytes('').constructor as typeof BufferType;
 
 // Adaptive FLOOD backoff: if a message send fails with FLOOD_WAIT, penalize
 // that account's limiter so its pending sends slow down instead of piling more
@@ -602,7 +608,7 @@ export class TelegramClientManager {
 
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const buffer = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+      const buffer = TelegramBuffer.from(new Uint8Array(arrayBuffer));
       const customFile = new CustomFile(file.name, file.size, "", buffer);
 
       const { message, hasThumbnail } = await this.sendFileWithOptionalThumb({
@@ -661,7 +667,7 @@ export class TelegramClientManager {
         const offset = segment.offset + partIdx * PART_SIZE;
         const chunk = file.slice(offset, Math.min(offset + PART_SIZE, file.size));
         throwIfAborted(hooks.signal);
-        const bytes = (globalThis as any).Buffer.from(new Uint8Array(await chunk.arrayBuffer()));
+        const bytes = TelegramBuffer.from(new Uint8Array(await chunk.arrayBuffer()));
 
         for (let retry = 0; retry < CHUNK_RETRY_COUNT; retry++) {
           throwIfAborted(hooks.signal);
@@ -808,14 +814,14 @@ export class TelegramClientManager {
     try {
       const t0 = performance.now();
       const arrayBuffer = await file.arrayBuffer();
-      const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+      const buf = TelegramBuffer.from(new Uint8Array(arrayBuffer));
       const tRead = performance.now();
       const fileHandle = await this.uploadFilePartsPaced(buf, file.name);
       const tBytes = performance.now();
 
       let uploadedThumb: unknown;
       if (thumb) {
-        const thumbBuf = (globalThis as any).Buffer.from(new Uint8Array(await thumb.arrayBuffer()));
+        const thumbBuf = TelegramBuffer.from(new Uint8Array(await thumb.arrayBuffer()));
         uploadedThumb = await this.uploadFilePartsPaced(thumbBuf, 'thumb.jpg');
       }
       const tThumb = performance.now();
@@ -959,7 +965,7 @@ export class TelegramClientManager {
       await Promise.all(prepared.map(async (p, i) => {
         try {
           const arrayBuffer = await p.file.arrayBuffer();
-          const buf = (globalThis as any).Buffer.from(new Uint8Array(arrayBuffer));
+          const buf = TelegramBuffer.from(new Uint8Array(arrayBuffer));
           const customFile = new CustomFile(p.file.name, p.file.size, "", buf);
           const message = await this.sendFileLocked({
             file: customFile,

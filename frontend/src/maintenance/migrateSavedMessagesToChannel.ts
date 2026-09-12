@@ -9,6 +9,7 @@ import { getClientFor } from '../lib/gramjs.ts';
 import { readMedia } from '../lib/telegramMedia.ts';
 import { resolveChannelPeerForAccount, validateChannelForAccount } from '../lib/channelStorage.ts';
 import { RecoveryCursorStore } from '../lib/telegramOperationRecovery.ts';
+import { accountActivityRegistry } from '../lib/accountActivityRegistry.ts';
 
 type MigrationMediaResult = {
   messageId: number;
@@ -78,11 +79,33 @@ declare global {
 
 const LEASE_SECONDS = 300;
 const GROUP_PAGE_SIZE = 25;
-const FORWARD_BATCH_SIZE = 100;
+const FORWARD_BATCH_SIZE = 25;
+const NORMAL_UPLOAD_YIELD_MESSAGE = 'Normal upload active; migration yielded';
+const RETRY_CONFLICT_ACCEPTED_STATES = new Set(['retryable', 'sent', 'registered', 'committed']);
 const activeRuns = new Map<string, RunControl>();
+
+type MigrationRetryClassification = 'mapping-gap' | 'flood' | 'server-transient' | 'version-conflict';
 
 function isConflict(error: unknown): boolean {
   return Number((error as any)?.response?.status) === 409;
+}
+
+function backendErrorDetail(error: unknown): string | null {
+  const detail = (error as any)?.response?.data?.detail;
+  if (detail == null) return null;
+  if (typeof detail === 'string') return detail;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(detail);
+  }
+}
+
+class MigrationUploadActiveError extends Error {
+  constructor(readonly sourceAccountId: number) {
+    super(NORMAL_UPLOAD_YIELD_MESSAGE);
+    this.name = 'MigrationUploadActiveError';
+  }
 }
 
 class MigrationForwardBatchError extends Error {
@@ -92,11 +115,21 @@ class MigrationForwardBatchError extends Error {
   }
 }
 
+function assertMigrationSourceIdle(sourceAccountId: number): void {
+  if (!accountActivityRegistry.isTrulyIdle(sourceAccountId)) {
+    throw new MigrationUploadActiveError(sourceAccountId);
+  }
+}
+
 function forwardErrorText(error: unknown): string {
   const value = error as any;
   return [value?.errorMessage, value?.message, value?.response?.data?.detail]
     .filter(Boolean)
     .join(' ');
+}
+
+function errorDetailText(error: unknown): string {
+  return backendErrorDetail(error) ?? (forwardErrorText(error) || 'unknown');
 }
 
 function transientForwardLeaseSeconds(error: unknown): number | null {
@@ -110,6 +143,25 @@ function transientForwardLeaseSeconds(error: unknown): number | null {
   const status = Number(value?.response?.status);
   if ((status >= 500 && status < 600) || /(^|\D)5\d\d(?=\D|$)/.test(text)) return 10;
   return null;
+}
+
+function missingForwardSourceMessageId(error: unknown): number | null {
+  const match = forwardErrorText(error).match(/Forward of message (\d+) returned no message/i);
+  if (!match) return null;
+  const messageId = Number(match[1]);
+  return Number.isFinite(messageId) ? messageId : null;
+}
+
+function isForwardMappingGap(error: unknown): boolean {
+  const text = forwardErrorText(error);
+  return /forward result count mismatch:/i.test(text)
+    || /Forward of message \d+ returned no message/i.test(text);
+}
+
+function classifyForwardRetry(error: unknown): Exclude<MigrationRetryClassification, 'version-conflict'> {
+  if (isForwardMappingGap(error)) return 'mapping-gap';
+  if (forwardErrorText(error).includes('FLOOD')) return 'flood';
+  return 'server-transient';
 }
 
 function sourceNumber(item: StorageMigrationItem, key: string): number {
@@ -145,6 +197,7 @@ async function productionForwardBatch(
   if (manager.offline) throw new Error(`Source account ${accountId} is offline`);
   const peer = await resolveChannelPeerForAccount(manager as any, targetChannelId);
   if (!peer) throw new Error(`Channel ${targetChannelId} is unavailable to source account ${accountId}`);
+  assertMigrationSourceIdle(accountId);
   const results = await manager.forwardBatchToTarget(
     'me',
     entries.map((entry) => ({ messageId: entry.sourceMessageId, randomId: entry.randomId })),
@@ -395,6 +448,42 @@ type PreparedForward = {
   sourceMessageId: number;
 };
 
+type FailedPreparedBatch = {
+  prepared: PreparedForward[];
+  error: unknown;
+  leaseSeconds: number;
+};
+
+type IsolatedForwardResult = {
+  reconciled: StorageMigrationItem[];
+  failedBatches: FailedPreparedBatch[];
+};
+
+type ParkedForwardResult = {
+  items: StorageMigrationItem[];
+  failedItemIds: Set<string>;
+};
+
+function logMigrationRetry(
+  prepared: PreparedForward[],
+  error: unknown,
+  retryAt: string,
+  classification: MigrationRetryClassification,
+): void {
+  const first = prepared[0];
+  const sourceMessageId = missingForwardSourceMessageId(error)
+    ?? (prepared.length === 1 ? first?.sourceMessageId ?? null : null);
+  const detail = errorDetailText(error);
+  console.warn(
+    `[Migration] retry classification=${classification}`
+      + ` sourceAccount=${first?.sourceAccountId ?? 'unknown'}`
+      + ` sourceMessageId=${sourceMessageId ?? 'unknown'}`
+      + ` subsetSize=${prepared.length}`
+      + ` retryAt=${retryAt}`
+      + ` detail=${detail}`,
+  );
+}
+
 async function prepareFreshForward(
   job: StorageMigrationJob,
   item: StorageMigrationItem,
@@ -427,6 +516,7 @@ async function sendPreparedBatch(
   if (prepared.some((entry) => entry.sourceAccountId !== sourceAccountId)) {
     throw new Error('Migration forward batch may not mix source accounts');
   }
+  assertMigrationSourceIdle(sourceAccountId);
   let results: MigrationMediaResult[];
   try {
     results = await telegramAdapter().forwardBatch({
@@ -459,28 +549,128 @@ async function sendPreparedBatch(
   return reconciled;
 }
 
+async function sendPreparedBatchIsolated(
+  job: StorageMigrationJob,
+  prepared: PreparedForward[],
+): Promise<IsolatedForwardResult> {
+  try {
+    return { reconciled: await sendPreparedBatch(job, prepared), failedBatches: [] };
+  } catch (error) {
+    const original = error instanceof MigrationForwardBatchError ? error.original : error;
+    const mappingGap = isForwardMappingGap(original);
+    const leaseSeconds = transientForwardLeaseSeconds(original) ?? (mappingGap ? LEASE_SECONDS : null);
+    if (leaseSeconds == null) {
+      if (error instanceof MigrationForwardBatchError) throw original;
+      throw error;
+    }
+
+    if (!mappingGap || prepared.length === 1) {
+      return {
+        reconciled: [],
+        failedBatches: [{ prepared, error: original, leaseSeconds }],
+      };
+    }
+
+    const missingSourceMessageId = missingForwardSourceMessageId(original);
+    if (missingSourceMessageId != null) {
+      const failedIndex = prepared.findIndex((entry) => entry.sourceMessageId === missingSourceMessageId);
+      if (failedIndex >= 0) {
+        const isolated = prepared[failedIndex];
+        const remainder = prepared.filter((_, index) => index !== failedIndex);
+        const remainderResult = remainder.length > 0
+          ? await sendPreparedBatchIsolated(job, remainder)
+          : { reconciled: [], failedBatches: [] };
+        const isolatedResult = await sendPreparedBatchIsolated(job, [isolated]);
+        return {
+          reconciled: [...remainderResult.reconciled, ...isolatedResult.reconciled],
+          failedBatches: [...remainderResult.failedBatches, ...isolatedResult.failedBatches],
+        };
+      }
+    }
+
+    const splitAt = Math.ceil(prepared.length / 2);
+    const left = await sendPreparedBatchIsolated(job, prepared.slice(0, splitAt));
+    const right = await sendPreparedBatchIsolated(job, prepared.slice(splitAt));
+    return {
+      reconciled: [...left.reconciled, ...right.reconciled],
+      failedBatches: [...left.failedBatches, ...right.failedBatches],
+    };
+  }
+}
+
+async function markMigrationOperationRetryable(
+  entry: PreparedForward,
+  retryAt: string,
+  errorCode: string,
+): Promise<TelegramOperation> {
+  const patch = (operation: TelegramOperation) => api.patchTelegramOperation(operation.operation_id, {
+    expected_operation_version: operation.version,
+    state: 'retryable',
+    retry_at: retryAt,
+    error_code: errorCode,
+  });
+
+  try {
+    return await patch(entry.operation);
+  } catch (error) {
+    if (!isConflict(error)) throw error;
+    logMigrationRetry([entry], error, retryAt, 'version-conflict');
+    let current = await api.getTelegramOperation(entry.operation.operation_id);
+    if (RETRY_CONFLICT_ACCEPTED_STATES.has(current.state)) return current;
+    if (!['sending', 'recovering'].includes(current.state) || current.version === entry.operation.version) {
+      throw error;
+    }
+
+    try {
+      return await patch(current);
+    } catch (retryError) {
+      if (!isConflict(retryError)) throw retryError;
+      logMigrationRetry([entry], retryError, retryAt, 'version-conflict');
+      current = await api.getTelegramOperation(entry.operation.operation_id);
+      if (RETRY_CONFLICT_ACCEPTED_STATES.has(current.state)) return current;
+      throw retryError;
+    }
+  }
+}
+
 async function parkTransientForwardBatch(
   prepared: PreparedForward[],
   leaseOwner: string,
   error: unknown,
   leaseSeconds: number,
-): Promise<StorageMigrationItem[]> {
+): Promise<ParkedForwardResult> {
   const detail = forwardErrorText(error).slice(0, 1024) || 'Transient Telegram forward failure';
-  const parked: StorageMigrationItem[] = [];
+  const retryAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  logMigrationRetry(prepared, error, retryAt, classifyForwardRetry(error));
+  const items: StorageMigrationItem[] = [];
+  const failedItemIds = new Set<string>();
   for (const entry of prepared) {
-    try {
-      await api.patchTelegramOperation(entry.operation.operation_id, {
-        expected_operation_version: entry.operation.version,
-        state: 'retryable',
-        error_code: detail.slice(0, 255),
-      });
-    } catch (operationError) {
-      if (!isConflict(operationError)) {
-        console.warn('[Migration] Failed to mark operation retryable:', entry.operation.operation_id, operationError);
+    const operation = await markMigrationOperationRetryable(entry, retryAt, detail.slice(0, 255));
+    if (operation.state !== 'retryable') {
+      if (operation.result_version != null) {
+        try {
+          items.push(await api.reconcileMigrationItem({
+            migrationId: entry.item.migration_id,
+            itemId: entry.item.item_id,
+            expectedItemVersion: entry.leased.version,
+            operationResultVersion: operation.result_version,
+          }));
+          continue;
+        } catch (reconcileError) {
+          if (!isConflict(reconcileError)) throw reconcileError;
+          console.warn(
+            `[Migration] Failed to reconcile progressed operation item=${entry.item.item_id}`
+              + ` detail=${errorDetailText(reconcileError)}`,
+          );
+        }
       }
+      items.push(entry.leased);
+      failedItemIds.add(entry.item.item_id);
+      continue;
     }
+    failedItemIds.add(entry.item.item_id);
     try {
-      parked.push(await api.claimMigrationItem({
+      items.push(await api.claimMigrationItem({
         migrationId: entry.item.migration_id,
         itemId: entry.item.item_id,
         expectedVersion: entry.leased.version,
@@ -492,12 +682,15 @@ async function parkTransientForwardBatch(
       }));
     } catch (itemError) {
       if (!isConflict(itemError)) {
-        console.warn('[Migration] Failed to park item after transient forward error:', entry.item.item_id, itemError);
+        console.warn(
+          `[Migration] Failed to park item after transient forward error item=${entry.item.item_id}`
+            + ` detail=${errorDetailText(itemError)}`,
+        );
       }
-      parked.push(entry.leased);
+      items.push(entry.leased);
     }
   }
-  return parked;
+  return { items, failedItemIds };
 }
 
 async function recoverWithoutBlindSend(
@@ -545,6 +738,7 @@ async function forwardItem(
     phase: 'rpc_started',
   });
 
+  assertMigrationSourceIdle(sourceAccountId);
   const result = await telegramAdapter().forward({
     accountId: sourceAccountId,
     sourceMessageId,
@@ -586,13 +780,18 @@ async function collectEvidenceBatch(
 
   const accounts = await api.listAccounts();
   const adapter = telegramAdapter();
+  const evidenceFreshCutoff = Date.now() - 4 * 60 * 1000;
   for (const account of accounts) {
     const candidates = items.flatMap((original) => {
       const current = currentByItem.get(original.item_id) ?? original;
       const operation = operations.get(original.item_id);
       if (!operation) return [];
-      if (current.evidence.some((row) => row.telegram_user_id === account.telegram_user_id
-        && row.result_version === operation.result_version)) return [];
+      const existing = current.evidence.find((row) => row.telegram_user_id === account.telegram_user_id
+        && row.result_version === operation.result_version);
+      if (existing) {
+        const checkedAt = Date.parse(existing.checked_at);
+        if (Number.isFinite(checkedAt) && checkedAt >= evidenceFreshCutoff) return [];
+      }
       return [{ item: current, operation }];
     });
     if (candidates.length === 0) continue;
@@ -670,7 +869,6 @@ async function processItem(
     const operation = await api.getTelegramOperation(item.operation_id);
     current = await recoverWithoutBlindSend(job, item, operation);
     if (current.state === item.state) {
-      // Sending/recovering may safely replay the same persisted random id only.
       current = await forwardItem(job, item, leaseOwner);
     }
   }
@@ -679,6 +877,14 @@ async function processItem(
 
 function expectedVersions(group: StorageMigrationGroup): Record<string, number> {
   return Object.fromEntries(group.items.map(item => [item.item_id, item.version]));
+}
+
+function busySourceAccount(group: StorageMigrationGroup): number | null {
+  const sourceAccountIds = new Set(group.items.map((item) => sourceNumber(item, 'telegram_user_id')));
+  for (const sourceAccountId of sourceAccountIds) {
+    if (!accountActivityRegistry.isTrulyIdle(sourceAccountId)) return sourceAccountId;
+  }
+  return null;
 }
 
 export function pauseMigrationJob(jobId: string): void {
@@ -697,8 +903,9 @@ export async function runMigrationJob(
   activeRuns.set(jobId, control);
   onProgress?.({ phase: 'running' });
 
-  const claimWindow = async (): Promise<StorageMigrationGroup[]> => {
+  const claimWindow = async (): Promise<{ groups: StorageMigrationGroup[]; busySourceAccountId: number | null }> => {
     const claimed: StorageMigrationGroup[] = [];
+    let busySourceAccountId: number | null = null;
     let itemCount = 0;
     while (!control.pauseRequested && itemCount < FORWARD_BATCH_SIZE) {
       const page = await api.listMigrationGroups({
@@ -712,6 +919,11 @@ export async function runMigrationJob(
       for (const candidate of page.groups) {
         if (control.pauseRequested) break;
         if (claimed.length > 0 && itemCount + candidate.items.length > FORWARD_BATCH_SIZE) break;
+        const busyAccount = busySourceAccount(candidate);
+        if (busyAccount != null) {
+          busySourceAccountId ??= busyAccount;
+          continue;
+        }
         try {
           const result = await api.claimMigrationGroup({
             migrationId: jobId,
@@ -732,13 +944,17 @@ export async function runMigrationJob(
       }
       if (!claimedAny) break;
     }
-    return claimed;
+    return { groups: claimed, busySourceAccountId };
   };
 
   try {
     while (!control.pauseRequested) {
-      const claimedGroups = await claimWindow();
-      if (claimedGroups.length === 0) break;
+      const claim = await claimWindow();
+      const claimedGroups = claim.groups;
+      if (claimedGroups.length === 0) {
+        if (claim.busySourceAccountId != null) throw new MigrationUploadActiveError(claim.busySourceAccountId);
+        break;
+      }
 
       const currentByItem = new Map<string, StorageMigrationItem>();
       const prepared: PreparedForward[] = [];
@@ -775,23 +991,27 @@ export async function runMigrationJob(
         for (let offset = 0; offset < entries.length; offset += FORWARD_BATCH_SIZE) {
           if (control.pauseRequested) break;
           const chunk = entries.slice(offset, offset + FORWARD_BATCH_SIZE);
-          try {
-            const reconciled = await sendPreparedBatch(job, chunk);
-            reconciled.forEach((item) => currentByItem.set(item.item_id, item));
-          } catch (error) {
-            if (!(error instanceof MigrationForwardBatchError)) throw error;
-            const leaseSeconds = transientForwardLeaseSeconds(error.original);
-            if (leaseSeconds == null) throw error.original;
-            const parked = await parkTransientForwardBatch(chunk, control.runId, error.original, leaseSeconds);
-            parked.forEach((item) => currentByItem.set(item.item_id, item));
-            chunk.forEach((entry) => skippedGroupIds.add(entry.item.group_id));
-            onProgress?.({
-              phase: 'running',
-              currentGroupId: chunk[0]?.item.group_id,
-              currentSourceAccount: chunk[0]?.sourceAccountId,
-              lastError: `Skipped transient forward batch (${chunk.length} items): ${forwardErrorText(error.original)}`,
-            });
-            console.warn(`[Migration] Skipped transient forward batch x${chunk.length}; retry in ~${leaseSeconds}s`, error.original);
+          const isolated = await sendPreparedBatchIsolated(job, chunk);
+          isolated.reconciled.forEach((item) => currentByItem.set(item.item_id, item));
+
+          for (const failure of isolated.failedBatches) {
+            const parked = await parkTransientForwardBatch(
+              failure.prepared,
+              control.runId,
+              failure.error,
+              failure.leaseSeconds,
+            );
+            parked.items.forEach((item) => currentByItem.set(item.item_id, item));
+            const actualFailures = failure.prepared.filter((entry) => parked.failedItemIds.has(entry.item.item_id));
+            actualFailures.forEach((entry) => skippedGroupIds.add(entry.item.group_id));
+            if (actualFailures.length > 0) {
+              onProgress?.({
+                phase: 'running',
+                currentGroupId: actualFailures[0]?.item.group_id,
+                currentSourceAccount: actualFailures[0]?.sourceAccountId,
+                lastError: `Skipped transient forward ${actualFailures.length === 1 ? 'item' : 'batch'} (${actualFailures.length} items): ${forwardErrorText(failure.error)}`,
+              });
+            }
           }
         }
         if (control.pauseRequested) break;
@@ -823,9 +1043,6 @@ export async function runMigrationJob(
             job = await api.getMigrationJob(jobId);
           }
         } else {
-          // Re-lease incomplete groups after reconcile clears item leases. This
-          // parks quorum/recovery work so the next bounded page can advance to
-          // later groups instead of spinning on the same first 25 groups.
           try {
             const result = await api.claimMigrationGroup({
               migrationId: jobId,
@@ -850,9 +1067,19 @@ export async function runMigrationJob(
     else onProgress?.({ phase: 'idle' });
     return job;
   } catch (error) {
+    if (error instanceof MigrationUploadActiveError) {
+      job = await api.getMigrationJob(jobId);
+      onProgress?.({
+        phase: 'idle',
+        currentSourceAccount: error.sourceAccountId,
+        lastError: NORMAL_UPLOAD_YIELD_MESSAGE,
+      });
+      console.info(`[Migration] yielded sourceAccount=${error.sourceAccountId} reason=${NORMAL_UPLOAD_YIELD_MESSAGE}`);
+      return job;
+    }
     onProgress?.({
       phase: control.pauseRequested ? 'paused' : 'idle',
-      lastError: (error as any)?.response?.data?.detail ?? (error as Error)?.message ?? String(error),
+      lastError: backendErrorDetail(error) ?? (error as Error)?.message ?? String(error),
     });
     if (isConflict(error)) return api.getMigrationJob(jobId);
     throw error;

@@ -39,6 +39,7 @@ jobs:
         run: >-
           npx vitest run
           src/lib/segmentScheduler.browser-timer.test.ts
+          src/lib/gramjsUploadSender.test.ts
           src/lib/forwardResult.test.ts
           src/lib/gramjs.forwardBatch.test.ts
           src/maintenance/migrateSavedMessagesToChannel.test.ts

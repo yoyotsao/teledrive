@@ -198,18 +198,21 @@ function resetMigration(count: number) {
 describe('batched migration verification', () => {
   beforeEach(() => resetMigration(0));
 
-  it('verifies 100 destinations with one Telegram read per reader plus one batched source probe', async () => {
+  it('verifies 100 destinations in bounded 25-item read batches for each reader and source probe', async () => {
     resetMigration(100);
 
     const result = await runMigrationJob('migration-verify-batch');
 
     expect(result.state).toBe('completed');
-    expect(state.getMessagesCalls).toHaveLength(3);
-    const source = state.getMessagesCalls.find((call) => call.accountId === 42 && call.peer === 'me');
-    const reader42 = state.getMessagesCalls.find((call) => call.accountId === 42 && call.peer !== 'me');
-    const reader77 = state.getMessagesCalls.find((call) => call.accountId === 77 && call.peer !== 'me');
-    expect(source?.ids).toHaveLength(100);
-    expect(reader42?.ids).toHaveLength(100);
-    expect(reader77?.ids).toHaveLength(100);
+    expect(state.getMessagesCalls).toHaveLength(12);
+    const sourceCalls = state.getMessagesCalls.filter((call) => call.accountId === 42 && call.peer === 'me');
+    const reader42Calls = state.getMessagesCalls.filter((call) => call.accountId === 42 && call.peer !== 'me');
+    const reader77Calls = state.getMessagesCalls.filter((call) => call.accountId === 77 && call.peer !== 'me');
+    expect(sourceCalls.map((call) => call.ids.length)).toEqual([25, 25, 25, 25]);
+    expect(reader42Calls.map((call) => call.ids.length)).toEqual([25, 25, 25, 25]);
+    expect(reader77Calls.map((call) => call.ids.length)).toEqual([25, 25, 25, 25]);
+    expect(sourceCalls.flatMap((call) => call.ids)).toHaveLength(100);
+    expect(reader42Calls.flatMap((call) => call.ids)).toHaveLength(100);
+    expect(reader77Calls.flatMap((call) => call.ids)).toHaveLength(100);
   });
 });

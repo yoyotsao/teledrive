@@ -139,6 +139,7 @@ async function migrationCalls(page: Page): Promise<any[]> {
 async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = []) {
   const jobs = new Map(initialJobs.map(job => [job.migration_id, structuredClone(job)]));
   const operations = new Map<string, any>();
+  const claimedGroups = new Set<string>();
   const logs: RequestLog[] = [];
 
   await page.route('**/api/v1/accounts', route => route.fulfill({
@@ -193,7 +194,8 @@ async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = [])
         const scope = url.searchParams.get('scope') ?? 'runnable';
         const eligible = job.items.filter(item => scope === 'applied'
           ? item.state === 'applied'
-          : !['applied', 'rolled_back', 'blocked', 'failed'].includes(item.state));
+          : !claimedGroups.has(`${job.migration_id}:${item.group_id}`)
+            && !['applied', 'rolled_back', 'blocked', 'failed'].includes(item.state));
         const groupIds = [...new Set(eligible.map(item => item.group_id))];
         return json({
           groups: groupIds.map(groupId => ({
@@ -208,6 +210,7 @@ async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = [])
       if (claimGroup && method === 'POST') {
         const job = jobs.get(claimGroup[1])!;
         const items = job.items.filter(item => item.group_id === claimGroup[2]);
+        claimedGroups.add(`${job.migration_id}:${claimGroup[2]}`);
         return json({ group: { group_id: claimGroup[2], items }, job: refreshJobSummary(job) });
       }
 
@@ -255,6 +258,7 @@ async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = [])
           item.applied_location_version = item.expected_location_version + 1;
         }
         job.state = job.items.every(item => item.state === 'applied') ? 'completed' : 'running';
+        claimedGroups.delete(`${job.migration_id}:${commit[2]}`);
         refreshJobSummary(job);
         return json({ group: { group_id: commit[2], items }, job });
       }
@@ -269,6 +273,7 @@ async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = [])
           item.version += 1;
         }
         job.state = job.items.every(item => item.state === 'rolled_back') ? 'rolled_back' : job.state;
+        claimedGroups.delete(`${job.migration_id}:${rollback[2]}`);
         refreshJobSummary(job);
         return json({ group: { group_id: rollback[2], items }, job });
       }

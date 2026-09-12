@@ -28,6 +28,12 @@ type MigrationJob = {
   target_version: number;
   accounts_version: number;
   target_snapshot: Record<string, any>;
+  total_items: number;
+  total_groups: number;
+  item_counts: Record<string, number>;
+  next_retry_at: string | null;
+  created_at: string;
+  updated_at: string;
   items: MigrationItem[];
 };
 
@@ -45,9 +51,39 @@ function sourceLocation(fileId = 'saved-file') {
   };
 }
 
+function itemCounts(items: MigrationItem[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const item of items) counts[item.state] = (counts[item.state] ?? 0) + 1;
+  return counts;
+}
+
+function refreshJobSummary(job: MigrationJob): MigrationJob {
+  job.total_items = job.items.length;
+  job.total_groups = new Set(job.items.map(item => item.group_id)).size;
+  job.item_counts = itemCounts(job.items);
+  job.updated_at = new Date().toISOString();
+  return job;
+}
+
 function makeJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
   const migrationId = overrides.migration_id ?? 'migration-1';
-  return {
+  const items = overrides.items ?? [{
+    migration_id: migrationId,
+    item_id: 'item-1',
+    file_id: 'saved-file',
+    group_id: 'saved-file',
+    part_index: null,
+    state: 'planned',
+    version: 1,
+    source_location: sourceLocation(),
+    expected_location_version: 0,
+    operation_id: null,
+    operation_result_version: null,
+    applied_location_version: null,
+    evidence: [],
+  }];
+  const now = new Date().toISOString();
+  const job: MigrationJob = {
     migration_id: migrationId,
     state: 'running',
     version: 1,
@@ -56,23 +92,16 @@ function makeJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
     target_version: 3,
     accounts_version: 2,
     target_snapshot: { storage_mode: 'channel', channel_id: '123456789', version: 3, accounts_version: 2 },
-    items: [{
-      migration_id: migrationId,
-      item_id: 'item-1',
-      file_id: 'saved-file',
-      group_id: 'saved-file',
-      part_index: null,
-      state: 'planned',
-      version: 1,
-      source_location: sourceLocation(),
-      expected_location_version: 0,
-      operation_id: null,
-      operation_result_version: null,
-      applied_location_version: null,
-      evidence: [],
-    }],
+    total_items: items.length,
+    total_groups: new Set(items.map(item => item.group_id)).size,
+    item_counts: itemCounts(items),
+    next_retry_at: null,
+    created_at: now,
+    updated_at: now,
     ...overrides,
+    items,
   };
+  return refreshJobSummary(job);
 }
 
 async function installMigrationTelegramHook(page: Page) {
@@ -110,6 +139,7 @@ async function migrationCalls(page: Page): Promise<any[]> {
 async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = []) {
   const jobs = new Map(initialJobs.map(job => [job.migration_id, structuredClone(job)]));
   const operations = new Map<string, any>();
+  const claimedGroups = new Set<string>();
   const logs: RequestLog[] = [];
 
   await page.route('**/api/v1/accounts', route => route.fulfill({
@@ -155,7 +185,33 @@ async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = [])
       const getJob = path.match(/^\/storage-migrations\/([^/]+)$/);
       if (getJob && method === 'GET') {
         const job = jobs.get(getJob[1]);
-        return job ? json(job) : json({ detail: 'not found' }, 404);
+        return job ? json(refreshJobSummary(job)) : json({ detail: 'not found' }, 404);
+      }
+
+      const listGroups = path.match(/^\/storage-migrations\/([^/]+)\/groups$/);
+      if (listGroups && method === 'GET') {
+        const job = jobs.get(listGroups[1])!;
+        const scope = url.searchParams.get('scope') ?? 'runnable';
+        const eligible = job.items.filter(item => scope === 'applied'
+          ? item.state === 'applied'
+          : !claimedGroups.has(`${job.migration_id}:${item.group_id}`)
+            && !['applied', 'rolled_back', 'blocked', 'failed'].includes(item.state));
+        const groupIds = [...new Set(eligible.map(item => item.group_id))];
+        return json({
+          groups: groupIds.map(groupId => ({
+            group_id: groupId,
+            items: eligible.filter(item => item.group_id === groupId),
+          })),
+          next_after: null,
+        });
+      }
+
+      const claimGroup = path.match(/^\/storage-migrations\/([^/]+)\/groups\/([^/]+)\/claim$/);
+      if (claimGroup && method === 'POST') {
+        const job = jobs.get(claimGroup[1])!;
+        const items = job.items.filter(item => item.group_id === claimGroup[2]);
+        claimedGroups.add(`${job.migration_id}:${claimGroup[2]}`);
+        return json({ group: { group_id: claimGroup[2], items }, job: refreshJobSummary(job) });
       }
 
       const patchItem = path.match(/^\/storage-migrations\/([^/]+)\/items\/([^/]+)$/);
@@ -195,24 +251,31 @@ async function installMigrationApi(page: Page, initialJobs: MigrationJob[] = [])
       if (commit && method === 'POST') {
         const job = jobs.get(commit[1])!;
         job.version += 1;
-        for (const item of job.items.filter(row => row.group_id === commit[2])) {
+        const items = job.items.filter(row => row.group_id === commit[2]);
+        for (const item of items) {
           item.state = 'applied';
           item.version += 1;
           item.applied_location_version = item.expected_location_version + 1;
         }
         job.state = job.items.every(item => item.state === 'applied') ? 'completed' : 'running';
-        return json(job);
+        claimedGroups.delete(`${job.migration_id}:${commit[2]}`);
+        refreshJobSummary(job);
+        return json({ group: { group_id: commit[2], items }, job });
       }
 
       const rollback = path.match(/^\/storage-migrations\/([^/]+)\/groups\/([^/]+)\/rollback$/);
       if (rollback && method === 'POST') {
         const job = jobs.get(rollback[1])!;
         job.version += 1;
-        for (const item of job.items.filter(row => row.group_id === rollback[2])) {
+        const items = job.items.filter(row => row.group_id === rollback[2]);
+        for (const item of items) {
           item.state = 'rolled_back';
           item.version += 1;
         }
-        return json(job);
+        job.state = job.items.every(item => item.state === 'rolled_back') ? 'rolled_back' : job.state;
+        claimedGroups.delete(`${job.migration_id}:${rollback[2]}`);
+        refreshJobSummary(job);
+        return json({ group: { group_id: rollback[2], items }, job });
       }
 
       if (path === '/telegram-operations' && method === 'POST') {

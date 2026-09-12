@@ -1,7 +1,6 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import source from './ChonkyDrive.tsx?raw';
 
-const source = readFileSync(new URL('./ChonkyDrive.tsx', import.meta.url), 'utf8');
 const folderStart = source.indexOf('const uploadFolder = async');
 const folderSource = folderStart >= 0 ? source.slice(folderStart) : '';
 

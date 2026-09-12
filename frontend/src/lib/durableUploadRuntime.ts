@@ -31,7 +31,13 @@ export interface FrozenUploadContext {
   writers: FrozenUploadWriter<TelegramClientManager>[];
 }
 
+let frozenUploadContextCache: FrozenUploadContext | null = null;
 let frozenUploadContextInFlight: Promise<FrozenUploadContext> | null = null;
+
+export function invalidateFrozenUploadContext(): void {
+  frozenUploadContextCache = null;
+  frozenUploadContextInFlight = null;
+}
 
 function uuid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -76,20 +82,21 @@ async function buildFrozenUploadContext(): Promise<FrozenUploadContext> {
 }
 
 /**
- * Coalesce concurrent target/account/writer resolution into one request set.
- * A large upload batch can start hundreds of files at once; without this gate
- * every file independently calls /storage-target, /accounts and GetDialogs,
- * exhausting the browser connection pool and tripping Telegram flood waits.
- * The promise is cleared as soon as it settles, so later batches still observe
- * storage-target/account changes instead of reusing stale configuration.
+ * Resolve storage topology once for this page session. Uploading hundreds of
+ * files must not turn /storage-target, /accounts or GetDialogs into a hot path.
+ * Settings/account mutations explicitly invalidate this cache; a page reload
+ * naturally resets it as well.
  */
 export async function resolveFrozenUploadContext(): Promise<FrozenUploadContext> {
+  if (frozenUploadContextCache) return frozenUploadContextCache;
   if (frozenUploadContextInFlight) return frozenUploadContextInFlight;
 
   const pending = buildFrozenUploadContext();
   frozenUploadContextInFlight = pending;
   try {
-    return await pending;
+    const context = await pending;
+    frozenUploadContextCache = context;
+    return context;
   } finally {
     if (frozenUploadContextInFlight === pending) {
       frozenUploadContextInFlight = null;

@@ -34,10 +34,11 @@ jobs:
       - name: Typecheck
         working-directory: frontend
         run: npx tsc --noEmit
-      - name: Focused migration regression
+      - name: Focused migration and upload regression
         working-directory: frontend
         run: >-
           npx vitest run
+          src/lib/segmentScheduler.browser-timer.test.ts
           src/lib/forwardResult.test.ts
           src/lib/gramjs.forwardBatch.test.ts
           src/maintenance/migrateSavedMessagesToChannel.test.ts

@@ -1144,6 +1144,9 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
   };
 
   const uploadFolder = async (items: DataTransferItemList, parentFolderId: string | null): Promise<void> => {
+    const rootEntries = Array.from({ length: items.length }, (_, i) => items[i].webkitGetAsEntry?.()).filter(Boolean);
+    const folderStorageTarget = await api.getStorageTarget();
+
     // Lazy folder creation: each unique path is created at most once.
     // Returns the folder's file_id (or parent fallback on error).
     const folderCache = new Map<string, Promise<string | null>>();
@@ -1194,9 +1197,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     // Upload one file's bytes to Telegram. Called only for files already proven
     // fresh (not a duplicate) — hash check happens before this is invoked.
-    // Does NOT register metadata — that happens after the caller releases
-    // fileSemaphore, so a slow backend never blocks the next file's bytes.
-    const uploadFileEntryFresh = async (file: File, onProgress?: SplitUploadProgress): Promise<{
+    const uploadFileEntryFresh = async (file: File, folderId: string | null, fileHash: string | null, onProgress?: SplitUploadProgress): Promise<{
       parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>;
       hasThumbnail: boolean;
     }> => {
@@ -1206,6 +1207,15 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       // does a video the browser cannot decode (`undecodable`).
       if (isMediaFile(file) && !thumbBlob && !undecodable) {
         throw new Error(`Thumbnail capture failed for ${file.name}`);
+      }
+      if (folderStorageTarget.storage_mode === 'channel') {
+        const uploadResult = await durableUploadFile(file, {
+          parentId: folderId,
+          fileHash,
+          thumb: thumbBlob,
+          onProgress,
+        });
+        return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
       }
       const uploadResult = await uploadFileSpread(file, onProgress, thumbBlob);
       return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
@@ -1344,7 +1354,10 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                 if (asExisting.length > 0) {
                   queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
                   try {
-                    await registerDuplicateParts(file, fileHash, asExisting, folderId);
+                    const targetParts = folderStorageTarget.storage_mode === 'channel'
+                      ? await ensureDedupPartsInCurrentTarget(asExisting)
+                      : asExisting;
+                    await registerDuplicateParts(file, fileHash, targetParts, folderId);
                     done();
                   } catch (err) {
                     failed('register', err);
@@ -1359,7 +1372,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
               // 批次內去重：搶到 claim 的人負責真的上傳，其餘的人排在它後面只註冊。
               // get/set 這一對必須保持同步，否則兩個同內容的 discovery 會同時搶到。
               const claim: { publish: (parts: RegisterableExistingPart[] | null) => void } = { publish: () => {} };
-              if (fileHash) {
+              if (fileHash && folderStorageTarget.storage_mode === 'saved_messages') {
                 const claimed = claimedHashes.get(fileHash);
                 if (claimed) {
                   queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
@@ -1380,7 +1393,9 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
               // 過了 claim 之後每條路徑都必須把它 settle 掉，排在後面的檔案才不會永遠等下去。
               try {
-                if (isAlbumEligibleMedia(file) && file.size <= SMALL_FILE_LIMIT) {
+                if (folderStorageTarget.storage_mode === 'saved_messages'
+                  && isAlbumEligibleMedia(file)
+                  && file.size <= SMALL_FILE_LIMIT) {
                   uploadPromises.push(
                     albumPipeline.enqueue(file, fileHash, folderId, onProgress)
                       .then((outcome) => {
@@ -1400,8 +1415,12 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                 }
 
                 uploadPromises.push(
-                  uploadFileEntryFresh(file, onProgress)
+                  uploadFileEntryFresh(file, folderId, fileHash, onProgress)
                     .then(async (result) => {
+                      if (folderStorageTarget.storage_mode === 'channel') {
+                        done();
+                        return;
+                      }
                       queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
                       try {
                         await registerFolderFileParts(file, fileHash, folderId, result.parts, result.hasThumbnail);
@@ -1438,7 +1457,6 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       }
     };
 
-    const rootEntries = Array.from({ length: items.length }, (_, i) => items[i].webkitGetAsEntry?.()).filter(Boolean);
     await Promise.all(rootEntries.map((e) => processEntry(e, '')));
 
     // All files have been routed (dedup-registered, enqueued into the album

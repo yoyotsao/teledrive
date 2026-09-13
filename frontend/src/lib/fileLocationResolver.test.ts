@@ -48,7 +48,7 @@ describe('file location resolver', () => {
   it('uses only the original account for Saved Messages', async () => {
     const original = manager(42);
     const other = manager(43);
-    const resolve = createFileLocationResolver(() => [other, original]);
+    const resolve = createFileLocationResolver(() => [other, original], () => 42);
 
     const result = await resolve(savedLocation, 'download');
     expect(result.client).toBe(original.client);
@@ -56,30 +56,40 @@ describe('file location resolver', () => {
     expect(other.client.getMessages).not.toHaveBeenCalled();
   });
 
-  it('fails over between live channel readers without trying Saved Messages', async () => {
-    const unavailable = manager(42, { channel: false });
-    const reader = manager(43, { channel: true });
-    const resolve = createFileLocationResolver(() => [unavailable, reader]);
+  it('uses the primary account for channel reads even when another reader appears first', async () => {
+    const primary = manager(42, { channel: true });
+    const secondary = manager(43, { channel: true });
+    const resolve = createFileLocationResolver(() => [secondary, primary], () => 42);
 
     const result = await resolve(channelLocation, 'preview');
-    expect(result.client).toBe(reader.client);
-    expect(reader.client.getMessages).toHaveBeenCalledTimes(1);
+    expect(result.client).toBe(primary.client);
+    expect(primary.client.getMessages).toHaveBeenCalledTimes(1);
+    expect(secondary.client.getMessages).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back to a secondary channel reader when primary cannot read', async () => {
+    const primary = manager(42, { channel: false });
+    const secondary = manager(43, { channel: true });
+    const resolve = createFileLocationResolver(() => [primary, secondary], () => 42);
+
+    await expect(resolve(channelLocation, 'download')).rejects.toMatchObject({ code: 'READ_UNAVAILABLE' });
+    expect(secondary.client.getMessages).not.toHaveBeenCalled();
   });
 
   it('returns READ_UNAVAILABLE when no linked manager can read the channel', async () => {
-    const resolve = createFileLocationResolver(() => [manager(42), manager(43)]);
+    const resolve = createFileLocationResolver(() => [manager(42), manager(43)], () => 42);
     await expect(resolve(channelLocation, 'download')).rejects.toMatchObject({ code: 'READ_UNAVAILABLE' });
   });
 
   it('rejects a message whose stored media identity is stale', async () => {
-    const resolve = createFileLocationResolver(() => [manager(42, { channel: true, mediaId: '1000' })]);
+    const resolve = createFileLocationResolver(() => [manager(42, { channel: true, mediaId: '1000' })], () => 42);
     await expect(resolve(channelLocation, 'download')).rejects.toMatchObject({ code: 'STALE_LOCATION' });
   });
 
   it('keeps same message numbers in two chats distinct', async () => {
     const saved = manager(42, { mediaId: '999' });
     const channel = manager(43, { channel: true, mediaId: '999' });
-    const resolve = createFileLocationResolver(() => [saved, channel]);
+    const resolve = createFileLocationResolver(() => [saved, channel], () => 43);
 
     const a = await resolve(savedLocation, 'download');
     const b = await resolve(channelLocation, 'download');
@@ -88,7 +98,7 @@ describe('file location resolver', () => {
   });
 
   it('reports a finite diagnostic error type', async () => {
-    const resolve = createFileLocationResolver(() => []);
+    const resolve = createFileLocationResolver(() => [], () => 42);
     try {
       await resolve(channelLocation, 'download');
       throw new Error('expected failure');

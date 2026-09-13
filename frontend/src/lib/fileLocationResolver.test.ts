@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createFileLocationResolver, FileLocationResolutionError } from './fileLocationResolver.ts';
+import {
+  createFileLocationResolver,
+  FileLocationResolutionError,
+  primaryAccountIdFromJwt,
+} from './fileLocationResolver.ts';
 import type { FileLocation } from './storageLocation.ts';
 
 function documentMedia(id: string, size = 10) {
@@ -25,6 +29,11 @@ function manager(accountId: number, options: { channel?: boolean; mediaId?: stri
   } as any;
 }
 
+function jwtForOwner(ownerId: number): string {
+  const payload = btoa(JSON.stringify({ user_id: ownerId })).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  return `header.${payload}.signature`;
+}
+
 const savedLocation: FileLocation = {
   telegram_chat_id: null,
   telegram_user_id: 42,
@@ -45,6 +54,11 @@ const channelLocation: FileLocation = {
 };
 
 describe('file location resolver', () => {
+  it('derives the primary account id from the drive owner in the JWT', () => {
+    expect(primaryAccountIdFromJwt(jwtForOwner(42))).toBe(42);
+    expect(primaryAccountIdFromJwt('invalid')).toBeNull();
+  });
+
   it('uses only the original account for Saved Messages', async () => {
     const original = manager(42);
     const other = manager(43);

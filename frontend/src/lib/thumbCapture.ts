@@ -13,6 +13,15 @@ const captureGate = new Semaphore(MAX_CONCURRENT_FILES);
 
 export type { ThumbCaptureResult };
 
+/** Continue an upload even when thumbnail capture exhausts all retries. */
+export async function runWithOptionalThumbnail<T>(
+  captureResult: Promise<ThumbCaptureResult>,
+  upload: (thumb: Blob | null) => Promise<T>,
+): Promise<T> {
+  const { thumb } = await captureResult;
+  return upload(thumb);
+}
+
 /** True for files eligible for Telegram album grouping and thumbnail capture. */
 export function isMediaFile(file: File): boolean {
   return file.type.startsWith('image/') || file.type.startsWith('video/');
@@ -21,13 +30,11 @@ export function isMediaFile(file: File): boolean {
 /**
  * Capture a thumbnail blob from a local image/video file.
  *
- * Callers treat a null thumb on a media file as an upload FAILURE - a media file
- * must never land in the drive without a thumbnail - so capture retries a few
- * times before giving up and a single transient failure must not doom the
- * upload. The exception is `undecodable`: when the browser has no decoder for
- * the video track there is no frame to capture on any attempt, and failing
- * forever would make the file permanently unstorable, so those upload as plain
- * thumbless documents instead.
+ * Capture retries a few times so a single transient failure does not lose the
+ * thumbnail. After all attempts are exhausted, callers upload the file without
+ * one; thumbnail generation is optional and must not fail the file upload.
+ * `undecodable` still short-circuits retries because another attempt cannot
+ * produce a frame when the browser has no decoder for the video track.
  *
  * Non-media files return `{ thumb: null, undecodable: false }` and legitimately
  * carry no thumbnail.

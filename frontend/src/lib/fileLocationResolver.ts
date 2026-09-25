@@ -1,6 +1,6 @@
 import type { FileLocation } from './storageLocation.ts';
 import { resolveChannelPeerForAccount, validateChannelForAccount } from './channelStorage.ts';
-import { getAllClients } from './gramjs.ts';
+import { getAllClients, loadJwt } from './gramjs.ts';
 import { readMedia, type MediaRef } from './telegramMedia.ts';
 
 export type FileReadPurpose = 'download' | 'thumbnail' | 'preview' | 'stream';
@@ -30,6 +30,21 @@ type ManagerLike = {
   offline?: boolean;
   client?: any;
 };
+
+/** JWT user_id is the drive owner, which is the immutable primary Telegram account. */
+export function primaryAccountIdFromJwt(token: string | null): number | null {
+  if (!token) return null;
+  try {
+    const payload = token.split('.')[1];
+    if (!payload) return null;
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+    const userId = Number(JSON.parse(atob(padded))?.user_id);
+    return Number.isSafeInteger(userId) && userId > 0 ? userId : null;
+  } catch {
+    return null;
+  }
+}
 
 function rawClient(manager: ManagerLike): any | null {
   return (manager as any).client ?? null;
@@ -79,11 +94,12 @@ async function fetchAndValidate(
 }
 
 /**
- * Build a resolver over a live manager registry. Tests inject a registry;
- * production uses getAllClients so reload/relogin state is observed lazily.
+ * Build a resolver over a live manager registry. Tests inject a registry and
+ * primary selector; production derives the primary account from the drive JWT.
  */
 export function createFileLocationResolver(
   managers: () => readonly ManagerLike[],
+  primaryAccountId: () => number | null,
 ): (location: FileLocation, purpose: FileReadPurpose) => Promise<ResolvedFileLocation> {
   return async (location: FileLocation, _purpose: FileReadPurpose): Promise<ResolvedFileLocation> => {
     const liveManagers = managers().filter((manager) => !manager.offline && rawClient(manager));
@@ -100,31 +116,39 @@ export function createFileLocationResolver(
       return fetchAndValidate(original, 'me', location, 1);
     }
 
-    let attempts = 0;
-    for (const manager of liveManagers) {
-      attempts += 1;
-      try {
-        const verification = await validateChannelForAccount(manager as any, location.telegram_chat_id);
-        if (!verification.can_read) continue;
-        const peer = await resolveChannelPeerForAccount(manager as any, location.telegram_chat_id);
-        if (!peer) continue;
-        return await fetchAndValidate(manager, peer, location, attempts);
-      } catch (error) {
-        if (error instanceof FileLocationResolutionError && error.code === 'STALE_LOCATION') throw error;
-        // Account-local resolution/read failures are recoverable: try the next
-        // currently linked manager instead of falling back to Saved Messages.
-      }
+    const primaryId = primaryAccountId();
+    const primary = primaryId == null
+      ? undefined
+      : liveManagers.find((manager) => manager.accountId === primaryId);
+    if (!primary) {
+      throw new FileLocationResolutionError(
+        'READ_UNAVAILABLE',
+        `Primary account ${primaryId ?? 'unknown'} is not locally available`,
+        0,
+      );
     }
 
-    throw new FileLocationResolutionError(
-      'READ_UNAVAILABLE',
-      `No live linked account can read channel ${location.telegram_chat_id}`,
-      attempts,
-    );
+    try {
+      const verification = await validateChannelForAccount(primary as any, location.telegram_chat_id);
+      if (!verification.can_read) throw new Error('Primary account cannot read channel');
+      const peer = await resolveChannelPeerForAccount(primary as any, location.telegram_chat_id);
+      if (!peer) throw new Error('Primary account cannot resolve channel');
+      return await fetchAndValidate(primary, peer, location, 1);
+    } catch (error) {
+      if (error instanceof FileLocationResolutionError && error.code === 'STALE_LOCATION') throw error;
+      throw new FileLocationResolutionError(
+        'READ_UNAVAILABLE',
+        `Primary account ${primaryId} cannot read channel ${location.telegram_chat_id}`,
+        1,
+      );
+    }
   };
 }
 
-const productionResolver = createFileLocationResolver(() => getAllClients() as unknown as readonly ManagerLike[]);
+const productionResolver = createFileLocationResolver(
+  () => getAllClients() as unknown as readonly ManagerLike[],
+  () => primaryAccountIdFromJwt(loadJwt()),
+);
 
 export function resolveFileLocation(
   location: FileLocation,

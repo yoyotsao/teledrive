@@ -35,7 +35,7 @@ it('reuses the generation-bound channel peer across repeated stream resolves', a
     media_size: 10,
     location_version: 2,
   };
-  const resolve = createFileLocationResolver(() => [manager]);
+  const resolve = createFileLocationResolver(() => [manager], () => manager.accountId);
 
   await resolve(location, 'stream');
   await resolve(location, 'stream');

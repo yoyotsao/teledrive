@@ -4,10 +4,9 @@ export type ThumbCaptureResult = {
   /** The captured JPEG, or null if there is none. */
   thumb: Blob | null;
   /**
-   * True when the browser has no decoder for this file's video track. Callers
-   * use it to tell "there will never be a frame" apart from "capture failed",
-   * because the first is a property of the file and the second is a transient
-   * fault worth failing the upload over.
+   * True when the browser has no decoder for this file's video track. The retry
+   * loop uses this permanent verdict to stop immediately; transient failures
+   * exhaust the configured attempts before both cases continue without a thumb.
    */
   undecodable: boolean;
 };

@@ -6,7 +6,7 @@ import { uploadFileSpread, type SplitUploadProgress } from '../lib/splitUpload';
 import { durableUploadFile } from '../lib/durableUploadRuntime';
 import { ensureDedupPartsInCurrentTarget } from '../lib/dedupRelocationRuntime';
 import { withSlotOn, nextAccount } from '../lib/accountPool';
-import { captureThumb, isMediaFile, type ThumbCaptureResult } from '../lib/thumbCapture';
+import { captureThumb, isMediaFile, runWithOptionalThumbnail, type ThumbCaptureResult } from '../lib/thumbCapture';
 import { getCachedThumbnail, setCachedThumbnail } from '../lib/thumbnailCache';
 import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
@@ -251,19 +251,13 @@ function createAlbumPipeline() {
         let prepareStage: UploadErrorStage = 'thumbnail';
         const p = withSlotOn(client, async () => {
           const tSlot = performance.now();
-          const { thumb, undecodable } = await captureThumb(file);
-          // The album path only ever handles media files, which MUST carry a
-          // thumbnail — a null capture (even after retries) fails the upload
-          // rather than silently landing a thumbless file in the drive. The one
-          // exception is a video the browser cannot decode: no retry produces a
-          // frame, so it goes up as a plain thumbless document instead of being
-          // permanently unstorable.
-          if (!thumb && !undecodable) throw new Error(`Thumbnail capture failed for ${file.name}`);
-          const tThumb = performance.now();
-          prepareStage = 'telegram';
-          const prepared = await client.prepareAlbumFile(file, thumb);
-          console.log(`[Perf] enqueue ${file.name} on account ${client.accountId}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
-          return prepared;
+          return runWithOptionalThumbnail(captureThumb(file), async (thumb) => {
+            const tThumb = performance.now();
+            prepareStage = 'telegram';
+            const prepared = await client.prepareAlbumFile(file, thumb);
+            console.log(`[Perf] enqueue ${file.name} on account ${client.accountId}: slotWait=${Math.round(tSlot - tQueued)}ms captureThumb=${Math.round(tThumb - tSlot)}ms prepare=${Math.round(performance.now() - tThumb)}ms`);
+            return prepared;
+          });
         }).then((prepared) => {
           onProgress?.(50);
           // prepareAlbumFile 回 null：位元組沒有成功送到 Telegram。
@@ -878,24 +872,17 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       }
     }
 
-    const { thumb: thumbBlob, undecodable } = await thumbPromise;
-    // Media files must carry a thumbnail — if capture failed (even after retries)
-    // the upload fails instead of registering a thumbless media file. Non-media
-    // files legitimately have no thumbnail, and so does a video whose codec the
-    // browser has no decoder for (`undecodable`) — there is no frame to capture
-    // on any attempt, so it registers thumbless rather than never uploading.
-    if (isMediaFile(file) && !thumbBlob && !undecodable) {
-      throw new Error(`Thumbnail capture failed for ${file.name}`);
-    }
-    console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
-    // Durable shared-storage uploads freeze the target/writer, persist every
-    // operation + random id before Telegram can create a message, persist the
-    // authoritative result, and only then commit metadata registration.
-    const uploadResult = await durableUploadFile(file, {
-      parentId: currentFolderId,
-      fileHash,
-      thumb: thumbBlob,
-      onProgress,
+    const uploadResult = await runWithOptionalThumbnail(thumbPromise, async (thumbBlob) => {
+      console.log('[Upload] Starting split upload for:', file.name, 'size:', file.size);
+      // Durable shared-storage uploads freeze the target/writer, persist every
+      // operation + random id before Telegram can create a message, persist the
+      // authoritative result, and only then commit metadata registration.
+      return durableUploadFile(file, {
+        parentId: currentFolderId,
+        fileHash,
+        thumb: thumbBlob,
+        onProgress,
+      });
     });
     console.log('[Upload] Durable upload completed, parts:', uploadResult.parts.length);
 
@@ -1202,24 +1189,19 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
       parts: Array<{ message_id: number; file_id: string; access_hash?: string; size: number; account_id: number }>;
       hasThumbnail: boolean;
     }> => {
-      const { thumb: thumbBlob, undecodable } = await captureThumb(file);
-      // Media files must carry a thumbnail — fail rather than register a
-      // thumbless media file. Non-media files legitimately have none, and so
-      // does a video the browser cannot decode (`undecodable`).
-      if (isMediaFile(file) && !thumbBlob && !undecodable) {
-        throw new Error(`Thumbnail capture failed for ${file.name}`);
-      }
-      if (folderStorageTarget.storage_mode === 'channel') {
-        const uploadResult = await durableUploadFile(file, {
-          parentId: folderId,
-          fileHash,
-          thumb: thumbBlob,
-          onProgress,
-        });
+      return runWithOptionalThumbnail(captureThumb(file), async (thumbBlob) => {
+        if (folderStorageTarget.storage_mode === 'channel') {
+          const uploadResult = await durableUploadFile(file, {
+            parentId: folderId,
+            fileHash,
+            thumb: thumbBlob,
+            onProgress,
+          });
+          return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
+        }
+        const uploadResult = await uploadFileSpread(file, onProgress, thumbBlob);
         return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
-      }
-      const uploadResult = await uploadFileSpread(file, onProgress, thumbBlob);
-      return { parts: uploadResult.parts, hasThumbnail: uploadResult.hasThumbnail };
+      });
     };
 
     const registerFolderFileParts = async (

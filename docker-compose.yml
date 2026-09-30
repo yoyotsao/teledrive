@@ -38,6 +38,7 @@ services:
   # no host port: only reachable on the compose network.
   reinamanager:
     image: reinamanager:local
+    pull_policy: never  # local-only image; never try docker.io
     environment:
       JWT_SECRET: ${JWT_SECRET}
       REINA_OWNER_ID: ${REINA_OWNER_ID:?set REINA_OWNER_ID in .env}

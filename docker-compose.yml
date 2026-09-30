@@ -34,6 +34,27 @@ services:
       - backend
     restart: unless-stopped
 
+  # ReinaManager web app, proxied by frontend nginx under /game/. Publishes
+  # no host port: only reachable on the compose network.
+  reinamanager:
+    image: reinamanager:local
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      REINA_OWNER_ID: ${REINA_OWNER_ID:?set REINA_OWNER_ID in .env}
+      TELEDRIVE_API: http://backend:8000
+      REINA_GAME_FOLDER: game
+      TZ: Asia/Taipei
+    volumes:
+      - reina-data:/data
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/game/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   # The Cloudflare connector serving the public hostname. It shares the
   # frontend container's network namespace instead of joining the compose
   # network: a token tunnel keeps its ingress rules in the Cloudflare
@@ -53,3 +74,4 @@ services:
 
 volumes:
   teledrive-data:
+  reina-data:

@@ -21,6 +21,7 @@ FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY security-headers.conf /etc/nginx/conf.d/security-headers.conf
+COPY reina-security-headers.conf /etc/nginx/snippets/reina-security-headers.conf
 
 EXPOSE 3000
 

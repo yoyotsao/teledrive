@@ -301,3 +301,20 @@ export async function registerDuplicateParts(
     })
   ));
 }
+
+/**
+ * Telegram cannot store a 0-byte file, so an empty file is registered as
+ * metadata only: message_id 0 marks "no Telegram message", file_id is random
+ * (it is a global primary key) and there is no hash (nothing to dedup).
+ */
+export function registerEmptyFile(file: File, parentId: string | null | undefined): Promise<unknown> {
+  return registerFileBounded({
+    filename: file.name,
+    filesize: 0,
+    mimeType: file.type || undefined,
+    messageId: 0,
+    fileId: `empty:${crypto.randomUUID()}`,
+    parentId: parentId ?? undefined,
+    originalName: file.name,
+  });
+}

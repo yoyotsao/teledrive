@@ -122,6 +122,8 @@ async function downloadFileRow(
 // Fetch a file's full bytes from Telegram (handles split files).
 export async function fetchFileBlob(file: FileInfo, onProgress?: DownloadProgress): Promise<Blob> {
   const mimeType = file.mime_type || 'application/octet-stream';
+  // Empty files are metadata only (message_id 0); there is nothing on Telegram.
+  if (file.filesize === 0 && !file.telegram_message_id) return new Blob([], { type: mimeType });
   if (file.is_split_file && file.split_group_id) {
     return downloadSplitMerged(file.split_group_id, mimeType, onProgress);
   }

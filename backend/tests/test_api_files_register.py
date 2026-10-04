@@ -299,3 +299,21 @@ def test_a_malformed_hash_is_rejected(client, db, run):
         resp = client.post("/api/v1/files/register", json=register_payload(file_hash=bad))
         assert resp.status_code == 422, f"{bad!r} was accepted: {resp.text}"
     assert run(db.get_file("doc1")) is None
+
+
+def test_empty_file_registers_as_metadata_only(client):
+    resp = client.post(
+        "/api/v1/files/register",
+        json=register_payload(file_id="empty:abc", filesize=0, message_id=0),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["filesize"] == 0
+    assert resp.json()["telegram_message_id"] == 0
+
+
+def test_message_id_zero_is_rejected_for_non_empty_files(client):
+    resp = client.post(
+        "/api/v1/files/register",
+        json=register_payload(file_id="bogus", filesize=10, message_id=0),
+    )
+    assert resp.status_code == 422

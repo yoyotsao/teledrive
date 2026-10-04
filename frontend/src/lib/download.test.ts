@@ -117,3 +117,13 @@ describe('resolver-based downloads', () => {
     expect(thumbnailCacheKey(channelFile(1))).not.toBe(thumbnailCacheKey(channelFile(2)));
   });
 });
+
+describe('empty files', () => {
+  it('downloads as an empty blob without touching Telegram', async () => {
+    const file = { ...channelFile(), filesize: 0, telegram_chat_id: null, telegram_message_id: 0, telegram_media_kind: null, telegram_media_id: null, telegram_media_size: null };
+    const blob = await fetchFileBlob(file as never);
+    expect(blob.size).toBe(0);
+    expect(mocks.resolveFileLocation).not.toHaveBeenCalled();
+    expect(mocks.legacyDownload).not.toHaveBeenCalled();
+  });
+});

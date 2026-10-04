@@ -65,7 +65,7 @@ class RegisterFileRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     filesize: int = Field(..., ge=0, le=9_223_372_036_854_775_807)
     mime_type: Optional[str] = Field(None, max_length=255)
-    message_id: int = Field(..., gt=0)
+    message_id: int = Field(..., ge=0)
     file_id: str = Field(..., min_length=1, max_length=512)
     access_hash: Optional[str] = Field(None, max_length=512)
     parent_id: Optional[str] = Field(None, max_length=512)
@@ -91,6 +91,16 @@ class RegisterFileRequest(BaseModel):
         if not value or "/" in value or "\\" in value or "\x00" in value:
             raise ValueError("Invalid filename")
         return value
+
+    @model_validator(mode="after")
+    def validate_empty_file_marker(self):
+        # Telegram cannot store 0-byte files, so an empty file is metadata only,
+        # marked by message_id 0. Nothing else may use that marker.
+        if self.message_id == 0 and (self.filesize != 0 or self.is_split_file):
+            raise ValueError("message_id 0 is reserved for empty files")
+        if self.filesize == 0 and self.message_id == 0 and self.telegram_media_kind is not None:
+            raise ValueError("empty files have no Telegram media")
+        return self
 
     @model_validator(mode="after")
     def validate_split_metadata(self):

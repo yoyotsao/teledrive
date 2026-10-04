@@ -12,7 +12,7 @@ import { FileInfo, FileData } from '../types';
 import { Semaphore } from '../lib/semaphore';
 import { ThumbBatchQueue } from '../lib/thumbQueue';
 import { ALBUM_BATCH } from '../config';
-import { registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, checkFileHashesBounded, canonicalExistingParts, assertPartsCoverFile, splitRegistrationIdentity, RegisterableExistingPart } from '../lib/uploadPlanner';
+import { registerEmptyFile, registerDuplicateParts, registerFileBounded, hashFileBounded, checkFileHashBounded, checkFileHashesBounded, canonicalExistingParts, assertPartsCoverFile, splitRegistrationIdentity, RegisterableExistingPart } from '../lib/uploadPlanner';
 import { DriveView, SortKey, SortOrder } from '../hooks/useUrlState';
 import { useUploadQueue } from '../hooks/useUploadQueue';
 import { safeErrorMessage, type UploadErrorStage } from '../lib/uploadQueue';
@@ -952,7 +952,8 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
 
     const routingPromises = enqueued.map(async ({ file, id: enqueuedId }) => {
       queue.dispatch({ type: 'setStatus', id: enqueuedId, attempt: 1, status: 'hashing', now: Date.now() });
-      const fileHash = await hashFileBounded(file);
+      // Empty files are never hashed: they would all collide as "identical content".
+      const fileHash = file.size === 0 ? null : await hashFileBounded(file);
 
       // 身分確認閘門：這一步之後才知道要用哪個 id、哪個 attempt 做事。
       const settled = queue.dispatch({ type: 'setHash', id: enqueuedId, attempt: 1, contentHash: fileHash, now: Date.now() });
@@ -983,6 +984,14 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
           failed('hash', err);
           return;
         }
+      }
+
+      if (file.size === 0) {
+        queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
+        uploadPromises.push(
+          registerEmptyFile(file, destination.resolvedFolderId).then(done).catch((err) => failed('register', err)),
+        );
+        return;
       }
 
       if (fileHash) {
@@ -1300,7 +1309,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
               }
 
               queue.dispatch({ type: 'setStatus', id: enqueuedId, attempt: 1, status: 'hashing', now: Date.now() });
-              const fileHash = await hashFileBounded(file);
+              const fileHash = file.size === 0 ? null : await hashFileBounded(file);
               const settled = queue.dispatch({ type: 'setHash', id: enqueuedId, attempt: 1, contentHash: fileHash, now: Date.now() });
               const resolution = settled.resolutions[enqueuedId];
               if (!resolution || resolution.outcome === 'discarded') return;
@@ -1329,6 +1338,15 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                   failed('hash', err);
                   return;
                 }
+              }
+
+              // Telegram 不接受 0 byte：只註冊中繼資料。
+              if (file.size === 0) {
+                queue.dispatch({ type: 'setStatus', id, attempt, status: 'registering', now: Date.now() });
+                uploadPromises.push(
+                  registerEmptyFile(file, folderId).then(done).catch((err) => failed('register', err)),
+                );
+                return;
               }
 
               // 後端去重命中：直接註冊中繼資料，不碰 Telegram。
@@ -2161,7 +2179,7 @@ export function ChonkyDrive({ view, sortBy, sortOrder, onNavigateFolder, onSortC
                     >
                       {file.name}
                     </div>
-                    {!file.isDir && file.size && viewMode !== 'grid' && (
+                    {!file.isDir && file.size != null && viewMode !== 'grid' && (
                       <div style={{ fontSize: '12px', color: 'var(--td-text-muted)' }}>
                         {formatFileSize(file.size)}
                       </div>

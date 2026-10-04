@@ -41,7 +41,7 @@ services:
     pull_policy: never  # local-only image; never try docker.io
     environment:
       JWT_SECRET: ${JWT_SECRET}
-      REINA_OWNER_ID: ${REINA_OWNER_ID:?set REINA_OWNER_ID in .env}
+      REINA_MAX_USERS: ${REINA_MAX_USERS:-100}
       TELEDRIVE_API: http://backend:8000
       REINA_GAME_FOLDER: game
       TZ: Asia/Taipei
